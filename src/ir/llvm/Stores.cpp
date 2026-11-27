@@ -1564,9 +1564,10 @@ void Backend::emit_handle_whole_nba(Index i) {
     const auto&       p    = ir_->payload(i).op_extra;
     const auto        qa   = ir_->extra_data<QueueArg>(p.extra);
     const Guarded&    dlv  = lvalue_of(p.op);
-    // Signal-keyed like the deferred store family (handle_buf_idx(dlv.sig)), so the
-    // destination is design state and needs no barrier. Asserted, not assumed.
+    // Signal-keyed like the deferred store family (handle_buf_idx(dlv.sig)), so the destination is
+    // design state, whose card is logged here, at the staging (see StoreNbDelay).
     assert(dlv.gc_owner == nullptr && "a whole-container NBA targets a signal");
+    emit_gc_container_barrier(dlv);
     auto*             rt   = handle_rec_ty(qa.queue_type);
     const auto        strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value*      rec  = b_.CreateCall(nba_arr_slot_fn(),
@@ -1674,16 +1675,17 @@ void Backend::emit_string_whole_nba(const LValue& lv, Index rhs) {
 // destination held). rt_string_move re-inits the staged handle, so the record's
 // retained capacity is left as a valid empty string for the next instant.
 //
-// No wake and no VCD touch, unlike the container commit: a string is refused
-// from sensitivity lists and event controls in the frontend (so no process can
-// be waiting on one) and has no $var form.
+// What waits on the signal is woken if some record changed the characters it
+// replaced: each record is an update of its own (LRM 4.9.4), and a string's value
+// is its content (str_chg_snapshot). No VCD touch: a string has no $var form.
 void Backend::emit_string_whole_commit(Signal sig) {
-    auto*          rt    = str_rec_ty();
-    const auto     strd  = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-    auto*          i8    = b_.getInt8Ty();
-    const uint32_t idx   = str_buf_idx(sig);
-    llvm::Value*   base  = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
-    llvm::Value*   count = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
+    auto*          rt     = str_rec_ty();
+    const auto     strd   = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
+    auto*          i8     = b_.getInt8Ty();
+    const uint32_t idx    = str_buf_idx(sig);
+    const bool     waited = signal_has_waiters(sig);
+    llvm::Value*   base   = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
+    llvm::Value*   count  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
 
     auto* fn    = b_.GetInsertBlock()->getParent();
     auto* head  = llvm::BasicBlock::Create(ctx_, "snba.head", fn);
@@ -1692,17 +1694,32 @@ void Backend::emit_string_whole_commit(Signal sig) {
     auto* entry = b_.GetInsertBlock();
     b_.CreateBr(head);
     b_.SetInsertPoint(head);
-    auto* k = b_.CreatePHI(b_.getInt32Ty(), 2);
+    auto* k   = b_.CreatePHI(b_.getInt32Ty(), 2);
+    auto* any = b_.CreatePHI(b_.getInt1Ty(), 2);
     k->addIncoming(b_.getInt32(0), entry);
+    any->addIncoming(b_.getFalse(), entry);
     b_.CreateCondBr(b_.CreateICmpULT(k, count), body, done);
     b_.SetInsertPoint(body);
     llvm::Value* rec    = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(strd)) });
     llvm::Value* dest   = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
     llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
+    llvm::Value* differs =
+      waited ? b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { dest, staged }), b_.getInt32(0)) : b_.getFalse();
     b_.CreateCall(str_move_fn(), { dest, staged });
     k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+    any->addIncoming(b_.CreateOr(any, differs), b_.GetInsertBlock());
     b_.CreateBr(head);
     b_.SetInsertPoint(done);
+
+    if (waited) {
+        auto* svc  = llvm::BasicBlock::Create(ctx_, "snba.svc", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "snba.cont", fn);
+        b_.CreateCondBr(any, svc, cont);
+        b_.SetInsertPoint(svc);
+        service_signal_container_mutation(sig);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    }
 }
 
 // Largest leaf slot byte size across an aggregate type (sizes the deferred
@@ -2187,7 +2204,7 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     // A compile-time-constant delay emits only the taken path; a runtime delay
     // that happens to be zero branches to the same immediate path.
     auto  schedule  = [&] {
-        emit_trace_nba(rec, traced, RT_TRACE_NBA_TIMER);
+        emit_trace_nba(rec, traced, RT_TRACE_NBA_TIMER, ticks);
         b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, rec, ticks, intra_cb_trampoline() });
     };
     auto immediate = [&] {
@@ -2350,6 +2367,8 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     // delayed gate driving one bit of a vector (emit_gate_as_process, LRM 28.16)
     // reaches here with a bit-select lvalue and does need both.
     fill_intra_payload(lv, rhs, rt, rec);
+    // The checker is told of the record the decision asked for, before it is armed.
+    emit_trace_inertial_arm(idxv, rec, ticks, ep);
 
     // Arm the wheel for `now + ticks` with rt_inertial_cb. A zero delay cannot
     // arm the wheel, so its store lands in the current instant's NBA region via
@@ -2390,7 +2409,8 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
 void Backend::emit_intra_event_arm(const LValue&                lv,
                                    Plane                        rhs,
                                    llvm::Value*                 count,
-                                   llvm::ArrayRef<llvm::Value*> trig_ids) {
+                                   llvm::ArrayRef<llvm::Value*> trig_ids,
+                                   llvm::ArrayRef<TraceTrigger> traced) {
     const SignalSlot& s      = slot_of(lv.sig);
     llvm::StructType* rt     = intra_rec_ty(s);
     const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
@@ -2402,6 +2422,8 @@ void Backend::emit_intra_event_arm(const LValue&                lv,
     b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
     fill_intra_payload(lv, rhs, rt, rec);
     emit_trace_nba(rec, trace_nba_of(lv, rhs, false), RT_TRACE_NBA_EVENT);
+    // The events the record waits for, and how many occurrences release it (R11).
+    emit_trace_nba_events(rec, cast(count, 32, false), traced);
     if (trig_ids.size() == 1) {
         b_.CreateCall(intra_event_register_fn(), { trig_ids[0], rec });
         return;

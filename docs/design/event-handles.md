@@ -286,7 +286,7 @@ Fields 2 and 3 are exactly `wait_elem_ty()`'s `{ ptr, ptr }`
 (`ir/llvm/Events.cpp, wait_elem_ty`) — the parked coroutine handle **with its region tag
 bits intact** (`kReactiveHomeTag = 2`; `emit_wake_push` is what strips
 them) and the opaque `sched_flag` pointer, which is a constant GEP
-into `clotho.proc_sched` for a process and a frame alloca for a task
+into `clotho.wake` for a process and a frame alloca for a task
 — store it raw and never interpret it.
 
 ### 6.2 Two node storage classes, one list

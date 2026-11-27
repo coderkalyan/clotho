@@ -896,6 +896,13 @@ struct CoverPoint {
     bool     is_auto    = false;
     uint32_t auto_total = 0;
     bool     is_signed  = false;
+    // option.comment and type_option.comment (LRM 19.7, 19.7.1), shown in the
+    // coverage report: empty when unset.
+    std::string inst_comment;
+    std::string type_comment;
+    // type_option.weight and type_option.goal of the coverpoint (LRM 19.7.1).
+    uint32_t type_weight = 1;
+    uint32_t type_goal   = 100;
 
     bool operator==(const CoverPoint&) const = default;
 };
@@ -909,9 +916,21 @@ struct CoverType {
     // names an instance by ("top.u1.") is read when the covergroup is constructed
     // (CoverOp::New), so the instances of one module share the one type.
     std::vector<CoverPoint> points;
+    // option.weight, and type_option.weight (the weight in $get_coverage).
     uint32_t                weight       = 1;
+    uint32_t                type_weight  = 1;
     uint32_t                goal         = 100;
     bool                    per_instance = false;
+    // option.at_least of the covergroup: the default its coverpoints took.
+    uint32_t                at_least     = 1;
+    // option.name (LRM 19.7, Table 19-1): the name each instance starts with, unset
+    // when the group leaves it to the tool.
+    std::optional<std::string> inst_name;
+    // option.comment and type_option.comment of the covergroup, shown in the report.
+    std::string inst_comment;
+    std::string type_comment;
+    // type_option.goal (LRM 19.7.1).
+    uint32_t type_goal = 100;
 
     bool operator==(const CoverType&) const = default;
 };
@@ -1007,8 +1026,8 @@ public:
     // covergroup: a covergroup declared in a module instantiated twice covers two
     // different sets of signals and reports as two types.
     std::vector<CoverType> cover_types;
-    // The first top instance's name (LRM 35.5.3). Every top gets its own DPI
-    // svScope, registered from `tops()`; this is only the fallback name for a
+    // The first top instance's name. Every top gets its own DPI svScope (LRM 35.5.3),
+    // registered from `tops()`; this is only the fallback name for a
     // design with no top instances at all, and the default `name` for a multi-top
     // module.
     std::string top_name;

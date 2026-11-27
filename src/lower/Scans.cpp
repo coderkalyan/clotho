@@ -161,11 +161,27 @@ const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e) 
 // in that order because slang answers isDynamicallySizedArray() for an
 // associative array too (foreach_dim_ref was bitten by exactly that).
 //
-// A FIXED unpacked array is deliberately absent. Its storage never changes
-// extent, so it has no mutation op at all -- every write to one is an element
-// store -- and it is refused rather than given a notifier nothing would fire.
+// A FIXED unpacked array is deliberately absent: its extent never changes, so it has
+// no mutation op, and every write to one is an element store. It is an aggregate
+// (is_notified_aggregate).
 bool is_notified_container(const slang::ast::Type& ty) {
     return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray();
+}
+
+// The aggregates whose members one any-change notifier covers: an unpacked struct, an
+// unpacked union and a FIXED unpacked array. The property is one variable, and LRM
+// 9.4.2.2 adds a variable the statement reads, not a member of it, so a change
+// anywhere in it wakes. A store to a leaf or an element classifies its own old -> new
+// transition, as a scalar property's does, and fires the property's notifier; a copy
+// over the whole of it, and a mutation of a container inside it, fire it too. There is no
+// edge notifier: an edge is the least significant bit of an expression (LRM 9.4.2),
+// which an aggregate has none of, and `@` over a whole aggregate is no legal event
+// expression (9.4.2: "Event expressions shall return singular values").
+//
+// An event member is no value a wait or `@*` reads, so a trigger fires nothing; the
+// member's own stores (its non-event siblings') do.
+bool is_notified_aggregate(const slang::ast::Type& ty) {
+    return ty.isUnpackedStruct() || ty.isUnpackedUnion() || (ty.isUnpackedArray() && !is_notified_container(ty));
 }
 
 PropNotify prop_notify_kind(const slang::ast::Type& ty) {
@@ -179,7 +195,7 @@ PropNotify prop_notify_kind(const slang::ast::Type& ty) {
         return PropNotify::None;
     }
     if (ty.isIntegral() || ty.isFloating() || ty.isClass() || ty.isCHandle() ||
-        ty.isVirtualInterface()) {
+        ty.isVirtualInterface() || ty.isCovergroup()) {
         return PropNotify::Word;
     }
     return PropNotify::None;
@@ -221,13 +237,111 @@ const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e
     return prop;
 }
 
-// Either kind: what a `wait` condition can park on. The design-wide pre-pass and
-// the wait lowering MUST agree on this set, so both call this and nothing else.
+// The AGGREGATE property an expression names. Like a container's, its notifier is for a
+// level-sensitive wait: it fires on a change anywhere in the property, and a wait
+// re-tests its condition. See is_notified_aggregate.
+const slang::ast::ClassPropertySymbol* waited_aggregate_prop(const Expression& e) {
+    const auto* prop = instance_class_prop(e);
+    if (prop == nullptr || !is_notified_aggregate(prop->getType().getCanonicalType())) {
+        return nullptr;
+    }
+    return prop;
+}
+
+// Any of the three kinds: what a `wait` condition, or an inferred `@*`, can park on.
+// The design-wide pre-pass and the wait lowering MUST agree on this set, so both call
+// this and nothing else.
 const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e) {
     if (const auto* p = waited_class_prop(e); p != nullptr) {
         return p;
     }
-    return waited_container_prop(e);
+    if (const auto* p = waited_container_prop(e); p != nullptr) {
+        return p;
+    }
+    return waited_aggregate_prop(e);
+}
+
+bool event_term_reads_member(const Expression& e) {
+    if (e.type->isEvent()) {
+        return false;
+    }
+    if (reads_vif(e)) {
+        return true;
+    }
+    ClassPropReadScan scan;
+    e.visit(scan);
+    return scan.any_prop;
+}
+
+bool reads_vif(const Expression& e) {
+    struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
+        bool found = false;
+        void handle(const MemberAccessExpression& ma) {
+            found = found || ma.value().type->getCanonicalType().isVirtualInterface();
+            visitDefault(ma);
+        }
+    };
+    Scan scan;
+    e.visit(scan);
+    return scan.found;
+}
+
+bool is_vif_member(const Expression& e) {
+    return e.kind == ExpressionKind::MemberAccess &&
+           e.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface();
+}
+
+bool lone_member_term(const Expression& e) {
+    return !e.type->isEvent() &&
+           (waited_class_prop(e) != nullptr || weak_get_call(e) != nullptr || is_vif_member(e));
+}
+
+bool event_expr_reads_heap(const Expression& e, const MethodOverrides& overrides) {
+    if (e.type->isEvent() || lone_member_term(e)) {
+        return false;
+    }
+    if (reads_vif(e)) {
+        return true;
+    }
+    ClassPropReadScan props;
+    e.visit(props);
+    if (props.any_prop || !props.weak_gets.empty()) {
+        return true;
+    }
+    if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
+        return false;
+    }
+    const CalleeReads called = callee_reads(e, overrides);
+    return called.method_call || !called.props.empty() || !called.builtins.empty();
+}
+
+void event_terms(const TimingControl& tc, std::vector<const SignalEventControl*>& out) {
+    switch (tc.kind) {
+        case TimingControlKind::SignalEvent:
+            out.push_back(&tc.as<SignalEventControl>());
+            return;
+        case TimingControlKind::EventList:
+            for (const TimingControl* t : tc.as<EventListControl>().events) {
+                event_terms(*t, out);
+            }
+            return;
+        default:
+            // An implicit @* names no term of its own, and no other control is a list member.
+            return;
+    }
+}
+
+bool same_member_read(const MemberAccessExpression& a, const MemberAccessExpression& b) {
+    if (&a.member != &b.member) {
+        return false;
+    }
+    const auto variable = [](const Expression& h) {
+        return h.kind == ExpressionKind::NamedValue || h.kind == ExpressionKind::HierarchicalValue;
+    };
+    const Expression& ha = a.value();
+    const Expression& hb = b.value();
+    return variable(ha) && variable(hb) &&
+           &ha.as<ValueExpressionBase>().symbol == &hb.as<ValueExpressionBase>().symbol;
 }
 
 bool is_weak_reference_class(const slang::ast::ClassType& clt) {
@@ -240,6 +354,14 @@ bool is_weak_reference_class(const slang::ast::ClassType& clt) {
 
 bool is_sync_builtin_class(const slang::ast::ClassType& clt) {
     if (clt.name != "semaphore" && clt.name != "mailbox") {
+        return false;
+    }
+    const slang::ast::Scope* pkg = clt.getParentScope();
+    return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+}
+
+bool is_process_class(const slang::ast::ClassType& clt) {
+    if (clt.name != "process") {
         return false;
     }
     const slang::ast::Scope* pkg = clt.getParentScope();
@@ -327,8 +449,23 @@ void ClassPropReadScan::handle(const slang::ast::HierarchicalValueExpression& e)
     visitDefault(e);
 }
 
+static bool roots_at_class_prop(const Expression& e);
+
+void ClassPropReadScan::take_event_place(const Expression& e) {
+    if (e.type->isEvent() && roots_at_class_prop(e) && instance_class_prop(e) == nullptr) {
+        event_props.push_back(&e);
+        any_prop = true;
+    }
+}
+
+void ClassPropReadScan::handle(const slang::ast::ElementSelectExpression& es) {
+    take_event_place(es);
+    visitDefault(es);
+}
+
 void ClassPropReadScan::handle(const MemberAccessExpression& ma) {
     take(ma);
+    take_event_place(ma);
     // Descended into on purpose: the object expression of `a.b.p` can itself
     // read properties, and a compound condition nests member accesses.
     visitDefault(ma);
@@ -338,12 +475,16 @@ void ClassPropReadScan::handle(const MemberAccessExpression& ma) {
 // whether a `wait` reading one can ever be woken. Exactly the class-property
 // partition, because a capture box IS a one-field class object
 // (docs/design/fork-join.md V4) and its field takes the same notifier machinery:
-// one classified word, a string's content, or a container's mutation surface. An
-// unpacked struct / union / fixed unpacked array carries none, and the wait
-// lowering refuses it by name rather than parking on nothing.
+// one classified word, a string's content, a container's mutation surface, or an
+// aggregate's members. A captured event has none and needs none: it is waited on
+// through the object it holds (Lowerer::expr_wait_deps).
 bool box_can_notify(const slang::ast::Type& ty) {
     const slang::ast::Type& ct = ty.getCanonicalType();
-    return prop_notify_kind(ct) != PropNotify::None || is_notified_container(ct);
+    return prop_notify_kind(ct) != PropNotify::None || is_notified_container(ct) || is_notified_aggregate(ct);
+}
+
+bool prop_can_notify(const slang::ast::Type& ty) {
+    return box_can_notify(ty);
 }
 
 void WaitLocalScan::handle(const slang::ast::NamedValueExpression& e) {
@@ -537,7 +678,10 @@ void CalleeReadScan::handle(const CallExpression& call) {
     // function of the two classes reads the FIFO or the key count.
     const bool sync = is_sync_builtin_class(cls);
     const bool weak = depth != 0 && sub.name == "get" && is_weak_reference_class(cls);
-    if ((sync || weak) && seen.insert(&cls).second) {
+    // A thread's state (LRM 9.7), which nothing stores where a notifier could see
+    // it: the thread's own parks and its end change it.
+    const bool status = sub.name == "status" && is_process_class(cls);
+    if ((sync || weak || status) && seen.insert(&cls).second) {
         out->builtins.push_back(&cls);
     }
 }
@@ -566,12 +710,20 @@ CalleeReads callee_reads(const Expression& e, const MethodOverrides& overrides) 
 
 // The design-wide notifiers `e` needs: one per instance property and per built-in
 // class that a subroutine it calls reads.
+//
+// An `event` property has two. Its own fires when another event is stored into it.
+// What a method reads through it (`e.triggered`, LRM 15.5.3) changes when the event
+// it names is triggered, and that may be any event of the design, so the second is
+// one notifier every trigger fires, keyed here on the design root.
 void WaitPropScan::note_callees(const Expression& e) {
     const CalleeReads reads = callee_reads(e, out->overrides);
     for (const slang::ast::ClassPropertySymbol* prop : reads.props) {
-        // A property of a type that has no notifier (an unpacked struct or union,
-        // a fixed unpacked array) has no design-wide one either.
-        if (box_can_notify(prop->getType())) {
+        // A property of a type that has no notifier (a covergroup handle) has no
+        // design-wide one either.
+        if (prop->getType().getCanonicalType().isEvent()) {
+            out->add_shared(*prop);
+            out->add_shared(prop->getParentScope()->getCompilation().getRoot());
+        } else if (prop_can_notify(prop->getType())) {
             out->add_shared(*prop);
         }
     }
@@ -580,31 +732,40 @@ void WaitPropScan::note_callees(const Expression& e) {
     }
 }
 
+// What a sampling wait over `e` needs laid out (Lowerer::lower_sampled_event_wait): the
+// design-wide notifiers of what the subroutines it calls read, and the any-change notifier
+// of each property it reads, of each fork-captured automatic and of each weak reference it
+// reads get() of.
+void WaitPropScan::note_sampled(const Expression& e) {
+    note_callees(e);
+    ClassPropReadScan scan;
+    e.visit(scan);
+    for (const Expression* p : scan.notifiable) {
+        const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*p);
+        if (is_notified_container(prop.getType().getCanonicalType())) {
+            out->add_container(prop);
+        } else {
+            out->add(prop, ir::Edge::Any);
+        }
+    }
+    for (const CallExpression* get : scan.weak_gets) {
+        out->weak_classes.insert(
+          &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
+    }
+    WaitLocalScan locals;
+    locals.out = &out->locals;
+    e.visit(locals);
+}
+
 void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
-    note_callees(ev.expr);
-    // A sampled event control (Lowerer::lower_sampled_event_wait) parks as a wait
-    // does: on the any-change notifier of each property its expression reads, of
-    // each fork-captured automatic, and of each weak reference it reads get() of.
-    // Which controls are sampled is the lowering's to say, with what this pass has
-    // not got; a notifier laid out for one that is not is a field nothing parks on.
+    // A sampled event control parks as a wait does. Which controls are sampled is the
+    // lowering's to say (Lowerer::classify_event_control), with what this pass has not got;
+    // a notifier laid out for one that is not is a field nothing parks on. A property and a
+    // weak reference named by themselves have a notifier of their own, laid out below.
     if (waited_class_prop(ev.expr) == nullptr && weak_get_call(ev.expr) == nullptr) {
-        ClassPropReadScan scan;
-        ev.expr.visit(scan);
-        for (const Expression* e : scan.notifiable) {
-            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
-            if (is_notified_container(prop.getType().getCanonicalType())) {
-                out->add_container(prop);
-            } else {
-                out->add(prop, ir::Edge::Any);
-            }
-        }
-        for (const CallExpression* get : scan.weak_gets) {
-            out->weak_classes.insert(
-              &std::get<0>(get->subroutine)->getParentScope()->asSymbol().as<slang::ast::ClassType>());
-        }
-        WaitLocalScan locals;
-        locals.out = &out->locals;
-        ev.expr.visit(locals);
+        note_sampled(ev.expr);
+    } else {
+        note_callees(ev.expr);
     }
     if (const auto* prop = waited_class_prop(ev.expr); prop != nullptr) {
         // An edge on a property whose type has no LSB lattice mints no notifier.
@@ -648,6 +809,38 @@ void WaitPropScan::handle(const slang::ast::SignalEventControl& ev) {
     visitDefault(ev);
 }
 
+// Whether an expression names an automatic variable, which a fork can capture in a box.
+// The pre-pass cannot tell which are boxed; the lowering does (Lowerer::is_boxed_symbol).
+static bool names_automatic_variable(const Expression& e) {
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
+    WaitLocalScan                                                scan;
+    scan.out = &named;
+    e.visit(scan);
+    return std::ranges::any_of(named, [](const slang::ast::ValueSymbol* vs) {
+        // A class property is no local, though slang gives it a lifetime too.
+        return (vs->kind == SymbolKind::Variable || vs->kind == SymbolKind::FormalArgument) &&
+               vs->as<slang::ast::VariableSymbol>().lifetime == slang::ast::VariableLifetime::Automatic;
+    });
+}
+
+// An event list some of whose terms are waited on by sampling (Lowerer::classify_event_control)
+// parks on the any-change notifier of every property any of its terms reads, a property named
+// by itself included: its edge notifier alone would not wake the comparison. Whether the list
+// is one of those is the lowering's to say; the terms below still lay out their own notifiers,
+// for a list that is not.
+void WaitPropScan::handle(const slang::ast::EventListControl& list) {
+    std::vector<const SignalEventControl*> terms;
+    event_terms(list, terms);
+    if (std::ranges::any_of(terms, [&](const SignalEventControl* t) {
+            return event_expr_reads_heap(t->expr, out->overrides) || names_automatic_variable(t->expr);
+        })) {
+        for (const SignalEventControl* t : terms) {
+            note_sampled(t->expr);
+        }
+    }
+    visitDefault(list);
+}
+
 void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
     note_callees(w.cond);
     // A level wait re-tests its condition on every wake, so any change in any
@@ -675,6 +868,25 @@ void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
     visitDefault(w);
 }
 
+// An implicit `@*` before a statement reads the class properties that statement reads
+// (LRM 9.4.2.2), so their object bodies must carry change notifiers before any class
+// is laid out, as for a `wait`.
+void WaitPropScan::handle(const slang::ast::TimedStatement& t) {
+    if (t.timing.kind == slang::ast::TimingControlKind::ImplicitEvent) {
+        ClassPropReadScan scan;
+        t.stmt.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
+            if (is_notified_container(prop.getType().getCanonicalType())) {
+                out->add_container(prop);
+            } else {
+                out->add(prop, ir::Edge::Any);
+            }
+        }
+    }
+    visitDefault(t);
+}
+
 // Every class declared under `scope`, appended to `out`. This is what makes static
 // property initialization eager (LRM 6.21 / 8.9): the initializers must run once at
 // the beginning of simulation whether or not anything ever names the property, so
@@ -692,6 +904,47 @@ void WaitPropScan::handle(const slang::ast::WaitStatement& w) {
 // A package member is deliberately NOT descended into: the caller enumerates
 // packages itself (lower_globals), so that a package's classes are initialized once
 // on the globals Lowerer rather than once per top that imports it.
+void RngReceiverScan::handle(const ClassType& cls) {
+    in_class.push_back(&cls);
+    visitDefault(cls);
+    in_class.pop_back();
+}
+
+void RngReceiverScan::handle(const slang::ast::CallExpression& call) {
+    bool scope_randomize = false;
+    if (call.subroutine.index() == 0) {
+        const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        const Scope*            own = sub.getParentScope();
+        const bool builtin_class = sub.flags.has(slang::ast::MethodFlags::BuiltIn) && own != nullptr &&
+                                   own->asSymbol().kind == SymbolKind::ClassType;
+        if (!builtin_class || (sub.name != "srandom" && sub.name != "get_randstate" && sub.name != "set_randstate")) {
+            visitDefault(call);
+            return;
+        }
+    } else if (call.getSubroutineName() != "randomize") {
+        visitDefault(call);
+        return;
+    } else {
+        const auto args = call.arguments();
+        scope_randomize = !args.empty() && args[0]->kind == ExpressionKind::Assignment;
+    }
+    if (!scope_randomize) {
+        const ClassType* cls = nullptr;
+        if (const Expression* t = call.thisClass()) {
+            cls = t->type->getCanonicalType().as_if<ClassType>();
+        } else if (call.getSubroutineName() == "randomize" && !call.arguments().empty() &&
+                   call.arguments()[0]->type->getCanonicalType().isClass()) {
+            cls = call.arguments()[0]->type->getCanonicalType().as_if<ClassType>();
+        } else if (!in_class.empty()) {
+            cls = in_class.back();
+        }
+        if (cls != nullptr) {
+            out->marked.insert(cls);
+        }
+    }
+    visitDefault(call);
+}
+
 void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out) {
     for (const Symbol& m : scope.members()) {
         switch (m.kind) {
@@ -1020,6 +1273,31 @@ void SensitivityCollector::mark_written(const ValueSymbol& sym) {
     }
 }
 
+// Whether a place expression is, or selects inside, a class property read through a
+// handle: through struct members, element selects and part selects, down to the
+// property itself.
+static bool roots_at_class_prop(const Expression& e) {
+    const Expression* cur = &e;
+    for (;;) {
+        if (instance_class_prop(*cur) != nullptr) {
+            return true;
+        }
+        switch (cur->kind) {
+            case ExpressionKind::MemberAccess:
+                cur = &cur->as<MemberAccessExpression>().value();
+                break;
+            case ExpressionKind::ElementSelect:
+                cur = &cur->as<ElementSelectExpression>().value();
+                break;
+            case ExpressionKind::RangeSelect:
+                cur = &cur->as<RangeSelectExpression>().value();
+                break;
+            default:
+                return false;
+        }
+    }
+}
+
 // Record the write target(s) of an lvalue: the base name is written, but any
 // selector expression on it (an index or a non-constant part-select bound) is
 // a read and is descended into.
@@ -1059,6 +1337,22 @@ void SensitivityCollector::record_write(const Expression& lhs) {
             for (const Expression* op : pat.elements()) {
                 record_write(*op);
             }
+            break;
+        }
+        case ExpressionKind::MemberAccess: {
+            // The member written is not read; the handle it goes through is.
+            const auto& ma = lhs.as<MemberAccessExpression>();
+            if (ma.value().type->getCanonicalType().isVirtualInterface() || instance_class_prop(ma) != nullptr) {
+                read_object(ma.value());
+                break;
+            }
+            // A member of a class property (`obj.s.f = ...`) is a write of that property,
+            // which the statement does not read; the handle it goes through is.
+            if (ma.member.kind == SymbolKind::Field && roots_at_class_prop(ma.value())) {
+                record_write(ma.value());
+                break;
+            }
+            lhs.visit(*this);
             break;
         }
         case ExpressionKind::Conversion:
@@ -1136,30 +1430,91 @@ void SensitivityCollector::handle(const ForLoopStatement& f) {
     visitDefault(f);
 }
 
-// A called subroutine's argument expressions are always sensitive, and so is the
-// object a method is called on, which the call reads as it reads an argument
-// (`wait (w.get() == null)` is tested again when `w` is pointed at another
-// object). Its body contributes only for a *function* under Comb rules
-// (9.2.2.2.1): a function may reference module signals directly, not only through
-// its arguments, so descend once into the callee body — the callee's formals /
-// locals are not module signals (not in sigmap), so they are ignored, while module
-// signals it reads / writes are recorded as usual. Task bodies never contribute
-// (9.2.2.2.1: "the contents of the tasks do not add anything"), and under
-// ImplicitEvent (@*) rules no callee body does (9.2.2.2.2).
+// A called subroutine's argument expressions are always sensitive. So is the object a
+// method is called on under `@*`, `wait` and `@(expr)`, which read it as they read an
+// argument (`wait (w.get() == null)` is tested again when `w` is pointed at another
+// object, 9.4.2.2). An always_comb is different: "References to class objects and
+// method calls of class objects do not add anything to the sensitivity list of an
+// always_comb, except for any contributions from argument expressions passed to these
+// method calls" (9.2.2.2.1), so neither the handle nor the method's body adds anything
+// there and what selects the object (`objs[i].get()`) does. Any other function's body
+// contributes only for a *function* under Comb rules (9.2.2.2.1): a function may
+// reference module signals directly, not only through its arguments, so descend once
+// into the callee body — the callee's formals / locals are not module signals (not in
+// sigmap), so they are ignored, while module signals it reads / writes are recorded
+// as usual. Task bodies never contribute (9.2.2.2.1: "the contents of the tasks do not
+// add anything"), and under ImplicitEvent (@*) rules no callee body does (9.2.2.2.2).
 void SensitivityCollector::handle(const CallExpression& c) {
-    if (const Expression* receiver = c.thisClass(); receiver != nullptr) {
+    const Expression* receiver = c.thisClass();
+    // A virtual interface is no class object: a method called through one is a
+    // hierarchical call, analyzed as a normal function (9.2.2.2.1).
+    const bool object_call = receiver != nullptr && receiver->type->getCanonicalType().isClass();
+    if (object_call) {
+        read_object(*receiver);
+    } else if (receiver != nullptr) {
         receiver->visit(*this);
     }
     for (const Expression* arg : c.arguments()) {
         arg->visit(*this);
     }
-    if (c.isSystemCall() || mode != SensitivityMode::Comb) {
+    if (c.isSystemCall() || mode != SensitivityMode::Comb || object_call) {
         return;
     }
     const SubroutineSymbol* sub = std::get<0>(c.subroutine);
     if (sub != nullptr && sub->subroutineKind == SubroutineKind::Function && entered.insert(sub).second) {
         sub->getBody().visit(*this);
     }
+}
+
+void SensitivityCollector::read_object(const Expression& obj) {
+    if (mode != SensitivityMode::Comb) {
+        obj.visit(*this);
+        return;
+    }
+    switch (obj.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue:
+            return;
+        case ExpressionKind::ElementSelect: {
+            const auto& es = obj.as<ElementSelectExpression>();
+            read_object(es.value());
+            es.selector().visit(*this);
+            return;
+        }
+        case ExpressionKind::MemberAccess:
+            read_object(obj.as<MemberAccessExpression>().value());
+            return;
+        default:
+            obj.visit(*this);
+            return;
+    }
+}
+
+// A member reached through a handle. A virtual-interface member is a signal of the
+// instance the handle names (LRM 25.9): it joins the sensitivity beside the handle
+// itself, in `always @*` (9.4.2.2: every variable the statement reads) and in
+// `always_comb` (9.2.2.2.1's exemption is for class objects only). A non-static class
+// property joins it in `always @*` the same way, and adds nothing at all to an
+// `always_comb`, handle included.
+void SensitivityCollector::handle(const MemberAccessExpression& ma) {
+    if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+        if (!ma.type->isEvent() &&
+            std::ranges::none_of(handles.vif, [&](const MemberAccessExpression* h) { return same_member_read(*h, ma); })) {
+            handles.vif.push_back(&ma);
+        }
+        visitDefault(ma);
+        return;
+    }
+    if (instance_class_prop(ma) != nullptr) {
+        if (mode == SensitivityMode::Comb) {
+            read_object(ma.value());
+            return;
+        }
+        if (level_waited_prop(ma) != nullptr) {
+            handles.props.push_back(&ma);
+        }
+    }
+    visitDefault(ma);
 }
 
 // Whether this node, ignoring its children, is safe to evaluate eagerly.
@@ -1920,30 +2275,20 @@ void BoxCandidateScan::handle(const BlockStatement& blk) {
         ValueRefScan rs;
         rs.out           = &candidates;
         rs.implicit_this = &implicit_this;
-        // NEITHER HALF of one of the fork's own declarations is a capture, because
-        // LRM 9.3.2 initializes such a variable "before any processes are spawned":
-        // lower_fork materializes it in the PARENT at the fork and gives it a fresh
-        // box per ENTRY, not the per-activation box install_capture_boxes hands out.
-        // Two consequences, and the clause's example turns on both:
+        // The INITIALIZER of one of the fork's own declarations is no child's
+        // reference: LRM 9.3.2 initializes such a variable "before any processes are
+        // spawned", so lower_fork evaluates it in the parent. That is what makes the
+        // clause's own carve-out implementable -- referring to a formal passed by
+        // reference is legal there even under join_any / join_none, precisely
+        // because no child-side access is involved.
         //
-        //   - the variable itself must not be boxed per activation, or one box
-        //     would be shared by every iteration's children and the clause's
-        //     example would print 333 instead of 123;
-        //   - its INITIALIZER is evaluated in the parent, so what that initializer
-        //     reads is not captured at all. That is what makes the clause's own
-        //     carve-out implementable -- referring to a formal passed by reference
-        //     is legal there even under join_any / join_none, precisely because no
-        //     child-side access is involved.
-        //
-        // A `begin ... end` nested inside the fork is a DIFFERENT block, so its
-        // declarations are none of this and keep the ordinary late path: the
-        // clause's own example says the nested `automatic int m = j` "is 4".
+        // A `begin ... end` nested inside the fork is a DIFFERENT block, a child,
+        // and its declarations are the child's own: the clause's example says the
+        // nested `automatic int m = j` "is 4".
         for_each_fork_stmt(blk, [&](const Statement& s) {
-            if (const auto* d = s.as_if<VariableDeclStatement>()) {
-                fork_scope_decls.insert(&d->symbol);
-                return;
+            if (s.kind != StatementKind::VariableDeclaration) {
+                s.visit(rs);
             }
-            s.visit(rs);
         });
     }
     visitDefault(blk);

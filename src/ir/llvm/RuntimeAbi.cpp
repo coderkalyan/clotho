@@ -427,23 +427,46 @@ llvm::FunctionCallee Backend::sscanf_fn() {
 }
 
 // i32 rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
-//                i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
-//                i64 start, i64 finish, i32 flags)
+//                i32 stride, i32 width, i64* inner, i32 inner_dims,
+//                i64 decl_left, i64 decl_right, i64 lo_word, i64 word_count,
+//                i64 ring_head, i64 ring_cap, i64 start, i64 finish, i32 flags, ptr site)
 llvm::FunctionCallee Backend::readmem_fn() {
     auto* ptr = raw_ptr_ty();
     auto* i32 = b_.getInt32Ty();
     auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_readmem", i32, { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
+    return rt_fn("rt_readmem", i32,
+                 { ptr, i32, ptr, ptr, i32, i32, ptr, i32, i64, i64, i64, i64, i64, i64, i64, i64, i32, ptr });
 }
 
-// i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 count, i32 width, i32 four,
-//              i64 decl_left, i64 decl_right, i64 start, i64 max_count, i32 flags,
-//              ptr site, i64 now)
+// i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 width, i32 four,
+//              i64* inner, i32 inner_dims, i64 decl_left, i64 decl_right,
+//              i64 lo_word, i64 word_count, i64 ring_head, i64 ring_cap,
+//              i64 start, i64 max_count, i32 flags, ptr site, i64 now)
 llvm::FunctionCallee Backend::fread_fn() {
     auto* ptr = raw_ptr_ty();
     auto* i32 = b_.getInt32Ty();
     auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_fread", i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32, ptr, i64 });
+    return rt_fn("rt_fread", i32,
+                 { i32, ptr, ptr, i32, i32, i32, ptr, i32, i64, i64, i64, i64, i64, i64, i64, i64, i32, ptr, i64 });
+}
+
+// i32 rt_readmem_assoc(const char* path, i32 path_len, ptr handle, ptr ops, i32 key_width, i32 stride,
+//                      i32 width, i32 z_off, i64* inner, i32 inner_dims, i64 start, i64 finish, i32 flags,
+//                      ptr alloc, ptr site)
+llvm::FunctionCallee Backend::readmem_assoc_fn() {
+    auto* ptr = raw_ptr_ty();
+    auto* i32 = b_.getInt32Ty();
+    auto* i64 = b_.getInt64Ty();
+    return rt_fn("rt_readmem_assoc", i32, { ptr, i32, ptr, ptr, i32, i32, i32, i32, ptr, i32, i64, i64, i32, ptr, ptr });
+}
+
+// i32 rt_fread_assoc(i32 fd, ptr handle, ptr ops, i32 key_width, i32 stride, i32 width, i32 z_off,
+//                    i64* inner, i32 inner_dims, i64 start, i64 max_count, i32 flags, ptr alloc, ptr site)
+llvm::FunctionCallee Backend::fread_assoc_fn() {
+    auto* ptr = raw_ptr_ty();
+    auto* i32 = b_.getInt32Ty();
+    auto* i64 = b_.getInt64Ty();
+    return rt_fn("rt_fread_assoc", i32, { i32, ptr, ptr, i32, i32, i32, i32, ptr, i32, i64, i64, i32, ptr, ptr });
 }
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
@@ -566,11 +589,12 @@ llvm::FunctionCallee Backend::value_plusargs_fn() {
     return env_->llmod.getOrInsertFunction("rt_value_plusargs", fnty);
 }
 
-// i32 rt_value_plusargs_str(const char* prefix, i32 prefix_len, rt_string* dst,
+// i32 rt_value_plusargs_str(const char* prefix, i32 prefix_len, i32 conv, rt_string* dst,
 //                           const rt_alloc_site*)
 llvm::FunctionCallee Backend::value_plusargs_str_fn() {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* fnty = llvm::FunctionType::get(b_.getInt32Ty(), { ptr, b_.getInt32Ty(), ptr, ptr }, false);
+    auto* i32  = b_.getInt32Ty();
+    auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr, ptr }, false);
     return env_->llmod.getOrInsertFunction("rt_value_plusargs_str", fnty);
 }
 
@@ -1387,17 +1411,26 @@ llvm::StructType* Backend::gc_map_ty() {
     return gc_map_ty_;
 }
 
-// rt_gc_roots (Gc.h:100-105): { ptr base, i32 nhandles, i32 reserved, ptr offsets }.
+// rt_gc_roots (Gc.h): { ptr base, i32 nhandles, i32 bytes, ptr offsets, i32 cards, i32 flags,
+// i32 ncontainers, i32 reserved, ptr containers }.
 llvm::StructType* Backend::gc_roots_ty() {
     if (gc_roots_ty_ == nullptr) {
-        gc_roots_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() },
-          "clotho.gcroots");
+        gc_roots_ty_ = llvm::StructType::create(ctx_,
+                                                { raw_ptr_ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  raw_ptr_ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  b_.getInt32Ty(),
+                                                  raw_ptr_ty() },
+                                                "clotho.gcroots");
     }
     return gc_roots_ty_;
 }
 
-// rt_gc_container (Gc.h:249-254): { i64 offset, i32 kind, i32 reserved, ptr ops }.
+// rt_gc_container (Gc.h): { i64 offset, i32 kind, i32 flag, ptr ops }.
 // `ops` is the container's OWN descriptor (kind 2 / 3 / 5), so ops->kind equals
 // `kind` and ops->inner describes the element -- the convention nested container
 // elements already use, which is what lets the collector treat a root entry, a
@@ -1409,17 +1442,6 @@ llvm::StructType* Backend::gc_container_ty() {
           "clotho.gccontainer");
     }
     return gc_container_ty_;
-}
-
-// rt_gc_container_table (Gc.h:256-261):
-// { ptr base, i32 count, i32 reserved, ptr entries }.
-llvm::StructType* Backend::gc_container_table_ty() {
-    if (gc_container_table_ty_ == nullptr) {
-        gc_container_table_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() },
-          "clotho.gccontainers");
-    }
-    return gc_container_table_ty_;
 }
 
 llvm::StructType* Backend::gc_frame_ty() {
@@ -1537,13 +1559,9 @@ llvm::FunctionCallee Backend::gc_nba_container_add_fn() {
                  { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
 }
 
-// The container-root ABI (Gc.h:263-268). rt_gc_containers_add takes a constant
-// rt_gc_container_table for state-resident storage; the add / remove pair takes a
-// live rt_dynarr / rt_queue / rt_assoc address for a frame local or a body
-// temporary.
-llvm::FunctionCallee Backend::gc_containers_add_fn() {
-    return rt_fn("rt_gc_containers_add", b_.getVoidTy(), { raw_ptr_ty() });
-}
+// The container-root ABI (Gc.h). The containers of design state are entries of a region's root
+// table; the add / remove pair takes a live rt_dynarr / rt_queue / rt_assoc address for a frame
+// local or a body temporary.
 
 llvm::FunctionCallee Backend::gc_container_add_fn() {
     return rt_fn("rt_gc_container_add", b_.getVoidTy(),
@@ -1581,6 +1599,18 @@ llvm::FunctionCallee Backend::gc_remember_fn() {
     return rt_fn("rt_gc_remember", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
+// rt_gc_note_ref_store (Gc.h): a handle is being stored through a `ref` formal's place.
+// (address, witness chain, bytes stored).
+llvm::FunctionCallee Backend::gc_note_ref_store_fn() {
+    return rt_fn("rt_gc_note_ref_store", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+}
+
+// rt_gc_note_state_store (Gc.h): the cold half of the inline card test of a store into design
+// state. (address, bytes stored).
+llvm::FunctionCallee Backend::gc_note_state_store_fn() {
+    return rt_fn("rt_gc_note_state_store", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+}
+
 // -- Functional coverage struct mirrors and entry points (src/runtime/Coverage.h) --
 
 llvm::StructType* Backend::cover_range_ty() {
@@ -1610,6 +1640,10 @@ llvm::StructType* Backend::cover_point_ty() {
                                                      b_.getInt32Ty(),
                                                      b_.getInt32Ty(),
                                                      b_.getInt32Ty(),
+                                                     b_.getInt32Ty(),
+                                                     raw_ptr_ty(),
+                                                     raw_ptr_ty(),
+                                                     b_.getInt32Ty(),
                                                      b_.getInt32Ty() },
                                                    "clotho.coverpoint");
     }
@@ -1625,6 +1659,12 @@ llvm::StructType* Backend::cover_type_ty() {
                                                     raw_ptr_ty(),
                                                     b_.getInt32Ty(),
                                                     b_.getInt32Ty(),
+                                                    b_.getInt32Ty(),
+                                                    b_.getInt32Ty(),
+                                                    b_.getInt32Ty(),
+                                                    raw_ptr_ty(),
+                                                    raw_ptr_ty(),
+                                                    raw_ptr_ty(),
                                                     b_.getInt32Ty() },
                                                   "clotho.covertype");
     }
@@ -1679,6 +1719,48 @@ llvm::FunctionCallee Backend::cover_start_fn() {
     return rt_fn("rt_cover_start", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
 }
 
+llvm::FunctionCallee Backend::cover_start_point_fn() {
+    return rt_fn("rt_cover_start_point", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_opt_set_fn() {
+    return rt_fn("rt_cover_opt_set", b_.getVoidTy(),
+                 { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_opt_get_fn() {
+    return rt_fn("rt_cover_opt_get", b_.getInt64Ty(), { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_opt_set_str_fn() {
+    return rt_fn("rt_cover_opt_set_str", b_.getVoidTy(),
+                 { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt64Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_opt_get_str_fn() {
+    return rt_fn("rt_cover_opt_get_str", b_.getVoidTy(),
+                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_set_fn() {
+    return rt_fn("rt_cover_type_opt_set", b_.getVoidTy(),
+                 { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_get_fn() {
+    return rt_fn("rt_cover_type_opt_get", b_.getInt64Ty(), { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_set_str_fn() {
+    return rt_fn("rt_cover_type_opt_set_str", b_.getVoidTy(),
+                 { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt64Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_opt_get_str_fn() {
+    return rt_fn("rt_cover_type_opt_get_str", b_.getVoidTy(),
+                 { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
+}
+
 llvm::FunctionCallee Backend::cover_set_name_fn() {
     return rt_fn("rt_cover_set_inst_name", b_.getVoidTy(),
                  { b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty() });
@@ -1694,6 +1776,10 @@ llvm::FunctionCallee Backend::cover_point_query_fn(const char* name, llvm::Type*
 
 llvm::FunctionCallee Backend::cover_type_query_fn(const char* name, llvm::Type* ret) {
     return rt_fn(name, ret, { b_.getInt32Ty() });
+}
+
+llvm::FunctionCallee Backend::cover_type_point_query_fn(const char* name, llvm::Type* ret) {
+    return rt_fn(name, ret, { b_.getInt32Ty(), b_.getInt32Ty() });
 }
 
 llvm::FunctionCallee Backend::cover_design_coverage_fn() {

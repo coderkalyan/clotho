@@ -498,42 +498,48 @@ struct LValueInfo {
     // The invariant, which every propagation site preserves: non-null implies a class
     // handle can land at or under this place, inside that owner.
     llvm::Value* gc_owner = nullptr;
-    // This assoc's key CONTAINS a class or event handle (rt_elem_ops carries its key
-    // shape, `assoc_key_shape`), so creating an entry stores a handle into
-    // the map's key storage -- a reference the owner acquires even when the VALUE is an
-    // int, and one that no further member selection is party to. Lifted onto the assoc
-    // lvalue at AssocSelect and consumed by assoc_elem_lvalue's put_ptr path, which is
-    // where the key is actually written.
-    bool assoc_key_handle = false;
-    // The OUTERMOST container on the path from `gc_owner` to this place whose handle
-    // still lives inside the owner's BODY, with its interned type. Non-null only once a
-    // select has re-based into that container's malloc'd payload, which is exactly when
-    // a `ref` formed here hands the callee a payload-interior pointer that
-    // rt_gc_find_object cannot resolve -- so the conservative frame scan cannot reach
-    // the owner and the collector's re-log cannot carry it forward across a suspension.
-    //
-    // The outermost one, and never the inner element: an element address is inside a
-    // payload that an outer ring growth reallocates, whereas a container handle in the
-    // object body is at a fixed address and never relocates. Registering the inner one
-    // would leave the collector reading freed memory after exactly the restructuring
-    // the ref epoch exists to detect (:22568-22569).
-    //
-    // Consumed only by lower_task_call_inst, which registers it as a dynamically-scoped
-    // container root for the call's duration (emit_gc_ref_container_add).
-    llvm::Value* gc_container_root = nullptr;
-    Ref          gc_container_type = Ref::Invalid;
+    // Creating an entry of this assoc stores a handle into the map -- a key that holds a class
+    // or event handle (rt_elem_ops carries its key shape, `assoc_key_shape`), or a value that
+    // can (an entry's value is constructed, and an event's construction makes an object) -- a
+    // reference the place's owner acquires even when the value stored afterwards is an int, and
+    // one that no further member selection is party to. Lifted onto the assoc lvalue at
+    // AssocSelect and consumed by assoc_elem_lvalue's put_ptr path, which is where the entry is
+    // created.
+    bool assoc_put_handle = false;
+    // The place is reached through a `ref` formal, which aliases storage the callee
+    // cannot attribute to an owner statically: an object's body, design state, a frame, or
+    // an element of a container some object owns. `gc_ref_slot` is the aliased address
+    // and `gc_ref_chain` the witness chain the call passed (null for a place that cannot
+    // move), which together let the runtime find the owner when a store lands
+    // (rt_gc_note_ref_store). Set only where the formal's type can hold a class handle,
+    // and cleared by agg_member for a member that cannot, as `gc_owner` is. Never set
+    // together with `gc_owner`: a HandleDeref starts a new place.
+    llvm::Value* gc_ref_slot  = nullptr;
+    llvm::Value* gc_ref_chain = nullptr;
+    // The place is inside the storage of design-state signal `gc_state_sig`, whose first byte is
+    // `gc_state_base`, and a class handle can land at or under it (docs/design/garbage-collection.md
+    // §7). Such a store is logged in the card of the region it lands in (emit_gc_state_barrier).
+    // Set at exactly one place, signal_lvalue; cleared by agg_member for a member that cannot reach
+    // a handle; carried by carry_gc_place through every element step. For a place inside a
+    // container's payload the card is the one of the outermost container, `epoch_chain.front()`.
+    // Never set together with `gc_owner` or `gc_ref_slot`.
+    llvm::Value* gc_state_base = nullptr;
+    Signal       gc_state_sig{ 0 };
     // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
     //
-    // The notifiers of the class property this place selects, when some `@` / `wait`
-    // in the design waits on it, plus the object body they live in. Null for every
-    // other place -- and null for EVERY place in a design that waits on no property,
+    // The notifiers of the class property this place selects, or lies inside, when some
+    // `@` / `wait` in the design waits on it, plus the object body they live in. Null for
+    // every other place -- and null for EVERY place in a design that waits on no property,
     // which is what makes that design pay nothing.
     //
     // Set at exactly one place, agg_member, off the interned class Ref plus the
-    // property's field index. A blocking store then classifies its own old -> new
-    // transition and wakes the notifiers whose edge it produced -- literally
+    // property's field index, and kept by every select inside an AGGREGATE property
+    // (a member, an element): the property is one variable (LRM 9.4.2.2), and a store to
+    // any leaf of it is a change of it. A blocking store then classifies its own old ->
+    // new transition and wakes the notifiers whose edge it produced -- literally
     // service_wait_queue's job, with the waiter lists reached through the object
-    // instead of through per-signal globals.
+    // instead of through per-signal globals. A whole-object copy (AggCopy) compares the
+    // bytes, and a container inside the aggregate fires on every mutation.
     const ChangeNotify* chg         = nullptr;
     llvm::Value*        chg_body    = nullptr;
     llvm::Type*         chg_body_ty = nullptr;
@@ -931,6 +937,11 @@ struct SignalSlot {
     // which is addressed directly off @clotho.state.
     static constexpr uint32_t no_anchor = ~0u;
     uint32_t anchor = no_anchor;
+    // Index of this signal's first container flag byte among its region's (Gc.h, rt_gc_roots),
+    // one byte for each RT_GC_CFLAG_BYTES of its storage; no_flags unless it holds a container
+    // that can reach a class handle.
+    static constexpr uint32_t no_flags   = ~0u;
+    uint32_t                  cflag_base = no_flags;
     // A nonblocking target some virtual interface writes (LRM 25.9). Its writes
     // defer a record carrying the destination pointer AND the instance context,
     // instead of the per-signal block shadow: a handle supplies only a
@@ -978,20 +989,16 @@ struct PortLayout {
     // field of the signal's shadow group (SignalSlot::sh_first + k).
     uint32_t shadow   = no_port_elem;
     uint32_t n_shadow = 0;
-    // Per edge (Edge::Any, Positive, Negative): a static bucket's base (ptr),
-    // trigger bits (i64) and subscriber count (i32); a dynamic bucket's base and
+    // Per edge (Edge::Any, Positive, Negative): the element (ptr) holding the
+    // address of the static waiter list in clotho.wait.static (of the empty list
+    // at its start when this instance has none); a dynamic bucket's base and
     // length cell (ptr) and capacity (i32). no_port_elem for a bucket it lacks.
-    struct Static {
-        uint32_t base = no_port_elem;
-        uint32_t trig = no_port_elem;
-        uint32_t cap  = no_port_elem;
-    };
+    std::array<uint32_t, 3> sta = { no_port_elem, no_port_elem, no_port_elem };
     struct Dynamic {
         uint32_t base = no_port_elem;
         uint32_t len  = no_port_elem;
         uint32_t cap  = no_port_elem;
     };
-    std::array<Static, 3>  sta;
     std::array<Dynamic, 3> dyn;
     // Per edge, the element holding the address of the waiter-list head that
     // `@(edge vif.sig)` waiters through a virtual interface park on.
@@ -1020,12 +1027,7 @@ struct NbaHold {
 };
 
 // The fixed leading fields of an instance record (Anchor, "Instance context");
-// every field after them is addressed through its Anchor::ctx_*_base. The first
-// is the one a body reads least: a group's entry is handed the address of its
-// wake pair and reaches the record at a constant offset from it, so a field
-// at offset 0 would be a use of the record's own address, a value tier-0 code
-// generation computes once and spills where it folds every other access into
-// the pair-relative displacement.
+// every field after them is addressed through its Anchor::ctx_*_base.
 inline constexpr uint32_t kCtxFirstVcd = 0;
 inline constexpr uint32_t kCtxShadow   = 1;
 inline constexpr uint32_t kCtxState    = 2;
@@ -1033,6 +1035,10 @@ inline constexpr uint32_t kCtxFixed    = 3;
 
 // Where the parked handles of an `expect` queue start (Backend::expect_queue_ty).
 inline constexpr uint64_t kExpectHandlesOffset = 8;
+
+// The i32 words that lead a static waiter list in clotho.wait.static: the entry
+// count and the two halves of the trigger bits a wake ORs into each subscriber.
+inline constexpr uint32_t kListHeader = 3;
 
 // One instance-scope occurrence: the addressing anchor for every signal the
 // scope declares. Each scope owns its own state global
@@ -1054,9 +1060,11 @@ struct Anchor {
     std::string name;
     // Lowest process index owned by this scope (~0 when it owns none).
     uint32_t first_proc = ~0u;
-    // How many processes the scope owns; each has a wake pair in the record
-    // (ctx_sched_base), at its dense def-local ordinal.
+    // How many processes the scope owns; each has a wake slot in clotho.wake, at
+    // wake_base plus its dense def-local ordinal.
     uint32_t n_owned = 0;
+    // The index of the scope's first wake slot (build_sched_flags).
+    uint32_t wake_base = 0;
     // This scope's NBA shadow: the per-def staging struct type (null when
     // the scope has no NBA shadow fields), its own global
     // (@clotho.inst.<hier>.shadow), and the opaque base-pointer global
@@ -1072,6 +1080,14 @@ struct Anchor {
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
+    // Field of the state struct that holds the card bytes of the region (Gc.h, rt_gc_roots), or
+    // no_cards when the scope holds no class handle.
+    static constexpr uint32_t no_cards    = ~0u;
+    uint32_t                  cards_field = no_cards;
+    // Field of the state struct that holds the container flag bytes of the region, after the
+    // card bytes, or no_flags when no signal of the scope holds a container of handles.
+    static constexpr uint32_t no_flags    = ~0u;
+    uint32_t                  flags_field = no_flags;
 
     // Instance context: ONE per-instance record (@clotho.inst.<hier>.ctx)
     // holding every base a def-relative body needs, laid out per definition so
@@ -1085,26 +1101,16 @@ struct Anchor {
     //                      owns, at its def-local process ordinal: a group's
     //                      field is its front process's
     //                      (0 when the function registers none)
-    //   ctx_sched_base [n x { i64, ptr }] one wake pair per owned process, at its
-    //                      def-local ordinal (a group's is its front process's):
-    //                      the wake word (the scheduled flag and the trigger
-    //                      bits) and the entry a thunk handle runs. A thunk
-    //                      group's handle is the address of its pair, so the
-    //                      entry is handed the pair and finds the record, and
-    //                      its own wake word, at constant offsets from it
+    //   ctx_wake_base i32  the index of the instance's first slot in clotho.wake
+    //                      (Anchor::wake_base): an owned process's wake slot, and
+    //                      its masks in clotho.wake.mask, are at that index plus
+    //                      its def-local ordinal (a group's are its front process's)
     //   ctx_port_base PortLayout::ty  one port per signal of the definition that
     //                      has anything for a writer (see PortLayout), in the
     //                      definition's signal order and the same for every unit
     //                      of one state type (a virtual interface names a member by
-    //                      its representative's field): wake bucket bases, counts
-    //                      and trigger bits, ids, dump-var index, shadow addresses
-    //   ctx_mmask_base i64 one per owned process, at its def-local ordinal: the
-    //                      trigger bits of the process's own events, which its
-    //                      member guard tests (0 unless it is a member of a
-    //                      guarded group; absent when the design has none)
-    //   ctx_gmask_base i64 same indexing: for the front process of a guarded
-    //                      group, the union of its members' bits, which the
-    //                      group's fail-safe tests
+    //                      its representative's field): static waiter lists, dynamic
+    //                      bucket bases and counts, ids, dump-var index, shadow addresses
     //   ctx_bind_base ptr  three per binding (see n_bind): the address of an
     //                      imported signal's storage, the record of the instance
     //                      that owns it and the address of its port in that record
@@ -1112,26 +1118,22 @@ struct Anchor {
     //   ctx_fbind_base ptr one per function binding (see n_fbind): the record
     //                      of the instance that owns an imported function
     //                      (null for a function of none)
-    // A writer in the instance's own code reads a bucket's base, count and
-    // trigger bits from its port, and a guarded group its masks, so none of them
-    // is baked into unit code: the buckets depend on who subscribes and the bits
-    // on the design-global colours (compute_trigger_masks), which are other
-    // units' business. A writer of another unit's signal reads the signal's port
-    // through its binding, never at an offset of the owner's record.
+    // A writer in the instance's own code finds a static waiter list through its
+    // port, and a guarded group its masks through the wake base, so neither is
+    // baked into unit code: the lists depend on who subscribes and the bits on the
+    // design-global colours (compute_trigger_masks), which are other units'
+    // business. A writer of another unit's signal reads the signal's port through
+    // its binding, never at an offset of the owner's record.
     // ctx_ty is shared across instances of one unit; the global is
     // created lazily by the first def-relative use.
     llvm::StructType*     ctx_ty         = nullptr;
     llvm::GlobalVariable* ctx_gv         = nullptr;
     uint32_t              ctx_blk_base   = 0;
-    uint32_t              ctx_sched_base = 0;
+    uint32_t              ctx_wake_base  = 0;
     uint32_t              ctx_port_base  = 0;
-    uint32_t              ctx_mmask_base = 0;
-    uint32_t              ctx_gmask_base = 0;
-    // Def-local count of owned processes (sizes the blk fields), the length of
-    // each mask array (the same, or 0 when no group of the design is guarded) and
-    // the number of ports of the definition.
+    // Def-local count of owned processes (sizes the blk fields) and the number of
+    // ports of the definition.
     uint32_t n_blk  = 0;
-    uint32_t n_mask = 0;
     uint32_t n_port = 0;
     // Bindings: one per extern signal declaration of the unit that names an
     // instance's storage (InstanceScope::externs), in the unit's order, three
@@ -1380,18 +1382,26 @@ public:
 
     uint64_t member_mask(uint32_t g, size_t i) const;
 
-    // Constant pointer to a field of process k's wake pair: 0 the wake word
-    // (what sched_flag_ptr returns), 1 the entry its thunk handle runs.
+    // Constant pointer to a field of process k's wake slot in clotho.wake: 0 the wake
+    // word (what sched_flag_ptr returns), 1 the handle its static subscriptions push.
     llvm::Constant* sched_wake_ptr(uint32_t k, uint32_t member);
 
     llvm::Constant* sched_flag_ptr(uint32_t k);
 
-    // The `{ i64 wake word, ptr entry }` pair of one process.
+    // A process's wake slot: `{ i64 wake word, ptr handle, ptr entry, ptr record }`,
+    // the element of clotho.wake. The handle is the one a static subscription
+    // pushes; the entry and record are a thunk group's, what the drain calls and
+    // hands it.
     llvm::StructType* wake_ty();
 
-    // Byte offset of the wake pair of owned process `ord` inside its instance's
-    // record: what a group's entry subtracts from the pair it is handed.
-    uint64_t wake_offset(const Anchor& a, uint32_t ord);
+    // The element of clotho.wake.mask, at the index of a process's wake slot:
+    // `{ i64 own bits, i64 group bits }` (member_mask, group_trig_mask_).
+    llvm::StructType* wake_mask_ty();
+
+    // The index of process `m`'s wake slot, as the code being lowered names it: the
+    // own instance's record holds the base of its slots, so unit code names no slot;
+    // code of no instance bakes the index.
+    llvm::Value* wake_slot_value(uint32_t m);
 
 private:
     // -- Cross-unit symbol references --
@@ -1686,6 +1696,8 @@ private:
     // (ir::ChangeNotify::shared): an element of clotho.chg_shared.
     llvm::Constant* chg_shared_slot(uint32_t k);
 
+    bool str_signal_waited(const LValueInfo& lv) const;
+
     llvm::Value* str_chg_snapshot(const Guarded& lv);
 
     void str_chg_after(const Guarded& lv, llvm::Value* snap);
@@ -1740,6 +1752,11 @@ private:
 
     bool reaches_class_handle(Ref type);
 
+    // Whether storage of this type holds a dynamic array, queue or associative array that can
+    // reach a class handle, through unpacked arrays and structs: a container of design state
+    // the collector walks by flag.
+    bool holds_gc_container(Ref type);
+
     std::vector<uint32_t> class_handle_offsets(Ref class_ref);
 
     std::vector<llvm::Constant*> class_elem_leaves(Ref class_ref);
@@ -1787,6 +1804,9 @@ private:
     struct GcContainer {
         uint64_t offset;
         Ref      type;
+        // Index of the flag byte of the container's first word in its region's flags
+        // (gc_roots_global; frame-resident containers have none).
+        uint32_t flag = 0;
     };
 
     void collect_gc_containers(Ref type, uint64_t base, llvm::Type* storage,
@@ -2289,17 +2309,42 @@ private:
     // leave (RT_TRACE_ABORT_*).
     void emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind);
 
+    // R22: the body's own activation (null in a function) forks onto the join record `rec`
+    // (`kind`: RT_TRACE_JOIN_*, `width` children); fork child `a` completes into `rec`; the
+    // activation is past the join of `rec`.
+    void emit_trace_fork(llvm::Value* rec, uint32_t kind, uint32_t width);
+    void emit_trace_child_done(llvm::Value* a, llvm::Value* rec);
+    void emit_trace_join(llvm::Value* rec);
+
     // clotho.run_once is about to run the bodies of one region (RT_TRACE_ORG_PREINIT ...), or has.
     void emit_trace_once(uint32_t kind);
 
-    // A thunk group parks at its static control when its entry returns: `wake` is its wake pair.
+    // A thunk group parks at its static control when its entry returns: `wake` is its wake slot.
     void emit_trace_thunk_park(llvm::Value* wake, const std::string& where);
 
+    // What the seed reports of a guarded group's members (S9): each member's own list (`n` entries at
+    // `list`), how many members there are (zero: the group is not guarded) and whether no two events of
+    // the group share a trigger bit.
+    struct TraceMembers {
+        llvm::Value* list;
+        llvm::Value* n;
+        llvm::Value* members;
+        llvm::Value* exact;
+    };
+
     // The seed's reports of one row: the spawn of its handle `h`, its static list (`n` entries at
-    // `list`, from the IR's wait events) and, when `parked_now` (an i1), its park at the static
-    // control `ctl`, which is where a group that is not queued now waits.
+    // `list`, from the IR's wait events), its members and, when `parked_now` (an i1), its park at the
+    // static control `ctl`, which is where a group that is not queued now waits.
     void emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list, llvm::Value* n,
-                             llvm::Value* parked_now);
+                             llvm::Value* parked_now, const TraceMembers& members);
+
+    // Member `index` of the guarded group being lowered starts its body (S9): a thunk row names the
+    // group by its wake slot, a coroutine by its handle.
+    void emit_trace_member(uint32_t index);
+
+    // R16: the generated code armed the inertial record `rec` of site `idx` (the dense id of its target, an
+    // i32) for the decision's `epoch` (an i64), `ticks` (an i64) from now.
+    void emit_trace_inertial_arm(llvm::Value* idx, llvm::Value* rec, llvm::Value* ticks, llvm::Value* epoch);
 
     // One event the seed links a persistent waiter onto joins the static list of the group `h`.
     void emit_trace_subscribe_event(llvm::Value* h, llvm::Value* obj, llvm::Value* name);
@@ -2332,8 +2377,19 @@ private:
     llvm::Constant* trace_nba_site(llvm::Module& m, const TraceNba& t, uint32_t path);
 
     // Report the update: created now (`rec` null, `path` RT_TRACE_NBA_BLOCK ... RT_TRACE_NBA_ZERO), or
-    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT).
-    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path);
+    // armed on the record `rec` for the timer or the event to release (RT_TRACE_NBA_TIMER, _EVENT);
+    // a timer's delay is `ticks` (an i64).
+    void emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path, llvm::Value* ticks = nullptr);
+
+    // One event a `<= @e` record waits for: the storage of a signal (`edge` RT_TRACE_POS ...) or an event
+    // object (RT_TRACE_OBJ).
+    struct TraceTrigger {
+        llvm::Value* x;
+        uint32_t     edge;
+    };
+
+    // The events of the `<= @e` record `rec` just armed, and its repeat count `count` (an i32).
+    void emit_trace_nba_events(llvm::Value* rec, llvm::Value* count, llvm::ArrayRef<TraceTrigger> trigs);
 
     // The scheduler enters `region` (RT_TRACE_REG_*).
     void emit_trace_region(uint32_t region);
@@ -2355,19 +2411,21 @@ private:
     void emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle, llvm::Value* flag_ptr);
 
     // One persistent subscription as the seed's tables hold it (plan_static_subscribe):
-    // a bucket's slot, or an event's node and the variable whose object it links onto.
+    // an event's node and the variable whose object it links onto. A signal's
+    // subscription is an entry of its static waiter list, which plan_static_subscribe
+    // writes into the table itself, so it returns no slot.
     struct StaticSub {
-        // A bucket: the address of the slot of the (signal, edge)'s static bucket that
-        // takes the group's { handle, flag } entry. An event: the node of the
-        // persistent pool that links onto the object's list.
+        // The node of the persistent pool that links onto the object's list.
         llvm::Constant* slot = nullptr;
-        // An event only: the address of the variable's handle, which names the
-        // object when the links are made.
+        // The address of the variable's handle, which names the object when the
+        // links are made.
         llvm::Constant* handle   = nullptr;
         bool            is_event = false;
     };
 
-    StaticSub plan_static_subscribe(Signal sig, uint32_t edge);
+    // Subscribe the group whose wake slot is `wake_slot` to (sig, edge): the next
+    // entry of the signal's static waiter list, or a node of an event's.
+    StaticSub plan_static_subscribe(Signal sig, uint32_t edge, uint32_t wake_slot);
 
     void emit_dynamic_register(Signal sig, uint32_t edge);
 
@@ -2511,18 +2569,21 @@ private:
 
     void signal_gc_containers(const SignalSlot& s, uint64_t base, std::vector<GcContainer>& out);
 
-    llvm::Constant* gc_roots_global(llvm::Constant* base, const std::vector<uint32_t>& offsets,
-                                    uint32_t index);
-
-    llvm::Constant* gc_containers_global(llvm::Constant* base,
-                                         const std::vector<GcContainer>& entries,
-                                         uint32_t                        index);
+    llvm::Constant* gc_roots_global(llvm::Constant*                 base,
+                                    const std::vector<uint32_t>&    offsets,
+                                    const std::vector<GcContainer>& containers,
+                                    uint32_t                        index,
+                                    llvm::StructType*               owner,
+                                    uint32_t                        cards_field,
+                                    uint32_t                        flags_field);
 
     llvm::Constant* gc_config_global();
 
     llvm::Constant* cover_array(llvm::StructType*                   row_ty,
                                 const std::vector<llvm::Constant*>& rows,
                                 const std::string&                  nm);
+
+    llvm::Constant* cover_string(const std::string& s);
 
     llvm::Constant* cover_config_global();
 
@@ -2872,7 +2933,7 @@ private:
     // Service `sig`'s waiters after a store; `path` is the write's kind for the
     // trace checker. With `fold_vcd` (the signal's dump-var base) the store's
     // dump-var touch is offered to the Any bucket's shared scan, which makes it
-    // only when the value changed (static_scan_port_fn); true when the scan took
+    // only when the value changed (static_scan_fn); true when the scan took
     // it, so the caller must not touch again.
     bool service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm, llvm::Value* old_z,
                             llvm::Value* new_z, uint32_t path = RT_TRACE_CHG_STORE, int32_t fold_vcd = -1);
@@ -2894,17 +2955,20 @@ private:
     void emit_release_moment(Signal sig, const EdgeFacts& f, bool canon);
     void emit_bound_notify(Signal sig, const EdgeFacts& f, llvm::Value* mask);
 
-    // The pieces of a (signal, edge) wake bucket a writer addresses: the static
-    // subscribers' base, the dynamic waiters' base and their length cell.
-    enum class WaitPart : uint8_t { Static, Dynamic, DynamicLen };
+    // The pieces of a (signal, edge) dynamic wake bucket a writer addresses: the
+    // waiters' base and their length cell.
+    enum class WaitPart : uint8_t { Dynamic, DynamicLen };
 
     // Where a bucket piece is for the body being lowered: read from the signal's
     // port where the body reaches it, the bucket's own global otherwise.
     llvm::Value* wait_base(WaitPart part, Signal sig, uint32_t edge);
 
-    void service_static_queue(Signal sig, uint32_t edge);
+    // The address of the header of (sig, edge)'s static waiter list in
+    // clotho.wait.static: through the signal's port where the body reaches it, a
+    // constant otherwise.
+    llvm::Value* static_list_ptr(Signal sig, uint32_t edge);
 
-    llvm::Value* static_trig_bits(Signal sig, uint32_t edge);
+    void service_static_queue(Signal sig, uint32_t edge);
 
     void service_dynamic_queue(Signal sig, uint32_t edge);
 
@@ -3154,20 +3218,8 @@ private:
     }
 
     // The static wake scan, emitted once per LLVM module and shape and called from
-    // every store that wakes a static bucket (service_static_queue), so a store
-    // site holds one call rather than the loop. `edge` only shapes the function
-    // when the trace checker is on, whose report names the bucket's edge; the
-    // traced form also takes the storage the writer reaches.
-    llvm::Function* static_scan_fn(bool padded, bool trig_zero, uint32_t edge);
-    // The same for a bucket reached through the signal's port: one argument, the
-    // address of the port's {base, trig, cap} triple, read in the function. With
-    // `vcd` it also takes the store's dump-var index and touches it after the scan.
-    llvm::Function* static_scan_port_fn(bool vcd, uint32_t edge);
-    llvm::Function* bound_notify_fn(const PortLayout& pl);
-    llvm::Function* bound_store_fn(const PortLayout& pl, bool four);
-    void            emit_bound_wake(const PortLayout& pl, llvm::Value* port, llvm::Value* want);
-    void            emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig,
-                                        const TraceCause& why);
+    // The shared static scans (static_scan_fn) per LLVM module and shape.
+    std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*> static_scan_fns_;
 
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why);
 
@@ -3289,6 +3341,8 @@ private:
     llvm::FunctionCallee sscanf_fn();
     llvm::FunctionCallee readmem_fn();
     llvm::FunctionCallee fread_fn();
+    llvm::FunctionCallee readmem_assoc_fn();
+    llvm::FunctionCallee fread_assoc_fn();
 
     llvm::FunctionCallee vcd_open_fn();
     llvm::FunctionCallee vcd_begin_fn();
@@ -3474,8 +3528,7 @@ private:
 
     llvm::StructType* gc_map_ty();
     llvm::StructType* gc_roots_ty();
-    llvm::StructType* gc_container_ty();
-    llvm::StructType* gc_container_table_ty();
+    llvm::StructType*    gc_container_ty();
     llvm::StructType* gc_frame_ty();
     llvm::StructType* gc_mutator_ty();
     llvm::StructType* gc_config_ty();
@@ -3489,12 +3542,12 @@ private:
     llvm::FunctionCallee gc_identity_object_fn();
     llvm::FunctionCallee gc_nba_words_add_fn();
     llvm::FunctionCallee gc_nba_container_add_fn();
-    llvm::FunctionCallee gc_containers_add_fn();
     llvm::FunctionCallee gc_container_add_fn();
     llvm::FunctionCallee gc_container_remove_fn();
     llvm::FunctionCallee gc_alloc_slow_fn();
     llvm::FunctionCallee gc_safepoint_slow_fn();
     llvm::FunctionCallee gc_remember_fn();
+    llvm::FunctionCallee gc_note_ref_store_fn();
 
     llvm::StructType* cover_range_ty();
     llvm::StructType* cover_bin_ty();
@@ -3508,10 +3561,20 @@ private:
     llvm::FunctionCallee cover_next_fn();
     llvm::FunctionCallee cover_hit_fn();
     llvm::FunctionCallee cover_start_fn();
+    llvm::FunctionCallee cover_start_point_fn();
+    llvm::FunctionCallee cover_opt_set_fn();
+    llvm::FunctionCallee cover_opt_get_fn();
+    llvm::FunctionCallee cover_opt_set_str_fn();
+    llvm::FunctionCallee cover_opt_get_str_fn();
+    llvm::FunctionCallee cover_type_opt_set_fn();
+    llvm::FunctionCallee cover_type_opt_get_fn();
+    llvm::FunctionCallee cover_type_opt_set_str_fn();
+    llvm::FunctionCallee cover_type_opt_get_str_fn();
     llvm::FunctionCallee cover_set_name_fn();
     llvm::FunctionCallee cover_inst_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_type_query_fn(const char* name, llvm::Type* ret);
+    llvm::FunctionCallee cover_type_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_design_coverage_fn();
 
     // -- Coroutine frame registry (docs/design/garbage-collection.md §2, F2) -----
@@ -3546,12 +3609,46 @@ private:
 
     void emit_gc_barrier(llvm::Value* owner);
 
-    void emit_gc_barrier_for(const LValueInfo& lv);
+    // What a store through a place may add a handle to: a slot of the place (the default), or
+    // a container, whose handle the place is or whose payload it lies in.
+    enum class GcWrite : uint8_t { Slot, Container };
 
-    void note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, llvm::Value* handle,
-                                Ref container_type);
+    void emit_gc_barrier_for(const Guarded& lv, uint64_t bytes = sizeof(void*), GcWrite what = GcWrite::Slot);
 
-    llvm::Value* emit_gc_ref_container_add(const LValueInfo& lv);
+    // The barrier of a mutation that adds a handle to the container `lv` designates.
+    void emit_gc_container_barrier(const Guarded& lv);
+
+    // How much design state a store through `lv` writes: the whole signal for a whole-signal
+    // place (a whole-aggregate nonblocking store), else one word.
+    uint64_t gc_store_bytes(const LValueInfo& lv) const;
+
+    void emit_gc_note_ref_store(llvm::Value* slot, llvm::Value* chain, uint64_t bytes);
+
+    llvm::FunctionCallee gc_note_state_store_fn();
+
+    void emit_gc_state_barrier(const LValue& v, uint64_t bytes, GcWrite what);
+
+    // The field of the state struct that holds the container flag bytes of a signal's region.
+    uint32_t gc_flags_field(const SignalSlot& s) const;
+
+    // Append the container flag bytes after the card bytes; returns the field index or
+    // Anchor::no_flags when `nflags` is zero.
+    uint32_t add_gc_flags(std::vector<llvm::Type*>& fields, uint32_t nflags);
+
+    // The flag bytes a signal's storage needs (0 unless it holds a container of handles), and
+    // sets its cflag_base to `first`.
+    uint32_t assign_gc_flags(SignalSlot& s, uint32_t first);
+
+    // The field of the state struct that holds the card bytes of a signal's region.
+    uint32_t gc_cards_field(const SignalSlot& s) const;
+
+    // Append the card bytes to the fields of a state struct whose signals include one that can
+    // reach a class handle; returns the field index or Anchor::no_cards.
+    uint32_t add_gc_cards(std::vector<llvm::Type*>& fields, bool any_handle);
+
+    void carry_gc_place(LValueInfo& to, const LValueInfo& from);
+
+    void set_gc_ref_place(LValueInfo& lv, uint32_t index);
 
     uint32_t intra_idx(Signal sig) const;
     bool              is_intra_target(Signal sig) const;
@@ -3577,7 +3674,11 @@ private:
 
     void init_state();
 
-    void emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path, llvm::Type* root_ty);
+    void emit_agg_init(Ref                        type,
+                       llvm::Value*               base,
+                       std::vector<llvm::Value*>& path,
+                       llvm::Type*                root_ty,
+                       bool                       object_body = false);
 
     void emit_agg_deinit(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path,
                          llvm::Type* root_ty);
@@ -3996,7 +4097,7 @@ private:
     void emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks);
 
     void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count,
-                              llvm::ArrayRef<llvm::Value*> trig_ids);
+                              llvm::ArrayRef<llvm::Value*> trig_ids, llvm::ArrayRef<TraceTrigger> traced);
 
     void emit_intra_commit(Signal sig);
 
@@ -4382,6 +4483,62 @@ private:
     };
     AsciiArg spill_ascii_arg(Index v, const char* name);
 
+    std::pair<llvm::Value*, uint32_t> mem_inner_dims(Ref array_type);
+
+    // The array a $readmem or $fread loads, resolved for rt_readmem / rt_fread: the
+    // leaf planes of the first word that exists, the leaf slot's facts, the loaded
+    // array's dimensions (the declared bounds of its highest, `inner` for the rest),
+    // which of the words of the highest dimension have storage and, for a queue, the
+    // ring they sit in. An associative array has no planes to point at (its elements are
+    // created by the load): rt_readmem_assoc / rt_fread_assoc take its handle, its
+    // descriptor and the index's width instead, and the slot facts describe one element.
+    struct MemTarget {
+        llvm::Value*                      mm_base = nullptr;
+        llvm::Value*                      z_base  = nullptr;
+        uint32_t                          stride  = 0;
+        uint32_t                          width   = 0;
+        bool                              four_state = false;
+        std::pair<llvm::Value*, uint32_t> inner;
+        // i64 values: the declared bounds of the highest dimension. Constants for a
+        // fixed-size array, [0 : size - 1] for a dynamic array or queue, whose size is
+        // read at run time.
+        llvm::Value* left  = nullptr;
+        llvm::Value* right = nullptr;
+        // i64 values: the words at positions [lo_word, lo_word + word_count), counted
+        // from `left`, exist; a count of 0 means the target names none.
+        llvm::Value* lo_word    = nullptr;
+        llvm::Value* word_count = nullptr;
+        // i64 values: the ring of a queue (see rt_readmem); 0 and 0 for any other array.
+        llvm::Value* ring_head = nullptr;
+        llvm::Value* ring_cap  = nullptr;
+        // An associative array: its handle (ptr) and descriptor, the index's width and
+        // signedness, the byte offset of the z plane in an element slot, and the i1 that
+        // says the target is valid at run time (null: always).
+        bool            assoc       = false;
+        llvm::Value*    assoc_handle = nullptr;
+        llvm::Constant* assoc_ops    = nullptr;
+        uint32_t        key_width    = 0;
+        bool            key_signed   = false;
+        uint32_t        z_off        = 0;
+        llvm::Value*    assoc_valid  = nullptr;
+        // The place the load writes: whose waiters it wakes and what it marks for the
+        // dump. `container` says it is a dynamic array, queue or associative array, which
+        // wakes through the container notifier (notify_container_mutation) rather than the
+        // waiters of an array signal.
+        LValueInfo place;
+        bool       container = false;
+    };
+
+    MemTarget resolve_mem_target(Index       target,
+                                 Ref         type,
+                                 Ref         base_type,
+                                 uint32_t    slice,
+                                 Index       slice_base,
+                                 Index       slice_end,
+                                 const char* task);
+
+    void finish_mem_load(const MemTarget& t, llvm::Value* changed, const char* prefix);
+
     void lower_fread_word(Index i);
 
     void lower_fread_mem(Index i);
@@ -4424,7 +4581,8 @@ private:
 
     void emit_defer_gen_bump();
 
-    void emit_defer_gen_bump_at(llvm::Value* gen);
+    // `delta` is 1 at a resume or activation start, kGenDisableBump at a `disable`.
+    void emit_defer_gen_bump_at(llvm::Value* gen, uint64_t delta = 1);
 
     // The report generation of the running thread (LRM 16.4.2), published for the
     // bodies it calls: a process group publishes its own counter at each activation
@@ -4952,6 +5110,8 @@ private:
     static constexpr uint32_t kProcSelfPark  = 1u << 11;
     // Parked in `wait fork`, woken when the last live descendant completes.
     static constexpr uint32_t kProcWaitFork  = 1u << 12;
+    // Announced as WAITING to whatever waits on `status()`: the next park is no news.
+    static constexpr uint32_t kProcSeenWait = 1u << 13;
 
     llvm::Value* proc_arg();
 
@@ -4964,6 +5124,12 @@ private:
     llvm::Value* program_root_pcb(llvm::Value* inst);
 
     void emit_proc_state(uint32_t from, uint32_t to);
+
+    uint32_t proc_status_notify() const;
+
+    void emit_proc_status_notify(llvm::Value* pcb);
+
+    void emit_proc_park_notify();
 
     llvm::Value* emit_proc_object(llvm::Value* pcb, Ref class_ref);
 
@@ -5142,6 +5308,8 @@ private:
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
     llvm::StructType*       state_ty_ = nullptr;
+    uint32_t                root_cards_field_ = Anchor::no_cards;
+    uint32_t                root_flags_field_ = Anchor::no_flags;
     // The NBA shadow struct (valid iff non-null) and its standalone global.
     llvm::StructType*       shadow_ty_     = nullptr;
     llvm::GlobalVariable*   shadow_global_ = nullptr;
@@ -5382,9 +5550,8 @@ private:
     // build_vcd_index registered it hidden: storage no scope lists (a temporary a
     // parent binds to a child's port), dumped under the alias's name only.
     std::vector<uint8_t> vcd_hidden_;
-    // The shared scans (static_scan_fn, static_scan_port_fn) per LLVM module and shape.
-    std::map<std::tuple<llvm::Module*, bool, bool, uint32_t>, llvm::Function*> static_scan_fns_;
-    std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*>       static_scan_port_fns_;
+    // The shared static scans (static_scan_fn) per LLVM module and shape.
+    std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*> static_scan_fns_;
     // bound_notify_fn per LLVM module and port layout.
     std::map<std::pair<llvm::Module*, llvm::StructType*>, llvm::Function*> bound_notify_fns_;
     // bound_store_fn per LLVM module, port layout and plane count.
@@ -5586,8 +5753,8 @@ private:
     // Per-subroutine may-finish closure; see compute_may_finish.
     std::vector<uint8_t> may_finish_;
     llvm::BasicBlock*   coro_ret_bb_     = nullptr;
-    // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
-    // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
+    // The current body's scheduled flag: the wake word of its slot in clotho.wake
+    // for a process, or a frame-resident alloca for a task.
     llvm::Value*        sched_ptr_       = nullptr;
     // Whether the body currently lowering is subscribed statically (subscribed_statically).
     // emit_arm_wake_word asserts it is not: its entry would wake the body at the park.
@@ -5729,37 +5896,40 @@ private:
     std::vector<bool>                   group_guarded_;
     std::vector<std::vector<uint64_t>>  group_member_mask_;
     std::vector<uint64_t>               group_trig_mask_;
-    // Any group guarded at all. Sizes the record's mask arrays and, with no
-    // guarded group, spares the main-side fills.
+    // Any group guarded at all. With none, clotho.wake.mask does not exist.
     bool                                any_guarded_     = false;
     uint32_t                            trig_collisions_ = 0;
-    // Per-signal wait queues, indexed by Signal handle and then by edge bucket
-    // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
-    // signal has no waiter of that (kind, edge). Splitting by edge hoists the
-    // edge check out of the scan into one branch per bucket. Static (.sta):
-    // fixed-capacity persistent subscriptions, `wait_sta_cap_` the compile-time
-    // trip count, no length. Dynamic (.dyn): one-shot waiters with `wait_dyn_len_gv_`
-    // live count. Built in build_wait_queues; serviced by service_static_queue /
-    // service_dynamic_queue.
-    std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_sta_gv_;
-    std::vector<std::array<llvm::ArrayType*, 3>>       wait_sta_ty_;
-    std::vector<std::array<uint32_t, 3>>               wait_sta_cap_;
-    // True (pre-padding) per-instance subscriber counts, and whether the bucket
-    // is padded past them to the definition maximum (see build_wait_queues).
-    std::vector<std::array<uint32_t, 3>> wait_sta_true_;
-    std::vector<std::array<uint8_t, 3>>  wait_sta_padded_;
-    // A signal of no instance has no record to hold its buckets' trigger bits:
-    // each static bucket gets a global of its own, filled at startup.
-    std::vector<std::array<llvm::GlobalVariable*, 3>> wait_sta_trig_gv_;
-    // Whether a bucket exists is `wait_*_gv_[signal][edge] != nullptr`; where a
-    // writer finds its pieces is the signal's port (PortLayout).
+    // Per-signal wait queues, indexed by Signal handle and then by edge
+    // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any). Splitting by
+    // edge hoists the edge check out of the scan into one branch per list.
+    //
+    // Static: the persistent subscriptions of every (signal, edge) are one list of
+    // clotho.wait.static, a constant table of i32: `[count, trig lo, trig hi,
+    // slot...]`, the subscribers' wake slot indices in subscription order and the
+    // trigger bits a wake ORs into their words. `sta_list_` is the index of the
+    // list's header, 0 (the empty list at the table's start) where the signal has
+    // no static subscriber of that edge. `sta_table_` is the table being filled.
+    //
+    // Dynamic (.dyn): one-shot waiters, `{ handle, flag }` entries with a
+    // `wait_dyn_len_gv_` live count, null where there are none. Where a writer
+    // finds either is the signal's port (PortLayout). Built in build_wait_queues;
+    // serviced by service_static_queue / service_dynamic_queue.
+    std::vector<std::array<uint32_t, 3>>               sta_list_;
+    std::vector<uint32_t>                              sta_table_;
+    llvm::GlobalVariable*                              sta_table_gv_ = nullptr;
+    // Next free entry per (signal, edge) list, handed out by the seed's
+    // subscriptions (plan_static_subscribe).
+    std::vector<std::array<uint32_t, 3>>               sta_next_;
+    // Whether a writer of the signal scans a static list of that edge: some
+    // instance of the signal's definition has one. The code a writer emits must
+    // not depend on which twin it runs for, nor a virtual interface's write on
+    // which instance its representative is, so a twin with no subscriber scans its
+    // empty list (index 0).
+    std::vector<std::array<bool, 3>>                   sta_has_;
 
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_len_gv_;
-    // Next free static slot per (signal, edge), handed out during lowering
-    // (parallels the capacities computed in build_wait_queues).
-    std::vector<std::array<uint32_t, 3>>               sta_next_;
     // The object a null event handle resolves to (clotho.event_null), so that a
     // wait on or a `.triggered` of a null handle needs no branch. Built in
     // build_wait_queues.
@@ -5798,13 +5968,18 @@ private:
     // The design's single detached `->> #d e` on-expiry thunk (clotho.ev_delay).
     // One rather than one-per-event: the timer node carries the handle.
     llvm::Function*                                    event_delay_thunk_ = nullptr;
-    // Per-process scheduled-flag placement (build_sched_flags): owning anchor
-    // (~0 = root array) and dense def-local ordinal within that owner's array.
+    // Per-process wake placement (build_sched_flags): owning anchor (~0 = none),
+    // dense def-local ordinal within that owner (or among the processes of no
+    // instance), and the index of the process's wake slot in clotho.wake.
     std::vector<uint32_t>               proc_sched_anchor_;
     std::vector<uint32_t>               proc_sched_ord_;
-    // Root scheduled-flag array (clotho.proc_sched) for unowned processes.
-    llvm::GlobalVariable*               sched_gv_     = nullptr;
-    llvm::ArrayType*                    sched_arr_ty_ = nullptr;
+    std::vector<uint32_t>               wake_slot_;
+    // The wake slots of every process (clotho.wake) and, in a design with a
+    // guarded group, every process's trigger masks (clotho.wake.mask), both
+    // indexed by wake slot.
+    llvm::GlobalVariable*               wake_gv_      = nullptr;
+    llvm::GlobalVariable*               wake_mask_gv_ = nullptr;
+    uint32_t                            n_wake_       = 0;
     // `clotho.run_once(table, count, wheel)` (run_once_fn), and the table of each
     // activation emit_run_once has built, with its row count: the Preponed table is
     // walked from two sites and built once.
@@ -6045,6 +6220,8 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
     // Memoized class object-body StructType per Kind::Class Ref (see class_body_ty).
     ankerl::unordered_dense::map<uint32_t, llvm::StructType*> class_body_ty_;
+    // Memoized unpacked-struct storage mirror per field-type list (see agg_storage_ty).
+    std::map<std::vector<llvm::Type*>, llvm::StructType*> agg_struct_tys_;
     // Memoized reaches_class_handle() per type Ref. Design-wide, not per module: the
     // answer depends only on the intern pool.
     ankerl::unordered_dense::map<uint32_t, bool> reaches_class_handle_;
@@ -6083,9 +6260,8 @@ private:
     llvm::StructType* cover_point_ty_  = nullptr;
     llvm::StructType* cover_type_ty_   = nullptr;
     llvm::StructType* cover_config_ty_ = nullptr;
-    // rt_gc_container / rt_gc_container_table (Gc.h:249-261), the container-root ABI.
-    llvm::StructType* gc_container_ty_       = nullptr;
-    llvm::StructType* gc_container_table_ty_ = nullptr;
+    // rt_gc_container (Gc.h), the container-root ABI.
+    llvm::StructType* gc_container_ty_ = nullptr;
     llvm::StructType* gc_config_ty_  = nullptr;
     llvm::StructType* gc_mutator_ty_ = nullptr;
 };

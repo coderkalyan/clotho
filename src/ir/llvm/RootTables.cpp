@@ -31,17 +31,26 @@ enum SeedRing : uint32_t { RingNone, RingActive, RingReactive, RingCont };
 } // namespace
 
 // The power-on value of every instance record, as the initializer of its global, and
-// the other constants main used to store: the entry of each thunk group's wake pair
-// and the trigger bits of a bucket no record describes. Nothing here is code, so
-// nothing grows with the instance count but data.
+// the other constants main used to store: the entry and record of each thunk group
+// (in its clotho.wake slot), the trigger masks of the guarded ones (clotho.wake.mask) and
+// the static waiter lists (clotho.wait.static). Nothing here is code, so nothing
+// grows with the instance count but data.
 //
 // A record is filled from facts the compile knows: where the instance's storage is,
 // what its ports hold of the owner's side (ids, dump-var index, shadow, wake
-// buckets), the instances its bindings name. Only what a run changes is not: the
-// wake words (the seed sets the ones that start now) and the counters.
+// lists), the instances its bindings name. Only what a run changes is not: the
+// wake slots (the seed fills their handles) and the counters.
 void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
     auto* const ptr_ty = llvm::PointerType::getUnqual(ctx_);
     auto* const null   = llvm::ConstantPointerNull::get(ptr_ty);
+    // The drain hands the entry of a group of one row its record (its wake slot),
+    // whether or not the row's code ever addressed it.
+    for (const SchedGroup& sg : sched_) {
+        const uint32_t ua = group_unit_anchor_[sg.rows.front()];
+        if (sg.thunk && sg.rows.size() == 1 && ua != SignalSlot::no_anchor) {
+            ensure_ctx(anchors_[ua]);
+        }
+    }
     // A binding names the record of the instance that owns its signal or its
     // function, so that record must exist before anything is filled; creating it
     // can make the owner an instance with bindings of its own to fill.
@@ -69,14 +78,12 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
     }
 
     // Every record field starts as zero; `ports` holds the elements of each port
-    // field and `wakes` the wake pairs, which are fields of their own.
+    // field.
     struct Record {
         std::vector<llvm::Constant*>              fields;
         std::vector<std::vector<llvm::Constant*>> ports;
-        std::vector<llvm::Constant*>              wakes;
     };
     std::vector<Record> records(anchors_.size());
-    auto* const         no_wake = llvm::ConstantAggregateZero::get(wake_ty());
     for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
         const Anchor& a = anchors_[ai];
         if (a.ctx_gv == nullptr) {
@@ -93,7 +100,6 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
                 port.push_back(llvm::Constant::getNullValue(pty->getElementType(e)));
             }
         }
-        r.wakes.assign(a.n_blk, no_wake);
     }
     const auto set = [&](uint32_t ai, uint32_t field, llvm::Constant* v) {
         assert(records[ai].fields[field]->getType() == v->getType() && "a record field takes a value of its own type");
@@ -174,9 +180,9 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
             if (pl == nullptr) {
                 continue;
             }
-            // The signal's port: its ids, dump-var index, shadow slots, wake buckets
-            // (with this instance's exact subscriber count: its slots are filled
-            // densely from 0, so its own scan needs no padding) and vif waiter heads.
+            // The signal's port: its ids, dump-var index, shadow slots, static waiter
+            // lists (the address of this instance's own, which holds exactly its own
+            // subscribers, or of the empty one), dynamic buckets and vif waiter heads.
             const uint32_t rank = port_field_[si];
             const auto     put  = [&](uint32_t elem, llvm::Constant* v) { set_port(ai, rank, elem, v); };
             // A canonical port (uniform) holds every id and the dump-var index
@@ -199,7 +205,7 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
                 uint32_t mask = 0;
                 for (uint32_t e = 0; e < 3; ++e) {
                     const uint32_t trig = static_cast<uint32_t>(IdFamily::TrigPos) + e;
-                    mask |= (wait_sta_gv_[si][e] != nullptr && wait_sta_true_[si][e] != 0 ? 1u : 0u)
+                    mask |= (sta_list_[si][e] != 0 ? 1u : 0u)
                             << (PortLayout::mask_sta + e);
                     mask |= (wait_dyn_gv_[si][e] != nullptr ? 1u : 0u) << (PortLayout::mask_dyn + e);
                     mask |= (id_val_[si][trig] != no_id ? 1u : 0u) << (PortLayout::mask_trig + e);
@@ -211,10 +217,8 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
                 put(pl->shadow + k, gep(a.shadow_ty, sym(a.shadow_gv), { 0, s.sh_first + k }));
             }
             for (uint32_t e = 0; e < 3; ++e) {
-                if (pl->sta[e].base != no_port_elem && wait_sta_gv_[si][e] != nullptr) {
-                    put(pl->sta[e].base, sym(wait_sta_gv_[si][e]));
-                    put(pl->sta[e].trig, b_.getInt64(trig_bits(sj, e)));
-                    put(pl->sta[e].cap, b_.getInt32(wait_sta_true_[si][e]));
+                if (pl->sta[e] != no_port_elem) {
+                    put(pl->sta[e], gep(sta_table_gv_->getValueType(), sym(sta_table_gv_), { 0, sta_list_[si][e] }));
                 }
                 if (pl->dyn[e].base != no_port_elem && wait_dyn_gv_[si][e] != nullptr) {
                     put(pl->dyn[e].base, sym(wait_dyn_gv_[si][e]));
@@ -245,50 +249,74 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
             set(pa, anchors_[pa].ctx_prog_base, b_.getInt32(inst));
         }
     }
-    // Trigger masks of the guarded groups an instance owns: the design-global
-    // colours, so data in its record rather than immediates in its code. A group
-    // spanning instances is guarded by its root-side dispatcher, which bakes them.
-    for (uint32_t g = 0; g < groups_.size(); ++g) {
-        if (!group_guarded_[g] || group_unit_anchor_[g] == SignalSlot::no_anchor) {
-            continue;
-        }
-        const uint32_t ai = group_unit_anchor_[g];
-        const Anchor&  a  = anchors_[ai];
-        assert(a.ctx_gv != nullptr && "a guarded group's masks are filled into a record that exists");
-        set(ai, a.ctx_gmask_base + proc_sched_ord_[groups_[g].front()], b_.getInt64(group_trig_mask_[g]));
-        for (size_t i = 0; i < groups_[g].size(); ++i) {
-            set(ai, a.ctx_mmask_base + proc_sched_ord_[groups_[g][i]], b_.getInt64(member_mask(g, i)));
+    // The first wake slot of each instance, from which its code finds the slots and
+    // masks of the processes it owns.
+    for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
+        if (anchors_[ai].ctx_gv != nullptr) {
+            set(ai, anchors_[ai].ctx_wake_base, b_.getInt32(anchors_[ai].wake_base));
         }
     }
-    // The entry each thunk group's handle runs, beside its wake word: the handle is
-    // the address of the pair (the seed) and the drain calls what it finds there.
-    std::vector<llvm::Constant*> root_wakes(sched_arr_ty_->getNumElements(), no_wake);
+    // Trigger masks of the guarded groups: the design-global colours, so data rather
+    // than immediates in unit code. A group spanning instances is guarded by its
+    // root-side dispatcher, which bakes them, as does a group of no instance.
+    if (wake_mask_gv_ != nullptr) {
+        auto* const                  mty = wake_mask_ty();
+        std::vector<llvm::Constant*> mask(n_wake_, llvm::ConstantAggregateZero::get(mty));
+        std::vector<uint64_t>        own(n_wake_, 0), all(n_wake_, 0);
+        for (uint32_t g = 0; g < groups_.size(); ++g) {
+            if (!group_guarded_[g]) {
+                continue;
+            }
+            all[wake_slot_[groups_[g].front()]] = group_trig_mask_[g];
+            for (size_t i = 0; i < groups_[g].size(); ++i) {
+                own[wake_slot_[groups_[g][i]]] = member_mask(g, i);
+            }
+        }
+        for (uint32_t s = 0; s < n_wake_; ++s) {
+            if (own[s] != 0 || all[s] != 0) {
+                mask[s] = llvm::ConstantStruct::get(mty, { b_.getInt64(own[s]), b_.getInt64(all[s]) });
+            }
+        }
+        wake_mask_gv_->setInitializer(
+          llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(wake_mask_gv_->getValueType()), mask));
+    }
+    // The entry each thunk group's handle runs and the record it is handed, in the
+    // group's wake slot: the handle is the slot's address (the seed), and the drain
+    // finds both beside the word. Only the entry of a group of one row of one
+    // instance reads the record (emit_unit_entry); a dispatcher addresses each
+    // row's record itself.
+    auto* const                  wty = wake_ty();
+    auto* const                  word0 = llvm::ConstantInt::get(sched_word_ty(), 0);
+    std::vector<llvm::Constant*> slots(n_wake_, llvm::ConstantAggregateZero::get(wty));
     for (uint32_t g = 0; g < procs.size(); ++g) {
         if (!sched_[g].thunk) {
             continue;
         }
-        const uint32_t        k      = sched_[g].front;
-        const uint32_t        aid    = proc_sched_anchor_[k];
-        llvm::Constant* const word   = llvm::ConstantInt::get(sched_word_ty(), 0);
-        llvm::Constant* const entry  = sym(procs[g]);
-        llvm::Constant* const pair   = llvm::ConstantStruct::get(wake_ty(), { word, entry });
-        if (aid == SignalSlot::no_anchor) {
-            root_wakes[proc_sched_ord_[k]] = pair;
-        } else {
-            assert(anchors_[aid].ctx_gv != nullptr && "a thunk group's record exists: the seed addressed its wake word");
-            records[aid].wakes[proc_sched_ord_[k]] = pair;
+        const uint32_t  row = sched_[g].rows.front();
+        const uint32_t  ua  = group_unit_anchor_[row];
+        llvm::Constant* rec = null;
+        if (sched_[g].rows.size() == 1 && ua != SignalSlot::no_anchor) {
+            assert(anchors_[ua].ctx_gv != nullptr && "a unit entry's record exists: its rows address it");
+            rec = sym(anchors_[ua].ctx_gv);
+        }
+        slots[wake_slot_[sched_[g].front]] = llvm::ConstantStruct::get(wty, { word0, null, sym(procs[g]), rec });
+    }
+    wake_gv_->setInitializer(llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(wake_gv_->getValueType()), slots));
+    // The static waiter lists, whose entries the seed's subscriptions planned.
+    for (uint32_t si = 0; si < sta_list_.size(); ++si) {
+        for (uint32_t e = 0; e < 3; ++e) {
+            assert((sta_list_[si][e] == 0 || sta_next_[si][e] == sta_table_[sta_list_[si][e]]) &&
+                   "every entry of a static list is a planned subscription");
         }
     }
-    sched_gv_->setInitializer(llvm::ConstantArray::get(sched_arr_ty_, root_wakes));
-    // The trigger bits of a static bucket no record describes (a signal of no
-    // instance), which any unit's writer reads.
-    for (uint32_t si = 0; si < wait_sta_trig_gv_.size(); ++si) {
-        for (uint32_t e = 0; e < 3; ++e) {
-            if (wait_sta_trig_gv_[si][e] != nullptr) {
-                wait_sta_trig_gv_[si][e]->setInitializer(
-                  llvm::ConstantInt::get(b_.getInt64Ty(), trig_bits(static_cast<Signal>(si), e)));
-            }
+    {
+        std::vector<llvm::Constant*> words;
+        words.reserve(sta_table_.size());
+        for (const uint32_t w : sta_table_) {
+            words.push_back(b_.getInt32(w));
         }
+        sta_table_gv_->setInitializer(
+          llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(sta_table_gv_->getValueType()), words));
     }
     for (uint32_t ai = 0; ai < anchors_.size(); ++ai) {
         Anchor& a = anchors_[ai];
@@ -300,8 +328,6 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
             auto* const pty = llvm::cast<llvm::StructType>(a.ctx_ty->getElementType(a.ctx_port_base + p));
             r.fields[a.ctx_port_base + p] = llvm::ConstantStruct::get(pty, r.ports[p]);
         }
-        r.fields[a.ctx_sched_base] =
-          llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(a.ctx_ty->getElementType(a.ctx_sched_base)), r.wakes);
         a.ctx_gv->setInitializer(llvm::ConstantStruct::get(a.ctx_ty, r.fields));
     }
 }
@@ -408,20 +434,20 @@ void Backend::emit_run_once(Activation which, llvm::Value* wheel, const std::vec
 // of `clotho.seed.rows`, in the order the groups were created in, except that the
 // groups of the always processes that wait at their head (waits_at_head) come first:
 //
-//   { ramp, first argument, wake word, kind, subscriptions }
+//   { ramp, first argument, wake word, kind, static list subscriptions }
 //
 // `clotho.seed` makes the group's handle (the ramp's frame, or for a thunk group, with
-// no ramp, the address of its wake pair with bit 0 set), sets its wake word if it
+// no ramp, the address of its wake slot with bit 0 set), sets its wake word if it
 // starts now, and queues it on its ring in its turn. The groups that start after every
 // other body (always_comb, LRM 9.2.2.2) are queued afterwards, in `clotho.seed.late`
-// order, and the buckets then take the subscriptions: `clotho.seed.slots` lists, row
-// after row, the slot of each static bucket that holds the group's { handle, flag }
-// entry. A persistent event waiter is linked onto its object in `clotho.seed.events`
-// order, which is the order of the waiter list the straight-line code made.
+// order. A group that is on some static waiter list then gets the handle those lists
+// push into its wake slot: the lists themselves are constant data (plan_static_subscribe)
+// and name the group by its slot. A persistent event waiter is linked onto its object
+// in `clotho.seed.events` order, which is the order of the waiter list the
+// straight-line code made.
 //
-// Nothing is decided at run time that the compile did not: which slot a subscription
-// fills, in what order the buckets' entries land (immaterial: each slot is written once
-// and nothing scans before the drain), which ring a group goes on.
+// Nothing is decided at run time that the compile did not: in what order the lists'
+// entries are, which ring a group goes on.
 void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
     const auto all      = mod_.processes();
     auto* const ptr_ty  = llvm::PointerType::getUnqual(ctx_);
@@ -448,10 +474,17 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         llvm::Constant* ctl    = nullptr;
         llvm::Constant* list   = nullptr;
         uint32_t        n      = 0;
+        // A guarded group's members (S9): each one's own list, how many there are, and whether no two events
+        // of the group share a trigger bit.
+        llvm::Constant* mlist   = nullptr;
+        uint32_t        mn      = 0;
+        uint32_t        members = 0;
+        uint32_t        exact   = 0;
     };
     std::vector<TraceRow>                     trace_rows;
     std::vector<std::vector<llvm::Constant*>> trace_entries(procs.size());
     auto* const                               trace_entry_ty = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, i64, ptr_ty });
+    auto* const                               trace_member_ty = llvm::StructType::get(ctx_, { ptr_ty, i32, i32 });
 
     // Schedule groups with an always_comb / always_latch member start after every other
     // body. A fused group is ONE body, so a continuous assignment fused with such a
@@ -596,9 +629,41 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
                 org |= RT_TRACE_ORG_REACTIVE_CONT;
             }
             llvm::Module& root = root_env_->llmod;
-            trace_rows.push_back(TraceRow{ trace_control(root, org, at.where),
-                                           subscribed_statically(k) ? trace_control(root, RT_TRACE_CTL_STATIC, at.where)
-                                                                    : null_ptr });
+            TraceRow      trow{ trace_control(root, org, at.where),
+                                subscribed_statically(k) ? trace_control(root, RT_TRACE_CTL_STATIC, at.where) : null_ptr };
+            // S9: the members of a guarded group, each with the list its guard tests, and whether the group's
+            // events keep trigger bits of their own. Only a group of one row is ever guarded
+            // (emit_sched_entries); an event object is not listed.
+            if (sched_[g].rows.size() == 1 && group_guarded_[sched_[g].rows.front()]) {
+                const uint32_t               g0 = sched_[g].rows.front();
+                std::vector<llvm::Constant*> entries;
+                for (uint32_t i = 0; i < groups_[g0].size(); ++i) {
+                    for (const WaitEvent& w : all[groups_[g0][i]].wait_events) {
+                        if (!mod_.signal(w.signal).is_event) {
+                            entries.push_back(llvm::ConstantStruct::get(
+                              trace_member_ty, { storage_address(slot_of(w.signal)), b_.getInt32(static_cast<uint32_t>(w.edge)),
+                                                 b_.getInt32(i) }));
+                        }
+                    }
+                }
+                if (!entries.empty()) {
+                    auto* const arr = llvm::ArrayType::get(trace_member_ty, entries.size());
+                    trow.mlist      = new llvm::GlobalVariable(root, arr, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage,
+                                                               llvm::ConstantArray::get(arr, entries), "clotho.trace.members");
+                    trow.mn         = static_cast<uint32_t>(entries.size());
+                }
+                trow.members = static_cast<uint32_t>(groups_[g0].size());
+                uint64_t used = 0;
+                trow.exact    = 1;
+                for (const WaitEvent& w : group_events_[g0]) {
+                    const uint8_t c = colour_of(w);
+                    if (c == 0 || (used >> c & 1) != 0) {
+                        trow.exact = 0;
+                    }
+                    used |= 1ull << c;
+                }
+            }
+            trace_rows.push_back(trow);
         }
     }
     if (rows.empty()) {
@@ -606,18 +671,18 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
     }
 
     // The static subscriptions, in topological order of the blocking-write wake graph
-    // (compute_subscription_order): bucket entry order is subscription order, the FIFO
-    // drain pops in bucket order, so a settle wave runs producers before consumers and
+    // (compute_subscription_order): list entry order is subscription order, the FIFO
+    // drain pops in list order, so a settle wave runs producers before consumers and
     // each acyclic cascade settles in one wave. A schedule group subscribes once, at
-    // its earliest member's rank, with its canonical event set and its flag/handle.
-    std::vector<bool>                         subscribed(procs.size(), false);
-    std::vector<std::vector<llvm::Constant*>> slots_of(procs.size());
+    // its earliest member's rank, with its canonical event set and its wake slot.
+    std::vector<bool> subscribed(procs.size(), false);
     struct EventSub {
         uint32_t        row;
         StaticSub       sub;
         llvm::Constant* name = nullptr;
     };
     std::vector<EventSub> event_subs;
+    bool                  any_listed = false;
     for (const uint32_t k : sub_order_) {
         const uint32_t g = sched_of_[group_of_[k]];
         const uint32_t f = sched_[g].front;
@@ -629,12 +694,13 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         assert((!all[f].reactive_home || !design_uses_reactive_ || design_uses_reactive_cont_) &&
                "a continuous tag needs the continuous ring's strip");
         for (const WaitEvent& w : sched_[g].events) {
-            StaticSub       s    = plan_static_subscribe(w.signal, static_cast<uint32_t>(w.edge));
+            StaticSub       s    = plan_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), wake_slot_[f]);
             llvm::Constant* name = trace_on() ? trace_string(root_env_->llmod, mod_.signal(w.signal).name) : nullptr;
             if (s.is_event) {
                 event_subs.push_back({ row_of[g], s, name });
             } else {
-                slots_of[g].push_back(s.slot);
+                ++rows[row_of[g]].subs;
+                any_listed = true;
                 if (trace_on()) {
                     trace_entries[g].push_back(llvm::ConstantStruct::get(
                       trace_entry_ty,
@@ -644,18 +710,10 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
             }
         }
     }
-    std::vector<llvm::Constant*> slots;
-    for (const uint32_t g : order) {
-        if (row_of[g] == ~0u) {
-            continue;
-        }
-        rows[row_of[g]].subs = static_cast<uint32_t>(slots_of[g].size());
-        slots.insert(slots.end(), slots_of[g].begin(), slots_of[g].end());
-    }
 
     // The trace's tables: one row per seed row, the list of each row's static subscription, and
     // the name of the variable of each persistent event waiter.
-    auto* const           trace_row_ty   = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, ptr_ty, i32 });
+    auto* const           trace_row_ty   = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, ptr_ty, i32, ptr_ty, i32, i32, i32 });
     llvm::GlobalVariable* trace_rows_gv  = nullptr;
     llvm::GlobalVariable* trace_names_gv = nullptr;
     if (trace_on()) {
@@ -672,7 +730,9 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         std::vector<llvm::Constant*> v;
         for (const TraceRow& r : trace_rows) {
             v.push_back(llvm::ConstantStruct::get(
-              trace_row_ty, { r.origin, r.ctl, r.list != nullptr ? r.list : null_ptr, b_.getInt32(r.n) }));
+              trace_row_ty, { r.origin, r.ctl, r.list != nullptr ? r.list : null_ptr, b_.getInt32(r.n),
+                              r.mlist != nullptr ? r.mlist : null_ptr, b_.getInt32(r.mn), b_.getInt32(r.members),
+                              b_.getInt32(r.exact) }));
         }
         auto* const arr = llvm::ArrayType::get(trace_row_ty, v.size());
         trace_rows_gv   = new llvm::GlobalVariable(root_env_->llmod, arr, /*isConstant=*/true,
@@ -712,7 +772,6 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         return new llvm::GlobalVariable(root_env_->llmod, arr, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage,
                                         llvm::ConstantArray::get(arr, v), name);
     };
-    llvm::GlobalVariable* slots_gv = slots.empty() ? nullptr : table(ptr_ty, slots, "clotho.seed.slots");
     llvm::GlobalVariable* late_gv  = nullptr;
     if (!late.empty()) {
         std::vector<llvm::Constant*> v;
@@ -836,7 +895,8 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
                 return b_.CreateLoad(ty, b_.CreateStructGEP(trace_row_ty, trow, f));
             };
             emit_trace_seed_row(h, tfield(0, ptr_ty), tfield(1, ptr_ty), tfield(2, ptr_ty), tfield(3, i32),
-                                b_.CreateICmpEQ(ring_of(kind), b_.getInt32(RingNone)));
+                                b_.CreateICmpEQ(ring_of(kind), b_.getInt32(RingNone)),
+                                TraceMembers{ tfield(4, ptr_ty), tfield(5, i32), tfield(6, i32), tfield(7, i32) });
         }
         // The time-zero settle run must evaluate every member.
         auto* const flag = block("seed.flag");
@@ -864,45 +924,21 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         });
     }
 
-    // The buckets' entries: each row's slots are the next `subs` of the list.
-    if (slots_gv != nullptr) {
-        auto* const pre   = b_.GetInsertBlock();
-        auto* const head  = block("sub.head");
-        auto* const outer = block("sub.row");
-        auto* const ihead = block("sub.slot.head");
-        auto* const ibody = block("sub.slot.body");
-        auto* const latch = block("sub.next");
-        auto* const done  = block("sub.done");
-        b_.CreateBr(head);
-        b_.SetInsertPoint(head);
-        auto* const i = b_.CreatePHI(i32, 2);
-        auto* const j = b_.CreatePHI(i32, 2);
-        i->addIncoming(b_.getInt32(0), pre);
-        j->addIncoming(b_.getInt32(0), pre);
-        b_.CreateCondBr(b_.CreateICmpULT(i, b_.getInt32(static_cast<uint32_t>(rows.size()))), outer, done);
-        b_.SetInsertPoint(outer);
-        llvm::Value* kind = b_.CreateLoad(i32, row_field(i, 3));
-        llvm::Value* subs = b_.CreateLoad(i32, row_field(i, 4));
-        llvm::Value* wake = b_.CreateLoad(ptr_ty, row_field(i, 2));
-        llvm::Value* h    = sub_handle(i, kind);
-        b_.CreateBr(ihead);
-        b_.SetInsertPoint(ihead);
-        auto* const t = b_.CreatePHI(i32, 2);
-        t->addIncoming(b_.getInt32(0), outer);
-        b_.CreateCondBr(b_.CreateICmpULT(t, subs), ibody, latch);
-        b_.SetInsertPoint(ibody);
-        llvm::Value* slot = b_.CreateLoad(ptr_ty, b_.CreateInBoundsGEP(slots_gv->getValueType(), slots_gv,
-                                                                       { b_.getInt32(0), b_.CreateAdd(j, t) }));
-        auto* const  elem = wait_elem_ty();
-        b_.CreateStore(h, b_.CreateStructGEP(elem, slot, 0));
-        b_.CreateStore(wake, b_.CreateStructGEP(elem, slot, 1));
-        t->addIncoming(b_.CreateAdd(t, b_.getInt32(1)), ibody);
-        b_.CreateBr(ihead);
-        b_.SetInsertPoint(latch);
-        i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), latch);
-        j->addIncoming(b_.CreateAdd(j, subs), latch);
-        b_.CreateBr(head);
-        b_.SetInsertPoint(done);
+    // The handle each static list pushes for the group: in the group's wake slot,
+    // beside the word the list's scan tests.
+    if (any_listed) {
+        count_loop(static_cast<uint32_t>(rows.size()), "sub", [&](llvm::Value* i) {
+            auto* const  listed = block("sub.listed");
+            auto* const  next   = block("sub.next");
+            llvm::Value* kind   = b_.CreateLoad(i32, row_field(i, 3));
+            llvm::Value* subs   = b_.CreateLoad(i32, row_field(i, 4));
+            b_.CreateCondBr(b_.CreateICmpNE(subs, b_.getInt32(0)), listed, next);
+            b_.SetInsertPoint(listed);
+            llvm::Value* wake = b_.CreateLoad(ptr_ty, row_field(i, 2));
+            b_.CreateStore(sub_handle(i, kind), b_.CreateStructGEP(wake_ty(), wake, 1));
+            b_.CreateBr(next);
+            b_.SetInsertPoint(next);
+        });
     }
 
     // The persistent event waiters: a node of the contiguous pool, linked onto the list

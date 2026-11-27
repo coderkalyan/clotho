@@ -30,9 +30,8 @@
 // is the whole of freeing it. Only an object that owes a finalizer is read.
 //
 // PINNING IS INERT. RT_GC_META_PINNED is set on every conservatively-reached object
-// and read only to carry the write-barrier obligation of a suspended activation
-// forward (relog_conservative_roots), because nothing moves. unpin_all() is what
-// makes "every pin is released" checkable.
+// and read by nothing but unpin_all(), because nothing moves: it is what keeps a move
+// of a pinned object a policy change, and what makes "every pin is released" checkable.
 //
 // COLLECTION HAPPENS AT A SAFEPOINT, EXCEPT WHEN AN ALLOCATION LOOP NEVER REACHES ONE.
 // The ordinary collection runs at a scheduler region boundary, the one place with no
@@ -142,11 +141,12 @@ constexpr uint64_t kLargeObjectBytes = RT_GC_LARGE_OBJECT_BYTES;
 // of handles.
 [[maybe_unused]] constexpr uint64_t kContainerWorkMax  = 1ull << 28;
 [[maybe_unused]] constexpr uint64_t kContainerElemsMax = 1ull << 32;
-// Runaway bound on how many live activations may ref into ONE heap-resident container
-// (ContainerReg::refs), a design limit no more than the others: it takes one suspended
-// activation holding a `ref` into the container per count, so 2^20 of them means the
-// register / remove pairing has come apart rather than that a design is large.
-[[maybe_unused]] constexpr uint32_t kContainerRefsMax = 1u << 20;
+
+// What g.verifying says a container walk is checking (mark_container_handle): every container
+// of a verified heap holds only handles this collection would spare, or, before a young
+// collection marks anything, every container of design state nothing logged holds only old ones.
+constexpr int32_t kVerifyHeap     = 1;
+constexpr int32_t kVerifyUnlogged = 2;
 
 // Initial worklist capacity, in handles. A page-ish of marking stack covers a
 // small testbench's object graph without a reallocation; deeper graphs grow it
@@ -166,17 +166,27 @@ constexpr uint64_t kNurseryBytesFloor = RT_GC_BLOCK_BYTES;
 // makes dropping an entry sound. 2^20 entries is 8 MiB of vector.
 constexpr size_t kRememberedMax = 1u << 20;
 
-// The heap-growth rule that picks the kind when cfg.full_every is 0 (§7). A young
+// Runaway bound for the log of design-state cards, in the convention of kRememberedMax: not a
+// design limit. A real log is the cards a design stored to between two collections, and a
+// collection empties it. Reaching this means more cards were stored to than a young collection
+// is worth reading one by one, so recording stops and the next collection reads every slot of
+// every table, which needs no log and so loses no store. 2^20 entries is 8 MiB of vector.
+constexpr size_t kLoggedCardsMax = 1u << 20;
+
+// The growth rule that picks the kind when cfg.full_every is 0 (§7). A young
 // collection cannot reclaim old garbage, so old garbage grows monotonically between
-// full collections; capping the heap at kFullGrowthFactor times the live bytes the
-// LAST FULL collection measured bounds floating garbage at a constant factor of the
-// live set and amortises full-collection cost to O(live) per doubling -- the
-// growth-factor argument, and the shape of BDW's GC_free_space_divisor.
+// full collections; a full collection once the old generation holds kFullGrowthFactor
+// times the live bytes the LAST FULL collection measured bounds floating garbage at a
+// constant factor of the live set and amortises full-collection cost to O(live) per
+// doubling -- the growth-factor argument, and the shape of BDW's GC_free_space_divisor.
+// What is compared is what the old generation holds (GcState::old_bytes), never the
+// committed heap: the heap includes the blocks the young budget was allocated from,
+// so a design with a small live set would find every collection full.
 //
-// The floor is not a tuning knob but a correctness-of-policy fix: the first chunk is
-// committed before anything can be live, so twice the live bytes of a design holding
-// a handful of objects is less than the heap will ever be and every collection would
-// be full, which is exactly the non-generational collector this phase replaces.
+// The floor is what a design with a small live set runs on: a few objects promoted by
+// each young collection double a live set of a few objects at once, and every few
+// collections would be full. Below the floor the old generation is not worth a pass
+// over the whole heap.
 constexpr uint64_t kFullGrowthFactor = 2;
 constexpr uint64_t kFullGrowthFloor  = kChunkBytes;
 
@@ -322,43 +332,11 @@ struct PendingContainer {
 };
 
 // A dynamically-scoped container registration: a frame local, or an element of one,
-// keyed by the address of its rt_dynarr / rt_queue / rt_assoc handle.
+// keyed by the address of its rt_dynarr / rt_queue / rt_assoc handle. One storage address
+// is one frame-local container, since that address is a per-activation alloca.
 struct ContainerReg {
     uint32_t           kind;
     const rt_elem_ops* ops;
-    // The heap object whose body or payload the registered container lives in, or null
-    // when the container's storage is not in the heap at all -- which is every frame-local
-    // registration, whose rt_dynarr / rt_queue / rt_assoc is a coroutine-frame alloca.
-    //
-    // Non-null for the one shape that needs it: a `ref` bound to an ELEMENT of a container
-    // owned by a class property (`obj.q[3]`, or `obj.qq[3]` for a queue of queues). That
-    // actual is a pointer INTO the outer container's malloc'd payload, which
-    // rt_gc_find_object rejects as not-in-a-block, so the conservative frame scan cannot
-    // resolve it to its owner the way it resolves a `ref` to a direct property. The
-    // registration therefore stands in for the resolution the frame scan cannot do, and it
-    // must do BOTH halves of it: reach the elements, and keep the owner alive
-    // (push_container_roots). Without the second half a registration that outlives its
-    // owner -- a task disabled mid-flight never reaches the removal -- would name a
-    // finalized body and the next collection would read freed memory. With it, an unpaired
-    // registration can only LEAK its owner, never dangle, which is the right side of that
-    // trade to fail on.
-    void*              owner;
-    // How many live activations have registered THIS address. Always 1 for a frame-local
-    // container, whose address is a per-activation alloca, so a second registration of one
-    // is an init without its deinit and stays fatal. A heap-resident container's address is
-    // a property of its OWNER, not of the activation, so two `ref` actuals into the same
-    // container -- `t(obj.q[1], obj.q[2])`, or two forked processes each passing obj.q[3]
-    // -- legitimately name the same key, and counting is the only correct answer: without
-    // it the first removal would deregister a container a live activation still refs, and
-    // in a release build the collector would then free what that activation pushes.
-    //
-    // Not a tolerated case but an EMITTED one, so the count cannot be optimised away later:
-    // `t(obj.q[1], obj.q[2])` emits two adds and two removes on this one key in a single
-    // call, and the backend deliberately does not fold them, because the two roots are
-    // separate SSA values that merely happen to compute the same address and relying on CSE
-    // to notice would be unsound exactly where it looked cleanest. So the COUNT is the
-    // only thing that tells one live registration of a key from two.
-    uint32_t           refs;
 };
 
 struct GcState {
@@ -388,9 +366,18 @@ struct GcState {
     // cleared only by a full collection actually completing.
     int32_t force_full = 0;
     // stats.bytes_live as the last FULL collection measured it -- the whole live set,
-    // which is the baseline the growth rule compares the heap against. A young
-    // collection's bytes_live is only what it visited, so it must not update this.
+    // which is the baseline the growth rule compares the old generation against. A
+    // young collection's bytes_live is only what it visited, so it must not update this.
     uint64_t live_after_full = 0;
+    // The bytes of every object that carries a mark: what the old generation holds,
+    // reachable or not. A collection adds each object it marks, and a full collection
+    // starts again from nothing, since it clears every mark first. Nothing sets or
+    // clears a mark between collections, so the heap walk of rt_gc_verify() finds
+    // exactly this many marked bytes at any time.
+    uint64_t old_bytes = 0;
+    // Of the objects the remembered set made a young collection trace again, the bytes:
+    // old already, so what that collection adds to bytes_live beyond them is promotion.
+    uint64_t retraced_bytes = 0;
 
     // -- Pressure and emergency collection (§6.1, §6.5) --
     //
@@ -467,7 +454,34 @@ struct GcState {
     std::vector<ChunkRecord*> young_large;
 
     std::vector<const rt_gc_roots*> roots;  // borrowed: the JIT'd module owns them
-    std::vector<Range>              ranges;
+    // Where each table's region is, to find the table an address belongs to (rt_gc_note_state_store).
+    // `table` indexes `roots`. Sorted by address before it is searched, which `regions_sorted` says.
+    struct Region {
+        uintptr_t lo;
+        uintptr_t hi;
+        uint32_t  table;
+    };
+    std::vector<Region> regions;
+    bool                regions_sorted = true;
+    // The cards stored to since the last collection, each once: a card byte is set exactly when it
+    // is here. At most kLoggedCardsMax of them; past that, or when a table is registered, the next
+    // collection reads every slot instead (`state_all`) and clears every card.
+    struct LoggedCard {
+        uint32_t table;
+        uint32_t card;
+    };
+    std::vector<LoggedCard> logged_cards;
+    // The containers of design state mutated since the last collection, each once: a container's
+    // flag bytes (Gc.h, rt_gc_roots) are set exactly when it is here. `table` indexes `roots`
+    // and `entry` that table's containers. Bounded like the cards, with the same fallback.
+    struct LoggedContainer {
+        uint32_t table;
+        uint32_t entry;
+    };
+    std::vector<LoggedContainer> logged_containers;
+    bool                    state_all        = true;
+    size_t                  logged_cards_max = kLoggedCardsMax;
+    std::vector<Range>      ranges;
 
     // The block the mutator's free run is in, and where that run began. The accounting
     // the inlined fast path cannot do: it bumps `cursor` and writes metadata bytes,
@@ -487,12 +501,10 @@ struct GcState {
     std::vector<void*> weak_reached;
     bool               weak_kept = false;
 
-    // Containers of class handles (§3.3, Gc.h:226-268). `container_tables` is
-    // borrowed exactly as `roots` is: the JIT'd module owns the constant.
-    // `containers` is the dynamically-scoped registry, keyed by handle address so a
-    // removal is a hash erase rather than a scan of every live activation's locals.
-    // `container_work` is the container half of the mark fixpoint.
-    std::vector<const rt_gc_container_table*>         container_tables;
+    // Containers of class handles (§3.3, Gc.h:226-268). Those of design state are in the root
+    // tables, borrowed as `roots` is. `containers` is the dynamically-scoped registry, keyed by
+    // handle address so a removal is a hash erase rather than a scan of every live activation's
+    // locals. `container_work` is the container half of the mark fixpoint.
     ankerl::unordered_dense::map<void*, ContainerReg> containers;
     std::vector<PendingContainer>                     container_work;
     // The NBA staging queues whose records can hold a handle. Registered once at start-up
@@ -1505,9 +1517,8 @@ void push_marked(void* handle) {
 // "traced" and "promoted". And every reference written into the object AFTER that point
 // takes the write barrier's taken edge -- `(meta & (MARK|LOGGED)) == MARK` -- so the
 // object is in the remembered set and the next collection traces it from there, which
-// covers stores from generated code and, through relog_conservative_roots(), the raw
-// interior stores a suspended activation performs after the barrier that armed it has
-// already been consumed.
+// covers stores from generated code and, through rt_gc_note_ref_store(), the raw
+// interior stores a callee performs through a `ref` it was handed.
 //
 // A third store shape stores no handle into a heap object at all: a class handle written
 // into a CONTAINER owned by an old object lands in the container's malloc'd payload. A
@@ -1523,25 +1534,19 @@ void push_marked(void* handle) {
 // trace `old.f = fresh` and lose `old.q.push_back(fresh)`, freeing an object a live queue
 // still points at.
 //
-// The suspended-activation window is the same for a container held by `ref`, with ONE
-// exception. A `ref` to a container that is a direct class property is a pointer to the
-// rt_queue / rt_dynarr / rt_assoc header inside the owning object's BODY, so the frame
-// scan resolves it to that object (rt_gc_find_object resolves interior pointers) and
-// relog_conservative_roots() carries the obligation forward exactly as for a `ref` to a
-// handle property. A `ref` to a NESTED container element -- `obj.qq[3]` where qq is a
-// queue of queues -- is a pointer into the outer container's malloc'd payload
-// (ir/llvm/StateLayout.cpp, ref_actual_ptr), which rt_gc_find_object correctly rejects as
-// outside the heap, so nothing re-logs the owner and a callee that suspends and only then
-// pushes is outside both mechanisms. It is closed at the call site instead, by
-// registering the actual as a dynamically-scoped container root for the call's duration
-// (rt_gc_container_add / rt_gc_container_remove), which needs nothing from this file,
-// because a container ROOT is scanned in full at every collection whatever its kind.
+// A store through a `ref` formal, or into the actual of an output formal, is a fourth
+// shape: the callee holds a raw interior pointer and cannot name the owner. Its barrier is
+// rt_gc_note_ref_store, which finds the owner from the address -- or, for an element of a
+// container, from the container the ref's witness chain names -- and logs it as the
+// inlined barrier would. It runs at each store, so a task that suspends across a
+// collection before its store logs the owner after it, and no record made at the call is
+// needed or kept.
 //
-// Should that registration ever be missing, the shape is LOUD rather than silent:
+// A young element an un-logged owner holds is LOUD rather than silent:
 // verify_old_edges() walks an un-remembered old object's container leaves and asserts
-// every element is one this collection would spare (is_marked_now), so an un-logged
-// young element fails an assertion at the collection that would have freed it instead of
-// at the use-after-free later.
+// every element is one this collection would spare (is_marked_now), so a missed barrier
+// fails an assertion at the collection that would have freed it instead of at the
+// use-after-free later.
 //
 // By induction over collections, an OLD object outside the remembered set has no
 // out-edge this collection could reach that is not already covered. Skipping it loses
@@ -1626,8 +1631,12 @@ void mark_container_handle(void* child) {
         // live container is one this collection would spare -- marked, or OLD in a young
         // collection, which is the same statement about liveness reached without a mark
         // (§7). One predicate for both, asserted, never re-marked.
-        assert(is_marked_now(resolved) &&
-               "a live container holds a handle this collection would not spare");
+        if (g.verifying == kVerifyUnlogged) {
+            assert(is_marked_now(resolved) &&
+                   "an unlogged container of design state names a young object: a mutation of it was not logged");
+        } else {
+            assert(is_marked_now(resolved) && "a live container holds a handle this collection would not spare");
+        }
         return;
     }
     mark_and_push(resolved);
@@ -1965,37 +1974,37 @@ void drain_containers() {
 // through rt_gc_container_add, and a class property is NOT a root -- it is reached
 // through its owning object's leaf table in trace_one, so a container inside a dead
 // object keeps nothing alive.
-void push_container_roots() {
-    for (const rt_gc_container_table* t : g.container_tables) {
-        assert(t != nullptr && "a registered container table exists");
-        assert(t->count < kRootHandlesMax && "an implausible container table size");
-        if (t->count == 0) {
-            continue;
+//
+// A container of design state is pushed by push_precise_roots, all of them or the logged ones.
+// This pushes every one, for a verification of the whole of design state.
+uint64_t push_all_state_containers() {
+    uint64_t n = 0;
+    for (const rt_gc_roots* t : g.roots) {
+        assert(t != nullptr && "a registered root table exists");
+        assert(t->ncontainers < kRootHandlesMax && "an implausible container count");
+        for (uint32_t i = 0; i < t->ncontainers; ++i) {
+            const rt_gc_container& e = t->containers[i];
+            push_container(static_cast<uint8_t*>(t->base) + e.offset, e.kind, e.ops);
         }
-        assert(t->base != nullptr && "a non-empty container table has a base");
-        assert(t->entries != nullptr && "a non-empty container table has entries");
-        uint8_t* base = static_cast<uint8_t*>(t->base);
-        for (uint32_t i = 0; i < t->count; ++i) {
-            const rt_gc_container& e = t->entries[i];
-            push_container(base + e.offset, e.kind, e.ops);
-        }
-        g.stats.container_roots += t->count;
+        n += t->ncontainers;
     }
-    // Dynamically-scoped containers: the registration IS the liveness claim, so there
-    // is nothing further to validate here. A broken init / deinit pairing is caught
-    // where it happens, by rt_gc_container_remove's assertion, rather than as a leak
-    // or a use-after-free one collection later.
+    return n;
+}
+
+// Dynamically-scoped containers: the registration IS the liveness claim, so there
+// is nothing further to validate here. A broken init / deinit pairing is caught
+// where it happens, by rt_gc_container_remove's assertion, rather than as a leak
+// or a use-after-free one collection later.
+void push_dynamic_container_roots() {
     for (const auto& kv : g.containers) {
-        // The owner first, so the container this walk is about to read cannot be a payload
-        // the finalizer of a dead object frees. A young collection legitimately declines to
-        // trace an OLD owner (mark_and_push), and that is not a gap: no young collection
-        // frees an old object, so it is intact either way.
-        if (kv.second.owner != nullptr) {
-            mark_and_push(kv.second.owner);
-        }
         push_container(kv.first, kv.second.kind, kv.second.ops);
     }
     g.stats.container_roots += static_cast<uint64_t>(g.containers.size());
+}
+
+void push_container_roots() {
+    g.stats.container_roots += push_all_state_containers();
+    push_dynamic_container_roots();
 }
 
 // Trace one marked object's handle fields.
@@ -2077,44 +2086,230 @@ void drain() {
     assert(g.stats.objects_live <= g.stats.objects_allocated && "live exceeds allocated");
 }
 
-// Precise roots: the design state buffer, per-instance state, static class
-// properties. The backend emits each table's handle slots by byte offset, so this
-// is one load per slot and needs no validation for correctness -- but a slot the
-// backend misclassified (a `chandle` lowers to the same 64-bit plane, design §3.4)
-// would have us trace a foreign DPI pointer, so a non-resolving precise root is
-// fatal rather than skipped. There is no staleness path for a root slot: design
-// state is never recycled heap.
-void push_precise_roots() {
-    for (const rt_gc_roots* t : g.roots) {
-        assert(t != nullptr);
-        assert(t->nhandles < kRootHandlesMax && "an implausible root table size");
-        if (t->nhandles == 0) {
-            continue;
+// -- Design-state roots and their cards (Gc.h, rt_gc_roots) ---------------------------
+//
+// A region's slots are read as roots, but a young collection reads only the slots of the
+// cards logged since the last collection. That is sound because of how an object becomes old:
+// every object a collection reaches is marked, and so old, so a slot nothing has stored to
+// since the collection that read it names an old object, which a young collection leaves
+// alone. A store to design state has to say so, then (rt_gc_note_state_store, and the inline
+// test of the card byte in front of the call), and until it does the slot is nobody's to read.
+// Everything the design held before the code ran has been stored by no instruction of it, so a
+// registration makes the next collection read every slot (state_all).
+
+uint8_t* cards_of(const rt_gc_roots* t) {
+    return static_cast<uint8_t*>(t->base) + t->cards;
+}
+
+uint32_t ncards_of(const rt_gc_roots* t) {
+    return ((t->cards - 1) >> RT_GC_CARD_SHIFT) + 1;
+}
+
+// The region an address is in, or null. The regions are sorted by address the first time one
+// is asked for after a registration, which is once, since they are all registered at start-up.
+const GcState::Region* find_region(uintptr_t a) {
+    if (!g.regions_sorted) {
+        std::sort(g.regions.begin(), g.regions.end(), [](const GcState::Region& x, const GcState::Region& y) {
+            return x.lo < y.lo;
+        });
+        for (size_t i = 1; i < g.regions.size(); ++i) {
+            assert(g.regions[i - 1].hi <= g.regions[i].lo && "two root tables describe one region");
         }
-        assert(t->base != nullptr && "a non-empty root table has a base");
-        assert(t->offsets != nullptr && "a non-empty root table has offsets");
-        uint8_t* base = static_cast<uint8_t*>(t->base);
-        for (uint32_t i = 0; i < t->nhandles; ++i) {
-            void* h = *reinterpret_cast<void**>(base + t->offsets[i]);
-            if (h == nullptr) {
-                continue;
+        g.regions_sorted = true;
+    }
+    const auto it = std::upper_bound(
+      g.regions.begin(), g.regions.end(), a, [](uintptr_t addr, const GcState::Region& r) { return addr < r.lo; });
+    if (it == g.regions.begin()) {
+        return nullptr;
+    }
+    const GcState::Region& r = *(it - 1);
+    return a < r.hi ? &r : nullptr;
+}
+
+// One card of one table: set its byte and record it. A card already set is logged already (the
+// byte and the log are set together), so a hot slot costs this call once per collection cycle,
+// which is also what the inline test in front of the call guarantees. Past kLoggedCardsMax the
+// byte is still set and recording stops: the next collection reads every slot, which needs no
+// log, so a dropped entry costs time and never a slot.
+void mark_card(uint32_t table, uint32_t card) {
+    uint8_t& byte = cards_of(g.roots[table])[card];
+    if (byte != 0) {
+        return;
+    }
+    byte = 1;
+    g.stats.state_cards_logged += 1;
+    if (g.state_all) {
+        return; // every slot is read at the next collection and every card cleared after it
+    }
+    if (g.logged_cards.size() >= g.logged_cards_max) {
+        g.state_all = true;
+        return;
+    }
+    g.logged_cards.push_back(GcState::LoggedCard{ table, card });
+}
+
+// -- Containers of design state and their flags -----------------------------------------------
+//
+// A container's payload is malloc'd, so no card says whether it was mutated, and what a
+// container costs a collection is its whole payload, whatever lies near its handle. Each has
+// flag bytes of its own instead (Gc.h, rt_gc_roots), set when a mutation that can add a handle to
+// it is logged. A young collection walks the logged containers and no others, which is sound for
+// the reason a card is: every handle a walk reached is marked, and so old, and a container
+// nothing has added a handle to since still holds only those. Moving handles within a container
+// (a sort, a ring growth) and removing them add none.
+
+uint8_t* flags_of(const rt_gc_roots* t) {
+    return static_cast<uint8_t*>(t->base) + t->flags;
+}
+
+// The bytes of a container's own handle, which a store to the container lands on.
+uint32_t container_handle_bytes(uint32_t kind) {
+    switch (kind) {
+        case rt_elem_dynarr:
+            return sizeof(rt_dynarr);
+        case rt_elem_queue:
+            return sizeof(rt_queue);
+        case rt_elem_assoc:
+            return sizeof(rt_assoc);
+    }
+    assert(false && "only a dynarr / queue / assoc is a container of design state");
+    return 0;
+}
+
+uint8_t* container_flags(const rt_gc_roots* t, const rt_gc_container& e) {
+    return flags_of(t) + e.flag;
+}
+
+uint32_t container_words(const rt_gc_container& e) {
+    return container_handle_bytes(e.kind) >> RT_GC_CFLAG_SHIFT;
+}
+
+// One container: set its flag bytes and record it. A container already flagged is logged already
+// (the bytes and the log are set together), so a hot container costs this call once per
+// collection cycle, which the inline test in front of the call guarantees. Past the bound the
+// bytes are still set and recording stops: the next collection walks every container.
+void log_container(uint32_t table, uint32_t entry) {
+    const rt_gc_roots* const t = g.roots[table];
+    const rt_gc_container&   e = t->containers[entry];
+    uint8_t* const           f = container_flags(t, e);
+    if (f[0] != 0) {
+        return;
+    }
+    std::memset(f, 1, container_words(e));
+    g.stats.state_containers_logged += 1;
+    if (g.state_all) {
+        return;
+    }
+    if (g.logged_containers.size() >= g.logged_cards_max) {
+        g.state_all = true;
+        return;
+    }
+    g.logged_containers.push_back(GcState::LoggedContainer{ table, entry });
+}
+
+// The containers whose handles overlap the region offsets [first, last]. The entries do not
+// overlap and ascend, so what they end at ascends too.
+void log_containers_in(uint32_t table, uint64_t first, uint64_t last) {
+    const rt_gc_roots* const     t     = g.roots[table];
+    const rt_gc_container* const begin = t->containers;
+    const rt_gc_container* const end   = begin + t->ncontainers;
+    const rt_gc_container*       it    = std::partition_point(
+      begin, end, [&](const rt_gc_container& e) { return e.offset + container_handle_bytes(e.kind) <= first; });
+    for (; it != end && it->offset <= last; ++it) {
+        log_container(table, static_cast<uint32_t>(it - begin));
+    }
+}
+
+// One slot as a root. Precise, and needing no validation for correctness -- but a slot the
+// backend misclassified (a `chandle` lowers to the same 64-bit plane, design §3.4) would have
+// us trace a foreign DPI pointer, so a non-resolving precise root is fatal rather than
+// skipped. There is no staleness path for a root slot: design state is never recycled heap.
+void read_root_slot(const rt_gc_roots* t, uint32_t i) {
+    g.stats.state_slots_read += 1;
+    void* const h = *reinterpret_cast<void**>(static_cast<uint8_t*>(t->base) + t->offsets[i]);
+    if (h == nullptr) {
+        return;
+    }
+    if (rt_gc_find_object(h) != h) {
+        // Report the word, not just the shape: the two ways to get here are a root table
+        // naming a slot that is not a class handle (so the value is whatever the design
+        // stored there) and a live root naming an object the heap has already reclaimed (so
+        // the value is a plausible-looking heap address). The number is what distinguishes them.
+        char note[160];
+        std::snprintf(note,
+                      sizeof note,
+                      "root %u of the table at %p reads %p, which the heap does not own "
+                      "(resolved to %p)",
+                      i,
+                      static_cast<const void*>(t),
+                      h,
+                      rt_gc_find_object(h));
+        gc_fatal("a precise GC root does not name a class object", note);
+    }
+    mark_and_push(h);
+}
+
+// The slots of one card: the offsets in [card * RT_GC_CARD_BYTES, the next card's), found by
+// binary search since a table's offsets ascend.
+void read_card_slots(const rt_gc_roots* t, uint32_t card) {
+    const uint32_t  lo    = card << RT_GC_CARD_SHIFT;
+    const uint32_t  hi    = lo + RT_GC_CARD_BYTES;
+    const uint32_t* first = std::lower_bound(t->offsets, t->offsets + t->nhandles, lo);
+    for (const uint32_t* at = first; at != t->offsets + t->nhandles && *at < hi; ++at) {
+        read_root_slot(t, static_cast<uint32_t>(at - t->offsets));
+    }
+}
+
+// Precise roots: the design state buffer and per-instance state, which hold the static class
+// properties too. A full collection reads every slot, as does one that owes it (state_all); a
+// young one reads the logged cards. Whichever it was, every card is clear after, and the log
+// is empty: the slots stored to from here on are the next collection's.
+void push_precise_roots() {
+    const bool all = g.kind == RT_GC_KIND_FULL || g.state_all;
+    if (all) {
+        for (const rt_gc_roots* t : g.roots) {
+            assert(t != nullptr);
+            assert(t->nhandles < kRootHandlesMax && "an implausible root table size");
+            for (uint32_t i = 0; i < t->nhandles; ++i) {
+                read_root_slot(t, i);
             }
-            if (rt_gc_find_object(h) != h) {
-                // Report the word, not just the shape: the two ways to get here are a
-                // root table naming a slot that is not a class handle (so the value is
-                // whatever the design stored there) and a live root naming an object the
-                // heap has already reclaimed (so the value is a plausible-looking heap
-                // address). The number is what distinguishes them.
-                char note[160];
-                std::snprintf(note, sizeof note,
-                              "root %u of the table at %p reads %p, which the heap does not own "
-                              "(resolved to %p)",
-                              i, static_cast<const void*>(t), h, rt_gc_find_object(h));
-                gc_fatal("a precise GC root does not name a class object", note);
+            g.stats.state_cards_read += ncards_of(t);
+        }
+        const uint64_t n = push_all_state_containers();
+        g.stats.state_containers_read += n;
+        g.stats.container_roots += n;
+    } else {
+        for (const GcState::LoggedCard& l : g.logged_cards) {
+            read_card_slots(g.roots[l.table], l.card);
+        }
+        g.stats.state_cards_read += g.logged_cards.size();
+        for (const GcState::LoggedContainer& l : g.logged_containers) {
+            const rt_gc_roots* const t = g.roots[l.table];
+            const rt_gc_container&   e = t->containers[l.entry];
+            push_container(static_cast<uint8_t*>(t->base) + e.offset, e.kind, e.ops);
+        }
+        g.stats.state_containers_read += g.logged_containers.size();
+        g.stats.container_roots += g.logged_containers.size();
+    }
+    if (g.state_all) {
+        for (const rt_gc_roots* t : g.roots) {
+            std::memset(cards_of(t), 0, ncards_of(t));
+            if (t->ncontainers != 0) {
+                std::memset(flags_of(t), 0, t->bytes - t->flags);
             }
-            mark_and_push(h);
+        }
+    } else {
+        for (const GcState::LoggedCard& l : g.logged_cards) {
+            cards_of(g.roots[l.table])[l.card] = 0;
+        }
+        for (const GcState::LoggedContainer& l : g.logged_containers) {
+            const rt_gc_roots* const t = g.roots[l.table];
+            std::memset(container_flags(t, t->containers[l.entry]), 0, container_words(t->containers[l.entry]));
         }
     }
+    g.logged_cards.clear();
+    g.logged_containers.clear();
+    g.state_all = false;
 }
 
 // Conservative scan of a byte range. Every candidate is validated against our own
@@ -2399,8 +2594,8 @@ void release_parked() {
 //
 // The barrier's record of the old-to-young edges a young collection could not
 // otherwise see. Two producers -- rt_gc_remember(), the out-of-line half of the
-// inlined barrier, and relog_conservative_roots() below -- and one consumer,
-// push_remembered_roots(), which every collection runs exactly once.
+// inlined barrier, and rt_gc_note_ref_store(), the barrier of a store through a `ref` --
+// and one consumer, push_remembered_roots(), which every collection runs exactly once.
 
 // Set LOGGED and record. Idempotent through the LOGGED bit, so a hot object costs one
 // push per collection CYCLE rather than one per store, and bounded by kRememberedMax:
@@ -2437,6 +2632,7 @@ void remember_object(void* handle) {
 void push_remembered_roots() {
     assert(g.kind == RT_GC_KIND_YOUNG || g.kind == RT_GC_KIND_FULL);
     assert(g.remembered.size() <= kRememberedMax && "the remembered set ran past its bound");
+    assert(g.stats.bytes_live == 0 && "the remembered set is the first root set a collection reads");
     for (void* h : g.remembered) {
         uint8_t* const m = meta_ptr(h);
         assert((*m & RT_GC_META_LOGGED) != 0 && "a remembered entry lost its LOGGED bit");
@@ -2456,50 +2652,10 @@ void push_remembered_roots() {
         // object, so nothing else queues it a second time.
         push_marked(h);
     }
+    // Nothing else has been counted yet, so this is what the entries added: not promotion.
+    g.retraced_bytes = g.stats.bytes_live;
     g.remembered.clear();
     assert(g.remembered.empty() && "the drain must leave the set empty");
-}
-
-// Re-enter every conservatively-reached object into the remembered set, for the NEXT
-// collection. This is not belt-and-braces: it closes a hole the inlined barrier cannot.
-//
-// The barrier is emitted at the store, except for a store through a raw interior pointer
-// whose owner is not statically known -- a `ref` formal bound to a class property, or an
-// output/inout formal whose actual is one -- where it is emitted at the CALL SITE, the
-// last place the owner handle is in hand (ir/llvm/Subroutines.cpp, lower_call_common). A non-blocking call cannot span a safepoint, so for a
-// function the call-site entry is still in the set when the callee's store lands. A
-// blocking TASK can suspend across a collection, which consumes that entry; the store
-// then lands on an OLD object whose LOGGED bit is clear with nothing left to log it, and
-// the next young collection would not trace it and would reclaim the young object it
-// stored while it is still reachable.
-//
-// What closes that is liveness. To perform the store after resuming, the activation must
-// hold the pointer -- the interior pointer, or the owner handle for a copy-back -- across
-// the suspend that PRECEDES the store, so CoroSplit keeps it in the coroutine frame and
-// the frame scan resolves it (rt_gc_find_object resolves interior pointers,
-// Gc.h:433-438). Every collection with such a store still to come therefore sees the
-// object conservatively, and re-logging it there means the first collection after the
-// store traces it. g.pinned is exactly that set, already deduplicated by the PINNED bit.
-//
-// Tracing the object at THIS collection instead would not close the hole: the pointer
-// need not still be live at the next safepoint after the store, so the object may never
-// be reached conservatively again. Only carrying the obligation forward works.
-void relog_conservative_roots() {
-    assert(g.worklist.empty() && "the re-log runs after the mark phase");
-    // The drain emptied the set at the start of this collection and nothing between
-    // then and here logs anything: a finalizer must not store a class handle, and
-    // sweep() asserts the neighbouring halves of that same claim.
-    assert(g.remembered.empty() && "something logged an object mid-collection");
-    for (void* h : g.pinned) {
-        // Marked (hence promoted) or already OLD -- either way remember_object's
-        // precondition holds, which is what this asserts on its behalf.
-        assert(is_old(h) && "a conservatively-reached object is OLD after the mark phase");
-        remember_object(h);
-    }
-    // Never counted into stats.remembered: that counter means "objects the WRITE BARRIER
-    // logged" (Gc.h:408-411), which is what lets a test prove the barrier fired at all,
-    // and it would prove nothing if the collector padded it.
-    assert(g.remembered.size() <= kRememberedMax && "the re-log ran past the bound");
 }
 
 void unpin_all() {
@@ -2881,9 +3037,13 @@ void release_heap() {
     g.young.clear();
     g.young_large.clear();
     g.roots.clear();
+    g.regions.clear();
+    g.regions_sorted = true;
+    g.logged_cards.clear();
+    g.logged_containers.clear();
+    g.state_all = true;
     g.ranges.clear();
     g.nba_queues.clear();
-    g.container_tables.clear();
     g.containers.clear();
     g.container_work.clear();
     g.worklist.clear();
@@ -2957,9 +3117,8 @@ void rearm_after_collection() {
 // -- Collection policy (§7) ---------------------------------------------------
 
 // Committed heap bytes: whole chunks plus the mappings of large objects, those kept
-// for reuse included. Large objects belong in it because a young collection does not
-// reclaim an old one either, so a design whose garbage is all large objects would
-// otherwise never take a full collection.
+// for reuse included. What --gc-heap-max limits, and what the stats report; the choice
+// of a full collection does not read it, since the heap includes the young budget.
 uint64_t heap_bytes() {
     const uint64_t chunks = g.chunks.size() * kChunkBytes;
     const uint64_t bytes  = chunks + g.large_mapped;
@@ -2981,15 +3140,20 @@ uint64_t heap_bytes() {
 //      full paths ALTERNATE and a stress run exercises both at every safepoint. Stress is
 //      the strongest correctness mode and a mode that only ever ran one of the two paths
 //      would be the weaker for it.
-//   5. Otherwise heap growth: full once the heap has grown past kFullGrowthFactor times
-//      the live bytes the last FULL collection measured, floored at kFullGrowthFloor. A
-//      young collection cannot reclaim old garbage, so this is the only thing bounding
-//      floating garbage, and it bounds it at a constant factor of the live set. The same
-//      rule is applied to the buffers strings and containers own, which a young collection
-//      cannot free for an old dead object either: a design whose objects are small and
-//      whose strings are large would otherwise never take a full collection, however
-//      much of its memory was dead (§6.5). Reaching --gc-heap-max forces one too: it is
-//      the one situation a young collection can do nothing about at all.
+//   5. Otherwise growth of the old generation: full once what it holds has passed
+//      kFullGrowthFactor times what the last FULL collection left, floored at
+//      kFullGrowthFloor. A young collection cannot reclaim old garbage, so this is the
+//      only thing bounding floating garbage, and it bounds it at a constant factor of
+//      the live set. The old generation is the objects a collection has marked
+//      (GcState::old_bytes) and the buffers their strings and containers own, which a
+//      young collection cannot free for an old dead object either: a design whose
+//      objects are small and whose strings are large would otherwise never take a full
+//      collection, however much of its memory was dead (§6.5). The buffers are counted
+//      as the last collection left them (owned_after_gc), after its finalizers freed
+//      those of the young objects that died; g_owned.live now would hold the young
+//      budget too, and a design with a small live set would find every collection full.
+//      Reaching --gc-heap-max forces one as well: it is the one situation a young
+//      collection can do nothing about at all.
 uint32_t choose_kind() {
     assert(g.initialized != 0 && "the kind is chosen inside an initialized collector");
     assert(g.cfg.full_every >= 0 && "a negative full_every is a configuration bug");
@@ -3004,24 +3168,18 @@ uint32_t choose_kind() {
         const uint64_t n = static_cast<uint64_t>(every);
         return (g.stats.collections % n == 0) ? RT_GC_KIND_FULL : RT_GC_KIND_YOUNG;
     }
-    const uint64_t heap = heap_bytes();
     if (g.cfg.heap_bytes_max != 0 && !heap_may_grow(kChunkBytes)) {
         return RT_GC_KIND_FULL;
     }
     assert(g.live_after_full < (1ull << 62) && "an implausible live-bytes baseline");
-    uint64_t target = g.live_after_full * kFullGrowthFactor;
+    assert(g.owned_after_full < (1ull << 62) && "an implausible owned-bytes baseline");
+    assert(g.old_bytes < (1ull << 62) && "an implausible old-generation size");
+    assert(g.owned_after_gc < (1ull << 62) && "an implausible owned-bytes count");
+    uint64_t target = (g.live_after_full + g.owned_after_full) * kFullGrowthFactor;
     if (target < kFullGrowthFloor) {
         target = kFullGrowthFloor;
     }
-    if (heap > target) {
-        return RT_GC_KIND_FULL;
-    }
-    assert(g.owned_after_full < (1ull << 62) && "an implausible owned-bytes baseline");
-    uint64_t owned_target = g.owned_after_full * kFullGrowthFactor;
-    if (owned_target < kFullGrowthFloor) {
-        owned_target = kFullGrowthFloor;
-    }
-    return (g_owned.live > owned_target) ? RT_GC_KIND_FULL : RT_GC_KIND_YOUNG;
+    return (g.old_bytes + g.owned_after_gc > target) ? RT_GC_KIND_FULL : RT_GC_KIND_YOUNG;
 }
 
 // Every root set, then the mark fixpoint. Extracted from rt_gc_collect_kind so both
@@ -3041,7 +3199,7 @@ void mark_from_roots() {
     // conservative_pins counts the objects whose retention conservatism is actually
     // responsible for.
     push_precise_roots();
-    push_container_roots();
+    push_dynamic_container_roots();
     push_frame_roots();
     push_range_roots();
     push_nba_roots();
@@ -3077,6 +3235,9 @@ void account_collection(uint32_t reason, uint32_t kind) {
         // Only a full collection may write either of these: it is the only one that has
         // measured the WHOLE live set.
         g.live_after_full = g.stats.bytes_live;
+        // The old generation is what survived: every mark was cleared before this
+        // collection, so each object it marked is counted once.
+        g.old_bytes = g.stats.bytes_live;
         // The owned-buffer half of the same baseline. Read at the end of the collection,
         // after the finalizers have freed what the dead objects owned, so it is what the
         // live set holds.
@@ -3084,6 +3245,10 @@ void account_collection(uint32_t reason, uint32_t kind) {
         g.force_full      = 0;
     } else {
         g.stats.young_collections += 1;
+        // What a young collection marks is promoted, and what it traced again from the
+        // remembered set was old already.
+        assert(g.stats.bytes_live >= g.retraced_bytes && "a retraced object is counted live");
+        g.old_bytes += g.stats.bytes_live - g.retraced_bytes;
     }
     assert(g.stats.young_collections + g.stats.full_collections == g.stats.collections &&
            "every collection is either young or full");
@@ -3161,6 +3326,8 @@ void print_stats(uint64_t swept_at_teardown) {
                  g.stats.conservative_pins);
     std::fprintf(stderr, "gc: %" PRIu64 " container roots at the last collection\n",
                  g.stats.container_roots);
+    std::fprintf(
+      stderr, "gc: %" PRIu64 " state containers walked at the last collection\n", g.stats.state_containers_read);
     std::fprintf(stderr,
                  "gc: %" PRIu64 " young, %" PRIu64 " full; %" PRIu64 " objects promoted, %" PRIu64
                  " logged by the write barrier\n",
@@ -3362,14 +3529,85 @@ void verify_roots() {
                    "a precise root names a reclaimed object");
         }
     }
-    // The same claim for a container root's OWNER, which is the shape whose failure runs
-    // a finalizer over a live object's string and container buffers rather than merely
-    // dangling one handle.
-    for (const auto& kv : g.containers) {
-        void* owner = kv.second.owner;
-        assert((owner == nullptr || rt_gc_find_object(owner) == owner) &&
-               "a container owner was reclaimed");
+}
+
+// The two halves of a card agree: a card byte is set exactly when the log holds the card
+// (or every card is owed a read, state_all), and each logged card is in its table. A byte set
+// with no entry is a card the next young collection would never read; an entry with no byte
+// is one a store would log again.
+void verify_cards() {
+    uint64_t set     = 0;
+    uint64_t flagged = 0;
+    for (const rt_gc_roots* t : g.roots) {
+        const uint8_t* cards = cards_of(t);
+        for (uint32_t c = 0; c < ncards_of(t); ++c) {
+            set += cards[c] != 0 ? 1 : 0;
+        }
+        for (uint32_t i = 0; i < t->ncontainers; ++i) {
+            const uint8_t* f = container_flags(t, t->containers[i]);
+            for (uint32_t w = 1; w < container_words(t->containers[i]); ++w) {
+                assert(f[w] == f[0] && "a container's flag bytes are set together");
+            }
+            flagged += f[0] != 0 ? 1 : 0;
+        }
     }
+    if (g.state_all) {
+        return;
+    }
+    assert(set == g.logged_cards.size() && "a card byte is set that the log does not hold");
+    for (const GcState::LoggedCard& l : g.logged_cards) {
+        assert(l.table < g.roots.size() && l.card < ncards_of(g.roots[l.table]) && "a logged card is in its table");
+        assert(cards_of(g.roots[l.table])[l.card] != 0 && "a logged card lost its byte");
+    }
+    assert(flagged == g.logged_containers.size() && "a container flag is set that the log does not hold");
+    for (const GcState::LoggedContainer& l : g.logged_containers) {
+        assert(l.table < g.roots.size() && l.entry < g.roots[l.table]->ncontainers &&
+               "a logged container is in its table");
+        const rt_gc_roots* const t = g.roots[l.table];
+        assert(container_flags(t, t->containers[l.entry])[0] != 0 && "a logged container lost its flag");
+    }
+}
+
+// A young collection reads the slots of the logged cards and no others, which is sound only
+// if every other slot names an object that is old by now: every object a collection reaches
+// is marked, and so old, and a slot not stored to since names only what the collection that
+// last read it left old. Called before the collection marks anything, so a mark still means
+// old. A slot outside the logged cards that names a young object is a store to design state
+// the code did not log.
+void verify_unlogged_state_slots() {
+    for (const rt_gc_roots* t : g.roots) {
+        const uint8_t* cards = cards_of(t);
+        uint8_t* const base  = static_cast<uint8_t*>(t->base);
+        for (uint32_t i = 0; i < t->nhandles; ++i) {
+            if (cards[t->offsets[i] >> RT_GC_CARD_SHIFT] != 0) {
+                continue;
+            }
+            void* const h = *reinterpret_cast<void**>(base + t->offsets[i]);
+            if (h == nullptr) {
+                continue;
+            }
+            assert(rt_gc_find_object(h) == h && "an unlogged state slot names no object");
+            assert(is_marked_now(h) &&
+                   "an unlogged state slot names a young object: a store to design state was not logged");
+        }
+    }
+}
+
+// The same for containers: a young collection walks the logged ones, so a container of design
+// state that is not logged must name only old objects. Before the collection marks anything, a
+// mark still means old; the walkers assert it instead of marking (g.verifying).
+void verify_unlogged_state_containers() {
+    g.verifying = kVerifyUnlogged;
+    for (const rt_gc_roots* t : g.roots) {
+        for (uint32_t i = 0; i < t->ncontainers; ++i) {
+            const rt_gc_container& e = t->containers[i];
+            if (container_flags(t, e)[0] == 0) {
+                push_container(static_cast<uint8_t*>(t->base) + e.offset, e.kind, e.ops);
+            }
+        }
+    }
+    drain_containers();
+    g.verifying = 0;
 }
 
 // The heap-wide totals, split from rt_gc_verify() for length (TigerStyle). Every
@@ -3387,11 +3625,16 @@ void verify_totals(const VerifyTally& tally) {
     assert((exact ? tally.marked_bytes == g.stats.bytes_live
                   : tally.marked_bytes >= g.stats.bytes_live) &&
            "the heap walk disagrees on live bytes");
+    // The old generation's size, which the choice of a full collection reads, is the bytes
+    // of the marked objects the walk finds: exact after every collection and until the
+    // next, since a mark is set by marking and cleared by a full collection and by nothing
+    // else.
+    assert(tally.marked_bytes == g.old_bytes && "the old-generation size disagrees with the walk");
     // The remembered set holds EXACTLY the objects carrying LOGGED, and both directions
     // matter: an object logged but not recorded is an old-to-young edge the next young
     // collection will not trace, and a recorded object whose bit was cleared is a barrier
-    // that can never fire for it again. After a collection both sides hold precisely what
-    // relog_conservative_roots() re-armed; between collections they grow together.
+    // that can never fire for it again. After a collection both sides are empty; between
+    // collections they grow together.
     assert(tally.logged == g.remembered.size() && "a LOGGED object outside the remembered set");
     for (void* h : g.remembered) {
         assert((*meta_ptr(h) & RT_GC_META_LOGGED) != 0 && "a remembered entry lost its bit");
@@ -3512,6 +3755,8 @@ extern "C" void rt_gc_init(const rt_gc_config* cfg) {
     g.kind            = RT_GC_KIND_FULL;
     g.force_full      = 0;
     g.live_after_full = 0;
+    g.old_bytes       = 0;
+    g.retraced_bytes  = 0;
     // The owned-buffer side of the same fresh start (§6.5), and the emergency threshold the
     // budget implies. Zeroing the count is what makes the clamp in buffer_free matter: a
     // string a previous run left in a runtime global is freed by this one against it.
@@ -3526,6 +3771,7 @@ extern "C" void rt_gc_init(const rt_gc_config* cfg) {
     g_owned.parking    = false;
     arm_owned_trigger();
     g.remembered.clear();
+    g.logged_cards_max = kLoggedCardsMax;
     for (uint64_t& n : g.by_reason) {
         n = 0;
     }
@@ -3629,14 +3875,42 @@ extern "C" void rt_gc_run_leave(void) {
 extern "C" void rt_gc_roots_add(const rt_gc_roots* table) {
     assert(table != nullptr && "a root table registration needs a table");
     assert(table->nhandles < kRootHandlesMax && "an implausible root table size");
-    assert((table->nhandles == 0 || table->base != nullptr) && "a non-empty table has a base");
+    assert(table->base != nullptr && "a root table names the region it describes");
     assert((table->nhandles == 0 || table->offsets != nullptr) && "a non-empty table has offsets");
-    // Negative space: registering a table twice is harmless to the scan but means
-    // the emitted startup sequence ran twice, which is not harmless anywhere else.
-    // The table's lifetime is the JIT'd module's; the runtime only borrows it.
-    assert(std::find(g.roots.begin(), g.roots.end(), table) == g.roots.end() &&
-           "this root table is already registered");
+    assert(table->cards <= table->bytes && "the card bytes lie inside the region");
+    assert(table->cards > 0 && "a region has something before its card bytes");
+    assert(table->bytes >= table->cards + ((table->cards - 1) >> RT_GC_CARD_SHIFT) + 1 &&
+           "a region has one card byte for each card of what lies before them");
+    assert(table->ncontainers < kRootHandlesMax && "an implausible container count");
+    assert((table->ncontainers == 0) == (table->containers == nullptr) && "containers are listed or absent");
+    assert((table->ncontainers == 0 || table->flags == table->cards + ((table->cards - 1) >> RT_GC_CARD_SHIFT) + 1) &&
+           "the flag bytes follow the card bytes");
+#ifndef NDEBUG
+    for (uint32_t i = 0; i < table->nhandles; ++i) {
+        assert(table->offsets[i] + sizeof(void*) <= table->cards && "a handle slot lies before the card bytes");
+        assert((i == 0 || table->offsets[i - 1] < table->offsets[i]) && "a table's offsets ascend");
+    }
+#endif
+    for (uint32_t i = 0; i < table->ncontainers; ++i) {
+        const rt_gc_container& e = table->containers[i];
+        assert(is_container_kind(e.kind) && e.ops != nullptr && e.kind == e.ops->kind &&
+               "an entry names a container with its own descriptor");
+        assert(e.offset + container_handle_bytes(e.kind) <= table->cards && "a container lies before the card bytes");
+        assert(table->flags + e.flag + container_words(e) <= table->bytes && "a container's flags lie in the region");
+        assert((i == 0 ||
+                table->containers[i - 1].offset + container_handle_bytes(table->containers[i - 1].kind) <= e.offset) &&
+               "a table's containers ascend and do not overlap");
+    }
+    // The regions of two tables never overlap, which includes a table registered twice (the
+    // emitted startup sequence ran twice); find_region checks it once, when it sorts them. The
+    // table's lifetime is the JIT'd module's; the runtime only borrows it.
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(table->base);
+    g.regions.push_back(GcState::Region{ lo, lo + table->bytes, static_cast<uint32_t>(g.roots.size()) });
+    g.regions_sorted = false;
     g.roots.push_back(table);
+    // What a region holds before the design runs is its initializer's, which no store of the
+    // code logged: the next collection, whatever its kind, reads every slot of every table.
+    g.state_all = true;
 }
 
 // The registry head lives in the mutator now (Gc.h:178-181), which is what let the
@@ -3742,56 +4016,17 @@ extern "C" void rt_gc_nba_container_add(uint32_t idx, uint32_t stride, uint32_t 
 
 // -- Containers of class handles ----------------------------------------------
 
-extern "C" void rt_gc_containers_add(const rt_gc_container_table* table) {
-    assert(table != nullptr && "a container table registration needs a table");
-    assert(table->count < kRootHandlesMax && "an implausible container table size");
-    assert((table->count == 0 || table->base != nullptr) && "a non-empty table has a base");
-    assert((table->count == 0 || table->entries != nullptr) && "a non-empty table has entries");
-#ifndef NDEBUG
-    for (uint32_t i = 0; i < table->count; ++i) {
-        assert(is_container_kind(table->entries[i].kind) && "an entry names a container");
-        assert(table->entries[i].ops != nullptr && "an entry carries a descriptor");
-        assert(table->entries[i].kind == table->entries[i].ops->kind &&
-               "an entry's kind and descriptor disagree");
-    }
-#endif
-    // Borrowed, never copied: the table is a constant in the JIT'd module and outlives
-    // the run, exactly as a root table does (Gc.h:99-100, 246-248).
-    g.container_tables.push_back(table);
-}
-
 extern "C" void rt_gc_container_add(void* handle, uint32_t kind, const rt_elem_ops* ops) {
     assert(handle != nullptr && "a container registration needs the container handle");
     assert(is_container_kind(kind) && "only a dynarr / queue / assoc is registered");
     assert_elem_ops(ops);
     assert(ops->kind == kind && "the kind and the container descriptor disagree");
-    // Whose heap object this container's storage belongs to, if any. Resolved ONCE here
-    // rather than at every collection: it costs a binary search per registration, which is
-    // per activation or per element init, and it turns the walk in push_container_roots
-    // into two loads. Null for a frame-local container, which is every registration the
-    // landed phases make -- so this is additive and changes none of them.
-    void* const owner = rt_gc_find_object(handle);
-    const auto it = g.containers.find(handle);
-    if (it != g.containers.end()) {
-        // Negative space, and the one direction that is still fatal: one storage ADDRESS is
-        // one frame-local container, because that address is a per-activation alloca, so a
-        // second registration of one means an emitted init ran without its deinit. A
-        // heap-resident container is different in kind -- its address belongs to the owner,
-        // so two live activations reffing into it name the same key by construction -- and
-        // there the answer is to count, not to complain.
-        assert(owner != nullptr && "this frame-local container is already registered");
-        assert(it->second.owner == owner && "two registrations disagree on the owner");
-        assert(it->second.kind == kind && "two registrations disagree on the kind");
-        assert(it->second.ops == ops && "two registrations disagree on the descriptor");
-        it->second.refs += 1;
-        assert(it->second.refs <= kContainerRefsMax && "a container registration ran away");
-        return;
-    }
-    [[maybe_unused]] const bool inserted =
-      g.containers.try_emplace(handle, ContainerReg{ kind, ops, owner, 1 }).second;
-    assert(inserted && "the find above said this container is not registered");
-    assert_resolves((owner == nullptr || rt_gc_find_object(owner) == owner) &&
-                    "a resolved container owner is a class object");
+    assert_resolves(rt_gc_find_object(handle) == nullptr && "a registered container is not in the heap");
+    // Negative space, and fatal: one storage ADDRESS is one frame-local container, because
+    // that address is a per-activation alloca, so a second registration of one means an
+    // emitted init ran without its deinit.
+    [[maybe_unused]] const bool inserted = g.containers.try_emplace(handle, ContainerReg{ kind, ops }).second;
+    assert(inserted && "this frame-local container is already registered");
 }
 
 extern "C" void rt_gc_container_remove(void* handle) {
@@ -3799,24 +4034,13 @@ extern "C" void rt_gc_container_remove(void* handle) {
     // O(1) average, and the reason this registry is a hash map where g.ranges is a
     // vector: a frame-local container is registered and removed once per ACTIVATION,
     // not once per run, so a linear scan would be on the call path.
-    const auto it = g.containers.find(handle);
     // Negative space in both directions, both silent otherwise. Absent means this container
     // was never registered, so the emitted init / deinit pair is broken: either a live
     // container is not a root (a use-after-free waiting to happen) or a dead one stays
     // one (a leak of its whole element subtree). A double removal arrives here as the
     // removal that finds nothing, and the same assertion catches it.
-    assert(it != g.containers.end() && "this container was never registered");
-    if (it == g.containers.end()) {
-        return;
-    }
-    assert(it->second.refs > 0 && "a registration with no holder is still in the registry");
-    if (it->second.refs > 1) {
-        // Another live activation still refs this heap-resident container; it stops being a
-        // root only when the last one lets go.
-        it->second.refs -= 1;
-        return;
-    }
-    g.containers.erase(it);
+    [[maybe_unused]] const size_t erased = g.containers.erase(handle);
+    assert(erased == 1 && "this container was never registered");
 }
 
 // -- Collection ---------------------------------------------------------------
@@ -3935,6 +4159,9 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     // container-root path kept this queue's elements alive" from "a conservative frame
     // word happened to pin the same object".
     g.stats.container_roots = 0;
+    g.stats.state_slots_read = 0;
+    g.stats.state_cards_read = 0;
+    g.stats.state_containers_read = 0;
     g.worklist.clear();
     g.container_work.clear();
     if (g.worklist.capacity() < kWorklistReserve) {
@@ -3943,6 +4170,15 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     assert(g.pinned.empty() && "the previous collection left a pin behind");
     assert(g.weak_reached.empty() && "the previous collection left a weak reference unexamined");
 
+#ifdef CLOTHO_EXTRA_ASSERTS
+    // Before anything is marked, which is the one moment a mark still says "old": a young
+    // collection reads the logged cards of design state and no others, so a slot outside
+    // them must name no young object.
+    if (kind == RT_GC_KIND_YOUNG && !g.state_all) {
+        verify_unlogged_state_slots();
+        verify_unlogged_state_containers();
+    }
+#endif
     mark_from_roots();
     // The marks are complete and nothing is reclaimed yet, which is the one moment to
     // ask whether an object was reached: of a weak reference's referent, and of the
@@ -3963,11 +4199,6 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     // The sweep runs the finalizers of the objects it frees, which free their buffers.
     sweep();
     g_owned.parking = false;
-    // Before unpin_all(), which is what clears the pins this reads. See the function:
-    // it carries the barrier obligation for a store a suspended activation has not
-    // performed yet, and it is the reason the conservative root set is scanned at all in
-    // a young collection.
-    relog_conservative_roots();
     unpin_all();
 
     rearm_after_collection();
@@ -4008,12 +4239,69 @@ extern "C" void rt_gc_remember(void* obj) {
     }
     const size_t before = g.remembered.size();
     remember_object(obj);
-    // Counted here and NOWHERE else, which is what Gc.h:408-411 promises: the number of
-    // objects the WRITE BARRIER logged over the run. The collector's own re-logging
-    // (relog_conservative_roots) deliberately does not touch it, so a test can still use
-    // this counter to prove the barrier fired rather than a root having found everything.
+    // Counted here and in rt_gc_note_ref_store, the two halves of the write barrier, and
+    // nowhere else, which is what Gc.h promises: the number of objects the barrier logged
+    // over the run. A test can still use it to prove the barrier fired rather than a root
+    // having found everything.
     if (g.remembered.size() != before) {
         g.stats.remembered += 1;
+    }
+}
+
+// The barrier of a store through a `ref` formal, or into the actual of an output formal:
+// a place the callee cannot attribute to an owner statically. `slot` is the address stored
+// to and `bytes` how much. `chain` is the witness chain the call passed when the place is an
+// element of a container (outermost first, whose first epoch pointer is inside the outermost
+// container's handle), else null. What holds the container is the owner of what the store
+// adds, and it is found from that handle; for a place that cannot move it is found from
+// `slot`. A heap object is logged if it is old. A place in design state is logged as an
+// emitted store to it would be. A place in neither -- a frame -- is read in full.
+extern "C" void rt_gc_note_ref_store(void* slot, const rt_ref_witness* chain, uint64_t bytes) {
+    if (g.initialized == 0) {
+        return;
+    }
+    assert(slot != nullptr && "a ref aliases a place");
+    void* at = slot;
+    if (chain != nullptr && chain->epoch != nullptr) {
+        at    = const_cast<uint64_t*>(chain->epoch);
+        bytes = 1;
+    }
+    if (void* const owner = rt_gc_find_object(at); owner != nullptr) {
+        rt_gc_remember(owner);
+        return;
+    }
+    rt_gc_note_state_store(at, bytes);
+}
+
+extern "C" void rt_gc_set_logged_cards_max(uint64_t max) {
+    g.logged_cards_max = static_cast<size_t>(max);
+}
+
+extern "C" void rt_gc_note_state_store(void* addr, uint64_t bytes) {
+    if (g.initialized == 0) {
+        return;
+    }
+    assert(addr != nullptr && "a state store names an address");
+    const GcState::Region* const region = find_region(reinterpret_cast<uintptr_t>(addr));
+    if (region == nullptr) {
+        return; // not design state: a frame, an object, a container payload
+    }
+    const rt_gc_roots* const t     = g.roots[region->table];
+    const uint64_t           first = reinterpret_cast<uintptr_t>(addr) - region->lo;
+    // The cards cover what lies before them. A store into the card bytes themselves is
+    // nobody's, and a range that runs into them is cut there.
+    if (first >= t->cards) {
+        return;
+    }
+    uint64_t last = first + (bytes == 0 ? 0 : bytes - 1);
+    if (last >= t->cards) {
+        last = t->cards - 1;
+    }
+    for (uint64_t card = first >> RT_GC_CARD_SHIFT; card <= (last >> RT_GC_CARD_SHIFT); ++card) {
+        mark_card(region->table, static_cast<uint32_t>(card));
+    }
+    if (t->ncontainers != 0) {
+        log_containers_in(region->table, first, last);
     }
 }
 
@@ -4115,6 +4403,7 @@ extern "C" void rt_gc_verify(void) {
     // freed a live object: reclaiming it clears the very start bit the walk below iterates
     // over, so the walk cannot see the failure the two parities exist to prevent.
     verify_roots();
+    verify_cards();
     // The container half of §13, through the same walkers with marking replaced by an
     // assertion (mark_container_handle): every non-null handle inside a live container --
     // an element handle, or one decoded out of an associative array's KEY bytes by

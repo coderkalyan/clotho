@@ -299,19 +299,6 @@ TEST_CASE("redefining a name in the same scope is an error") {
     CHECK(r.diagnostic_text().find("redefinition of") != std::string::npos);
 }
 
-TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
-    // The suffix must be a compile-time string literal; a string parameter
-    // reference has no runtime string representation yet, so it is rejected.
-    const LowerResult r = lower_text(R"(
-        module m;
-            parameter string S = " ns";
-            initial $timeformat(-9, 2, S, 10);
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("suffix must be a string literal") != std::string::npos);
-}
-
 // A `final` block lowers to a run-once end-of-sim process (LRM 9.2.3), scheduled
 // separately from initial/always (the backend runs it on the exit paths).
 TEST_CASE("final block lowers to a Final-activation process") {
@@ -1022,30 +1009,6 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
     )");
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "v") == 4);
-}
-
-TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
-    // Binding a type parameter to a not-yet-lowered type must hit the same loud
-    // guard as a direct declaration, not silently accept it (PRINCIPLES.md). (`event`,
-    // `chandle`, `class`, a virtual interface, an associative array with a
-    // class-handle value and one with an EVENT value, an associative array
-    // keyed by a chandle / event / virtual interface / unpacked union, and a
-    // mailbox of events were all prior examples here; every one of them lowers
-    // now.) `mailbox #(T)` bound to T = a virtual interface stands in as the
-    // still-unsupported type, reached THROUGH the type parameter rather than
-    // written directly: a virtual interface is not a container element type.
-    const LowerResult r = lower_text(R"(
-        interface ifc;
-        endinterface
-        module m #(parameter type T = int);
-            mailbox #(T) v;
-        endmodule
-        module top;
-            m #(.T(virtual ifc)) u();
-        endmodule
-    )");
-    CHECK(!r.ok);
-    CHECK(r.diagnostic_text().find("mailbox message element type is not supported") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {

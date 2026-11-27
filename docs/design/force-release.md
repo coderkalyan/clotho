@@ -237,8 +237,8 @@ commit-time gate yet.
     and exact — a range vector is only needed for runtime-variable bounds, which
     §10.6.2 does not permit (it requires *constant* selects).
   - Bit/part-select force of a **variable** is forbidden by §10.6.2 ("shall not be a
-    bit-select or a part-select of a variable") — rejected loud — even though iverilog
-    accepts it. An open decision (docs/TODO.md).
+    bit-select or a part-select of a variable"), so it is not a gap: slang rejects it as
+    illegal source, even though iverilog accepts it.
 
 ## Force on a net with a net delay (LRM 10.6.2, 10.3.3, 28.16)
 

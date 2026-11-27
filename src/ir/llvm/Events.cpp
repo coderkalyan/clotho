@@ -115,21 +115,19 @@ void Backend::emit_entry(llvm::Value* q, llvm::Value* slot_idx, llvm::Value* han
     b_.CreateStore(flag_ptr, b_.CreateStructGEP(elem, slot, 1));
 }
 
-// Persistent (always-block) subscription, planned: where a process's entry goes. The
-// seed's tables hold it (emit_seed), and one loop of root makes the stores. A static
-// bucket takes the entry at a compile-time slot; slots are handed out in process /
-// wait-event order, matching the capacities build_wait_queues computed, so each array
-// fills exactly once and is never compacted. The store is a plain one of the
-// process's ramp handle and scheduled-flag pointer, never a resume of the coroutine,
-// so it does not inhibit coro-elide of other processes. All subscriptions land before
-// any servicing, so the fixed-trip scans never read an empty slot.
+// Persistent (always-block) subscription, planned: what the seed's tables hold
+// (emit_seed). A signal's subscription is the next entry of its (signal, edge)
+// static list, the subscribing group's wake slot, written into the constant table
+// here: entries are handed out in subscription order, matching the counts
+// build_wait_queues gave the lists, so each list fills exactly once and is never
+// compacted. Nothing is stored at run time but the slot's handle (the seed).
 //
-// An event has no buckets: a node of the contiguous persistent array links onto the
+// An event has no lists: a node of the contiguous persistent array links onto the
 // event object's waiter list. Edge is meaningless for an event (a trigger is not a
 // transition), so it is ignored here -- every event subscription is recorded once, on
 // the one list. The object is the one the variable's own handle names when the links
 // are made, which a declaration initializer (`event e2 = e1`) may have changed.
-Backend::StaticSub Backend::plan_static_subscribe(Signal sig, uint32_t edge) {
+Backend::StaticSub Backend::plan_static_subscribe(Signal sig, uint32_t edge, uint32_t wake_slot) {
     const auto i = static_cast<uint32_t>(sig);
     StaticSub  sub;
     if (mod_.signal(sig).is_event) {
@@ -140,9 +138,9 @@ Backend::StaticSub Backend::plan_static_subscribe(Signal sig, uint32_t edge) {
         sub.handle = storage_address(slots_[i]);
         return sub;
     }
-    const uint32_t slot = sta_next_[i][edge]++;
-    sub.slot            = llvm::ConstantExpr::getInBoundsGetElementPtr(
-      wait_elem_ty(), sym(wait_sta_gv_[i][edge]), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(slot) });
+    const uint32_t list = sta_list_[i][edge];
+    assert(list != 0 && sta_next_[i][edge] < sta_table_[list] && "a subscription has an entry of its list");
+    sta_table_[list + kListHeader + sta_next_[i][edge]++] = wake_slot;
     return sub;
 }
 
@@ -204,7 +202,7 @@ void Backend::emit_wait_suspend(const TracePark& park) {
 // that bucket's length); the scheduler resumes us in the fresh resume block.
 //
 // Flag arming: service_dynamic_queue now reads the flag, so we must store 0 to
-// our &proc_sched slot before suspending or we would never be woken again
+// our wake slot before suspending or we would never be woken again
 // (emit_arm_wake_word). That store is also why a process with a static
 // subscription cannot park here: its entry reads the same flag, finds it armed
 // and resumes the process at this wait (B51), so a process whose body holds a
@@ -449,16 +447,14 @@ Backend::WaitCounts Backend::wait_counts() const {
     return c;
 }
 
-// One wait-queue entry, shared by both the static and dynamic queues:
-// { ptr handle, ptr flag_ptr }.
+// One dynamic wait-queue entry: { ptr handle, ptr flag_ptr }.
 //   handle   — the suspended coroutine to resume.
-//   flag_ptr — &clotho.proc_sched[process]. Both queues read it to avoid
-//              waking a process twice when several of the signals it waits on
-//              change together (a multi-signal sensitivity or a multi-signal
-//              @(a or b) intra-body wait).
-// The persistent/transient distinction is encoded by which queue the entry
-// lives in (.sta vs .dyn); the edge is encoded by which per-edge sub-queue it
-// lives in (.pos/.neg/.any). Neither is a per-entry field anymore.
+//   flag_ptr — the waiter's wake word: a process's in clotho.wake, a task's or a
+//              fork child's in its frame. The scan reads it to avoid waking a
+//              process twice when several of the signals it waits on change
+//              together (a multi-signal @(a or b) intra-body wait).
+// The edge is encoded by which per-edge sub-queue the entry lives in
+// (.pos/.neg/.any), not by a per-entry field.
 llvm::StructType* Backend::wait_elem_ty() {
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
     return llvm::StructType::get(ctx_, { ptr, ptr });
@@ -495,7 +491,7 @@ llvm::StructType* Backend::event_obj_ty() {
 // `handle` and `flag` are exactly wait_elem_ty's two words -- the parked
 // coroutine handle WITH its region tag bits intact (emit_wake_push strips
 // them) and the opaque scheduled-flag pointer, which is a constant GEP into
-// clotho.proc_sched for a process and a frame alloca for a task. Never
+// clotho.wake for a process and a frame alloca for a task. Never
 // interpret `flag`; store and compare it as an address.
 //
 // The two links are what buy an unbounded waiter set: a persistent
@@ -550,38 +546,58 @@ llvm::Value* Backend::event_obj_for(Signal sig) {
     return event_obj_of(load_event_handle(sig));
 }
 
-// Per-signal wait queues, split into up to three per-edge sub-queues, each
-// created only if it has at least one waiter:
+// Per-signal wait queues, split by edge, each created only if it has at least
+// one waiter:
 //
-//   clotho.wait.<sig>.sta.{pos,neg,any}  — persistent always-block
-//     subscriptions for that edge. Filled at startup (priming) and never
-//     pushed/popped; serviced by a fixed-trip scan (capacity is a compile-time
-//     constant, so the optimizer can unroll it). No length global.
+//   static: the persistent always-block subscriptions of a (signal, edge), one
+//     list of clotho.wait.static, `[count, trig lo, trig hi, slot...]`. The
+//     count and trigger bits are known here, the entries once the seed has
+//     planned its subscriptions (plan_static_subscribe); the table is constant
+//     data from then on, scanned by count (emit_static_scan_rt).
 //   clotho.wait.<sig>.dyn.{pos,neg,any}  — one-shot intra-body @(edge sig)
 //     waiters for that edge, each with its own .len of live entries; serviced
 //     by a straight scan that wakes every entry (they all share the matched
 //     edge) and resets the length.
 //
 // Splitting by edge hoists the per-entry edge test out of the scan: servicing
-// guards each whole bucket with a single branch on the matching transition
-// fact. Both kinds share the { handle, flag_ptr } element type.
+// guards each whole list with a single branch on the matching transition fact.
 void Backend::build_wait_queues() {
     const auto sigs = mod_.signals();
     WaitCounts c    = wait_counts();
 
-    // Module-dedup prep, option (a): every instance of a reused definition
-    // gets the per-def MAXIMUM bucket capacity for each def-local signal,
-    // so twin bodies emit identical fixed-trip service scans regardless of
-    // per-instance fan-out (subscribers cross instance boundaries through
-    // ports). A padded slot is zeroinit — null flag pointer — and the
-    // inline scan skips it (emit_static_scan_rt `padded`). The true
-    // per-instance counts are kept for the NBA meta table, whose
-    // commit-side scans stay exact and check-free.
-    wait_sta_true_.assign(sigs.size(), { 0, 0, 0 });
-    wait_sta_padded_.assign(sigs.size(), { 0, 0, 0 });
+    // A static list holds exactly its own subscribers: a scan reads the count
+    // from the list's header, so twin bodies emit the same scan whatever their
+    // fan-out. Index 0 is the empty list, which a port names when its instance
+    // has no list of that edge.
+    sta_list_.assign(sigs.size(), { 0, 0, 0 });
+    sta_has_.assign(sigs.size(), { false, false, false });
+    sta_next_.assign(sigs.size(), { 0, 0, 0 });
+    sta_table_.assign(kListHeader, 0);
     for (uint32_t i = 0; i < sigs.size(); ++i) {
-        wait_sta_true_[i] = c.sta[i];
+        if (sigs[i].is_event) {
+            continue;
+        }
+        for (uint32_t e = 0; e < 3; ++e) {
+            if (c.sta[i][e] == 0) {
+                continue;
+            }
+            const uint64_t trig = trig_bits(static_cast<Signal>(i), e);
+            sta_list_[i][e]     = static_cast<uint32_t>(sta_table_.size());
+            sta_has_[i][e]      = true;
+            sta_table_.push_back(c.sta[i][e]);
+            sta_table_.push_back(static_cast<uint32_t>(trig));
+            sta_table_.push_back(static_cast<uint32_t>(trig >> 32));
+            sta_table_.resize(sta_table_.size() + c.sta[i][e], 0);
+        }
     }
+    // Filled by fill_instance_records, once the seed has planned the entries. Not
+    // marked constant though nothing writes it: shared unit code names it, and the
+    // shared-code check reads a constant of the module it compares as its contents,
+    // which are not final while the units are lowered.
+    auto* const table_ty = llvm::ArrayType::get(b_.getInt32Ty(), sta_table_.size());
+    sta_table_gv_ = new llvm::GlobalVariable(env_->llmod, table_ty, false, llvm::GlobalValue::InternalLinkage,
+                                             llvm::ConstantAggregateZero::get(table_ty), "clotho.wait.static");
+    sta_table_gv_->setAlignment(llvm::Align(8));
     // Def-local signal table per scope occurrence: slot.path's last
     // element is the signal's field index within its own scope. Shared by
     // the capacity padding below, the instance-context layout, and block
@@ -609,39 +625,32 @@ void Backend::build_wait_queues() {
             if (members.size() < 2) {
                 continue;
             }
+            // Module-dedup prep: every instance of a reused definition gets the
+            // per-def MAXIMUM dynamic bucket capacity for each def-local signal,
+            // so twin bodies that bake it agree whatever their per-instance
+            // fan-out, and scans a static list where any twin has one.
             const size_t nsig = by_anchor[members.front()].size();
             for (size_t j = 0; j < nsig; ++j) {
                 for (uint32_t e = 0; e < 3; ++e) {
-                    uint32_t max_sta = 0, max_dyn = 0;
-                    uint32_t min_sta = ~0u;
+                    uint32_t max_dyn = 0;
+                    bool     any_sta = false;
                     for (const uint32_t a : members) {
                         const auto si = static_cast<uint32_t>(by_anchor[a][j]);
-                        max_sta       = std::max(max_sta, c.sta[si][e]);
-                        min_sta       = std::min(min_sta, c.sta[si][e]);
                         max_dyn       = std::max(max_dyn, c.dyn[si][e]);
+                        any_sta       = any_sta || sta_has_[si][e];
                     }
-                    // The padded (null-checked) scan shape must be uniform
-                    // across every instance of the def — including the one
-                    // whose true count equals the maximum — or twin bodies
-                    // would still diverge.
                     for (const uint32_t a : members) {
                         const auto si = static_cast<uint32_t>(by_anchor[a][j]);
-                        wait_sta_padded_[si][e] = min_sta < max_sta ? 1 : 0;
-                        c.sta[si][e]            = max_sta;
-                        c.dyn[si][e]            = max_dyn;
+                        c.dyn[si][e]  = max_dyn;
+                        sta_has_[si][e] = any_sta;
                     }
                 }
             }
         }
     }
-    wait_sta_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
-    wait_sta_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
-    wait_sta_cap_.assign(sigs.size(), { 0, 0, 0 });
     wait_dyn_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
     wait_dyn_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
     wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
-    sta_next_.assign(sigs.size(), { 0, 0, 0 });
-    wait_sta_trig_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
 
     // What events need of the design: the null object, the pending-chain head and
     // the persistent-node pool, the last sized by the same static-subscription
@@ -709,22 +718,6 @@ void Backend::build_wait_queues() {
         }
         for (uint32_t e = 0; e < 3; ++e) {
             const std::string base = "clotho.wait." + sigs[i].name + "." ;
-            if (c.sta[i][e] > 0) {
-                auto* arr           = llvm::ArrayType::get(elem, c.sta[i][e]);
-                wait_sta_ty_[i][e]  = arr;
-                wait_sta_cap_[i][e] = c.sta[i][e];
-                wait_sta_gv_[i][e]  = new llvm::GlobalVariable(
-                  env_->llmod, arr, false, llvm::GlobalValue::InternalLinkage,
-                  llvm::ConstantAggregateZero::get(arr), base + "sta." + edge_suffix(e));
-                if (slots_[i].anchor == SignalSlot::no_anchor) {
-                    // No record describes this bucket (a package variable's): its
-                    // trigger bits live in a global of their own, which writers in
-                    // any unit read (static_trig_bits).
-                    wait_sta_trig_gv_[i][e] = new llvm::GlobalVariable(
-                      env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
-                      llvm::ConstantInt::get(b_.getInt64Ty(), 0), base + "sta." + edge_suffix(e) + ".trig");
-                }
-            }
             if (c.dyn[i][e] > 0) {
                 auto* arr          = llvm::ArrayType::get(elem, c.dyn[i][e]);
                 wait_dyn_ty_[i][e] = arr;
@@ -756,7 +749,7 @@ bool Backend::signal_has_waiters(Signal sig) const {
     for (uint32_t e = 0; e < 3; ++e) {
         // A `<= @e` trigger has no coroutine waiter but its edge must still be
         // watched so a store/commit fires its deferred records.
-        if (wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr ||
+        if (sta_has_[i][e] || wait_dyn_gv_[i][e] != nullptr ||
             vif_wait_[i][e] || trigger_id(sig, e) >= 0) {
             return true;
         }
@@ -770,13 +763,13 @@ bool Backend::signal_has_waiters(Signal sig) const {
 bool Backend::signal_has_level_waiters(Signal sig) const {
     const auto i = static_cast<uint32_t>(sig);
     const auto e = static_cast<uint32_t>(Edge::Any);
-    return uniform(sig) || wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr;
+    return uniform(sig) || sta_has_[i][e] || wait_dyn_gv_[i][e] != nullptr;
 }
 
 bool Backend::signal_has_bucket(Signal sig, Edge e) const {
     const auto i = static_cast<uint32_t>(sig);
     const auto k = static_cast<uint32_t>(e);
-    return uniform(sig) || wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr || vif_wait_[i][k] ||
+    return uniform(sig) || sta_has_[i][k] || wait_dyn_gv_[i][k] != nullptr || vif_wait_[i][k] ||
            trigger_id(sig, k) >= 0;
 }
 
@@ -1270,7 +1263,7 @@ void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
             b_.SetInsertPoint(cont);
             continue;
         }
-        if (wait_sta_gv_[i][e] != nullptr) {
+        if (sta_has_[i][e]) {
             service_static_queue(sig, e);
         }
         if (wait_dyn_gv_[i][e] != nullptr) {
@@ -1395,8 +1388,7 @@ void Backend::emit_bound_wake(const PortLayout& pl, llvm::Value* port, llvm::Val
     for (const uint32_t e : { static_cast<uint32_t>(Edge::Any), static_cast<uint32_t>(Edge::Positive),
                               static_cast<uint32_t>(Edge::Negative) }) {
         when(has(1u << (PortLayout::mask_sta + e)), "sta", [&] {
-            emit_static_scan_rt(elem(ptr, pl.sta[e].base), elem(i32, pl.sta[e].cap), false, elem(i64, pl.sta[e].trig),
-                                { .kind = RT_TRACE_STATIC, .fact = e });
+            emit_static_scan_rt(elem(ptr, pl.sta[e]), { .kind = RT_TRACE_STATIC, .fact = e });
         });
         when(has(1u << (PortLayout::mask_dyn + e)), "dyn", [&] {
             emit_dynamic_scan_rt(elem(ptr, pl.dyn[e].base), elem(ptr, pl.dyn[e].len),
@@ -1616,7 +1608,7 @@ void Backend::emit_trigger_fire(llvm::Value* trig_id) {
     b_.SetInsertPoint(done);
 }
 
-// Body-side base pointer of a wait bucket piece: loaded from the signal's port
+// Body-side base pointer of a dynamic bucket piece: loaded from the signal's port
 // where the body reaches it (the own instance's record, or the port address a
 // binding holds for a signal of another instance), the bucket's own global
 // otherwise. Root's code (commit functions, the seed loop) keeps the globals
@@ -1626,99 +1618,72 @@ llvm::Value* Backend::wait_base(WaitPart part, Signal sig, uint32_t edge) {
     const SignalSlot& s = slots_[i];
     if (port_reachable(s)) {
         const PortLayout& pl   = *port_of(s);
-        const uint32_t    elem = part == WaitPart::Static    ? pl.sta[edge].base
-                                 : part == WaitPart::Dynamic ? pl.dyn[edge].base
-                                                             : pl.dyn[edge].len;
+        const uint32_t    elem = part == WaitPart::Dynamic ? pl.dyn[edge].base : pl.dyn[edge].len;
         return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, elem));
     }
     if (s.anchor != SignalSlot::no_anchor) {
         taint("names a wait bucket of one instance");
     }
-    llvm::GlobalVariable* gv = part == WaitPart::Static    ? wait_sta_gv_[i][edge]
-                               : part == WaitPart::Dynamic ? wait_dyn_gv_[i][edge]
-                                                           : wait_dyn_len_gv_[i][edge];
-    return sym(gv);
+    return sym(part == WaitPart::Dynamic ? wait_dyn_gv_[i][edge] : wait_dyn_len_gv_[i][edge]);
 }
 
-// The trigger bits a wake of (sig, edge) ORs into a subscriber's wake word, as
-// data: they are design-global colours (compute_trigger_masks), so no unit's
-// code may hold them as an immediate. The owner's code finds them in its own
-// record's port, a writer of another instance's signal in the port its binding
-// names, any other writer (root's) in the owner's record global (a design
-// symbol, like the bucket it scans), and a signal of no instance has a global of
-// its own per bucket.
-llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
+// The header of (sig, edge)'s static list. Where the list is depends on who
+// subscribes, which is the business of other units: a body that reaches the
+// signal's port reads the list's address there, and any other writer (root's)
+// names the constant, which no unit's shared code may hold.
+llvm::Value* Backend::static_list_ptr(Signal sig, uint32_t edge) {
     const auto        i = static_cast<uint32_t>(sig);
     const SignalSlot& s = slots_[i];
-    if (s.anchor != SignalSlot::no_anchor && wait_sta_gv_[i][edge] != nullptr) {
-        return b_.CreateLoad(b_.getInt64Ty(), port_elem_ptr(s, port_of(s)->sta[edge].trig));
+    if (port_reachable(s)) {
+        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), port_elem_ptr(s, port_of(s)->sta[edge]));
     }
-    if (wait_sta_trig_gv_[i][edge] != nullptr) {
-        return b_.CreateLoad(b_.getInt64Ty(), sym(wait_sta_trig_gv_[i][edge]));
-    }
-    // The colours of a signal of some instance are that instance's own.
     if (s.anchor != SignalSlot::no_anchor) {
-        taint("names the trigger bits of a signal of one instance");
+        taint("names a static waiter list of one instance");
     }
-    return b_.getInt64(trig_bits(sig, edge));
+    return llvm::ConstantExpr::getInBoundsGetElementPtr(sta_table_gv_->getValueType(), sym(sta_table_gv_),
+                                                        llvm::ArrayRef<llvm::Constant*>{
+                                                          b_.getInt32(0), b_.getInt32(sta_list_[i][edge]) });
 }
 
-// Static sub-queue scan (one edge bucket): a loop over the persistent
-// subscriptions for this (signal, edge). The bucket's edge already matched the
-// transition (the caller guarded the whole scan), so there is no per-entry
-// edge check. Membership never changes — no compaction, no length.
+// Static list scan (one edge): a loop over the persistent subscriptions for this
+// (signal, edge). The list's edge already matched the transition (the caller
+// guarded the whole scan), so there is no per-entry edge check. Membership never
+// changes — no compaction, no length.
 //
 // The loop is a function of its own per module and shape, and a store site
 // holds one call to it: the scan is the bulk of a wake, and inlined at every
-// store it was most of a design's code (static_scan_fn).
-//
-// A body that reaches the signal's port (the owner's own code, or a writer of
-// another instance's signal through its binding) passes the port's {base, trig,
-// cap} triple, the exact count of that instance, so the scan needs no padding,
+// store it was most of a design's code (static_scan_fn). It reads the count and
+// trigger bits from the list's header, so every writer passes the one address,
 // and the store's dump-var touch rides along when service_wait_queue offers it
-// (vcd_fold_). Any other writer passes the bucket, the per-definition maximum
-// (null-checked when twins differ) and the trigger bits (static_trig_bits).
+// (vcd_fold_) to a writer that reaches the signal's port.
 void Backend::service_static_queue(Signal sig, uint32_t edge) {
-    const auto                       i = static_cast<uint32_t>(sig);
-    const SignalSlot&                s = slots_[i];
-    llvm::SmallVector<llvm::Value*, 4> args;
-    llvm::Function*                  scan = nullptr;
+    const SignalSlot&                  s    = slots_[static_cast<uint32_t>(sig)];
+    llvm::Value* const                 list = static_list_ptr(sig, edge);
+    llvm::SmallVector<llvm::Value*, 4> args{ list };
+    bool                               vcd = false;
     if (port_reachable(s)) {
-        const PortLayout::Static& pl = port_of(s)->sta[edge];
-        assert(pl.trig == pl.base + 1 && pl.cap == pl.base + 2 && "the port holds a bucket's triple in order");
-        args.push_back(port_elem_ptr(s, pl.base));
-        const bool vcd = vcd_fold_.has_value() && vcd_fold_->sig == sig && edge == static_cast<uint32_t>(Edge::Any);
+        vcd = vcd_fold_.has_value() && vcd_fold_->sig == sig && edge == static_cast<uint32_t>(Edge::Any);
         if (vcd) {
             args.push_back(vcd_index_value(sig, vcd_fold_->base));
             vcd_fold_->taken = true;
         }
-        scan = static_scan_port_fn(vcd, edge);
-    } else {
-        llvm::Value* const trig      = static_trig_bits(sig, edge);
-        auto* const        none      = llvm::dyn_cast<llvm::ConstantInt>(trig);
-        const bool         trig_zero = none != nullptr && none->isZero();
-        args.push_back(wait_base(WaitPart::Static, sig, edge));
-        args.push_back(b_.getInt32(wait_sta_cap_[i][edge]));
-        if (!trig_zero) {
-            args.push_back(trig);
-        }
-        scan = static_scan_fn(wait_sta_padded_[i][edge] != 0, trig_zero, edge);
     }
     if (trace_on()) {
         // The storage the writer reaches, as the waiter's list names it.
         args.push_back(storage_ptr(slot_of(sig)));
     }
+    llvm::Function* const scan = static_scan_fn(vcd, edge);
     if (!uniform(sig) || !port_reachable(s)) {
         b_.CreateCall(scan, args);
         return;
     }
-    // Bound storage has every bucket in its port, most of them empty in a given
-    // instance: test the count before calling the scan.
-    llvm::Value* const cap  = b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap));
-    auto* const        fn   = b_.GetInsertBlock()->getParent();
-    auto* const        body = llvm::BasicBlock::Create(ctx_, "nsta.call", fn);
-    auto* const        cont = llvm::BasicBlock::Create(ctx_, "nsta.skip", fn);
-    b_.CreateCondBr(b_.CreateICmpNE(cap, b_.getInt32(0)), body, cont);
+    // Bound storage has every list in its port, most of them empty in a given
+    // instance: one that is names the empty list at the table's start, so the
+    // call is skipped without reading the table.
+    auto* const fn   = b_.GetInsertBlock()->getParent();
+    auto* const body = llvm::BasicBlock::Create(ctx_, "nsta.call", fn);
+    auto* const cont = llvm::BasicBlock::Create(ctx_, "nsta.skip", fn);
+    b_.CreateCondBr(b_.CreateICmpNE(list, sym(sta_table_gv_)), body, cont);
     b_.SetInsertPoint(body);
     b_.CreateCall(scan, args);
     b_.CreateBr(cont);
@@ -1883,6 +1848,15 @@ void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel, uint32_t tri
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
     emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
+    // Some `@` or `wait` calls a method that reads an event property (LRM 9.4.2).
+    // The method can reach any event of the design through any object, so each
+    // trigger wakes those waiters to re-evaluate. The frontend hangs their notifier
+    // on the event type (Lowerer::declare_shared_notifiers); no other design has one.
+    if (const ChangeNotify* cn = mod_.change_notify(mod_.pool.event_type, 0);
+        cn != nullptr && cn->shared != kNoNotify) {
+        llvm::Value* any = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), chg_shared_slot(cn->shared)));
+        emit_event_wake_list(any, { .kind = RT_TRACE_EVENT, .obj = any });
+    }
     // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
     // object rather than on a signal edge. Every trigger form converges here, and
     // only an object some such statement registered on has an id to fire.
@@ -2125,71 +2099,54 @@ void Backend::emit_dynamic_remove(Signal sig, uint32_t edge) {
 
 // -- Wait-queue scans --
 
-// Generic static-queue scan (base + capacity values), null base => no
-// waiters. Serves service_static_queue, which passes the bucket's base and
-// capacity (a constant global, or fields of the owner's record). Each
-// entry wakes its process only if its scheduled flag is 0, then sets the
-// flag — collapsing a multi-signal sensitivity (the same process
-// subscribed under several signals) into a single wake.
-// `padded`: the bucket is capacity-padded to its definition's maximum (see
-// build_wait_queues), so trailing slots are zeroinit — skip a null flag
-// pointer instead of dereferencing it. Exact buckets keep the check-free
-// scan.
-// `trig`: trigger bits this (signal, edge) contributes to the wake word
-// (compute_trigger_masks): a constant, or a value read from the owner's
-// instance record. Note the already-queued path: it must still OR the bits
-// in, or a group woken by two of its events in one instant loses the second
-// one's bit and skips the members that were waiting for it. With a constant 0
-// that path is empty and the emission is exactly the unguarded scan.
-void Backend::emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded, llvm::Value* trig, const TraceCause& why) {
+// Static list scan: the list's header gives the count and the trigger bits this
+// (signal, edge) contributes to each wake word (compute_trigger_masks), and each
+// entry is a subscriber's wake slot. An entry wakes its group only if the slot's
+// word is 0, then sets it -- collapsing a multi-signal sensitivity (the same group
+// subscribed under several signals) into a single wake -- and pushes the handle
+// beside the word. Note the already-queued path: it must still OR the bits in, or
+// a group woken by two of its events in one instant loses the second one's bit and
+// skips the members that were waiting for it.
+void Backend::emit_static_scan_rt(llvm::Value* list, const TraceCause& why) {
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* i32  = b_.getInt32Ty();
     auto* word = sched_word_ty();
-    auto* elem = wait_elem_ty();
+    auto* slot_ty = wake_ty();
     auto* fn   = b_.GetInsertBlock()->getParent();
     auto* body = llvm::BasicBlock::Create(ctx_, "nsta.body", fn);
     auto* wake = llvm::BasicBlock::Create(ctx_, "nsta.wake", fn);
     auto* cont = llvm::BasicBlock::Create(ctx_, "nsta.cont", fn);
     auto* done = llvm::BasicBlock::Create(ctx_, "nsta.done", fn);
-    auto* entry = b_.GetInsertBlock();
-    // A bucket nobody subscribed to has no entries, whatever its base is. A loop
-    // that tests at its bottom and carries one pointer and one count is what
+    llvm::Value* const count = b_.CreateLoad(i32, list);
+    llvm::Value* const trig  = b_.CreateAlignedLoad(b_.getInt64Ty(), b_.CreateConstInBoundsGEP1_32(i32, list, 1), llvm::Align(4));
+    llvm::Value* const first = b_.CreateConstInBoundsGEP1_32(i32, list, kListHeader);
+    llvm::Value* const slots = sym(wake_gv_);
+    auto*              entry = b_.GetInsertBlock();
+    // A loop that tests at its bottom and carries one pointer and one count is what
     // tier-0 code generation (which keeps every value that outlives a block in
     // memory) makes the least of: this is the shape of every wake a store makes.
-    b_.CreateCondBr(b_.CreateICmpNE(cap, b_.getInt32(0)), body, done);
+    b_.CreateCondBr(b_.CreateICmpNE(count, b_.getInt32(0)), body, done);
 
     b_.SetInsertPoint(body);
     auto* cur  = b_.CreatePHI(ptr, 2);
     auto* left = b_.CreatePHI(i32, 2);
-    cur->addIncoming(base, entry);
-    left->addIncoming(cap, entry);
-    llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, cur, 0));
-    llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, cur, 1));
-    if (padded) {
-        auto* live = llvm::BasicBlock::Create(ctx_, "nsta.live", fn);
-        b_.CreateCondBr(b_.CreateICmpNE(fptr, llvm::ConstantPointerNull::get(ptr)), live, cont);
-        b_.SetInsertPoint(live);
-    }
-    llvm::Value* old    = b_.CreateLoad(word, fptr);
-    auto*        queued = b_.CreateICmpNE(old, b_.getInt64(0));
-    auto*        none   = llvm::dyn_cast<llvm::ConstantInt>(trig);
-    if (none != nullptr && none->isZero()) {
-        b_.CreateCondBr(queued, cont, wake);
-        b_.SetInsertPoint(wake);
-        emit_wake_push(b_, h, why);
-        b_.CreateStore(b_.getInt64(1), fptr);
-    } else {
-        // The word becomes the entry's bits OR-ed in if it was already queued, else
-        // queued with them: one store, so only the push is a block of its own.
-        b_.CreateStore(b_.CreateSelect(queued, b_.CreateOr(old, trig), b_.CreateOr(trig, b_.getInt64(1))), fptr);
-        b_.CreateCondBr(queued, cont, wake);
-        b_.SetInsertPoint(wake);
-        emit_wake_push(b_, h, why);
-    }
+    cur->addIncoming(first, entry);
+    left->addIncoming(count, entry);
+    llvm::Value* const index = b_.CreateZExt(b_.CreateLoad(i32, cur), b_.getInt64Ty());
+    llvm::Value* const slot  = b_.CreateInBoundsGEP(slot_ty, slots, index);
+    llvm::Value* const fptr  = b_.CreateStructGEP(slot_ty, slot, 0);
+    llvm::Value* const old   = b_.CreateLoad(word, fptr);
+    auto* const        queued = b_.CreateICmpNE(old, b_.getInt64(0));
+    // The word becomes the entry's bits OR-ed in if it was already queued, else
+    // queued with them: one store, so only the push is a block of its own.
+    b_.CreateStore(b_.CreateSelect(queued, b_.CreateOr(old, trig), b_.CreateOr(trig, b_.getInt64(1))), fptr);
+    b_.CreateCondBr(queued, cont, wake);
+    b_.SetInsertPoint(wake);
+    emit_wake_push(b_, b_.CreateLoad(ptr, b_.CreateStructGEP(slot_ty, slot, 1)), why);
     b_.CreateBr(cont);
 
     b_.SetInsertPoint(cont);
-    cur->addIncoming(b_.CreateInBoundsGEP(elem, cur, b_.getInt32(1)), cont);
+    cur->addIncoming(b_.CreateConstInBoundsGEP1_32(i32, cur, 1), cont);
     llvm::Value* next = b_.CreateSub(left, b_.getInt32(1));
     left->addIncoming(next, cont);
     b_.CreateCondBr(b_.CreateICmpNE(next, b_.getInt32(0)), body, done);
@@ -2210,24 +2167,25 @@ llvm::Function* shared_fn(llvm::Module& m, llvm::FunctionType* ty, const std::st
 
 } // namespace
 
-// (base ptr, cap i32[, trig i64][, traced storage ptr]). The cap is the caller's
-// constant bucket size, an argument because the function serves every bucket.
-llvm::Function* Backend::static_scan_fn(bool padded, bool trig_zero, uint32_t edge) {
+// (list ptr[, dump-var index i32][, traced storage ptr]). The caller reaches the
+// function only when the list's fact holds, so for the Any list only when the
+// value changed, which is when a dump-var touch matters.
+llvm::Function* Backend::static_scan_fn(bool vcd, uint32_t edge) {
     const bool          traced = trace_on();
     llvm::Module* const m      = &env_->llmod;
-    const auto          key    = std::make_tuple(m, padded, trig_zero, traced ? edge : 0u);
+    const auto          key    = std::make_tuple(m, vcd, traced ? edge : 0u);
     if (const auto it = static_scan_fns_.find(key); it != static_scan_fns_.end()) {
         return it->second;
     }
     auto* const              ptr = llvm::PointerType::getUnqual(ctx_);
-    std::vector<llvm::Type*> params{ ptr, b_.getInt32Ty() };
-    if (!trig_zero) {
-        params.push_back(b_.getInt64Ty());
+    std::vector<llvm::Type*> params{ ptr };
+    if (vcd) {
+        params.push_back(b_.getInt32Ty());
     }
     if (traced) {
         params.push_back(ptr);
     }
-    std::string name = std::string("clotho.notify.sta") + (padded ? ".pad" : "") + (trig_zero ? "" : ".trig");
+    std::string name = vcd ? "clotho.notify.vcd" : "clotho.notify";
     if (traced) {
         name += ".e" + std::to_string(edge);
     }
@@ -2236,56 +2194,11 @@ llvm::Function* Backend::static_scan_fn(bool padded, bool trig_zero, uint32_t ed
 
     const llvm::IRBuilderBase::InsertPointGuard guard(b_);
     b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", f));
-    llvm::Value* const trig = trig_zero ? static_cast<llvm::Value*>(b_.getInt64(0)) : f->getArg(2);
-    TraceCause         why{ .kind = RT_TRACE_STATIC, .fact = edge };
+    TraceCause why{ .kind = RT_TRACE_STATIC, .fact = edge };
     if (traced) {
         why.obj = f->getArg(f->arg_size() - 1);
     }
-    emit_static_scan_rt(f->getArg(0), f->getArg(1), padded, trig, why);
-    b_.CreateRetVoid();
-    return f;
-}
-
-// (port triple ptr[, dump-var index i32][, traced storage ptr]). The triple is
-// {ptr base, i64 trig, i32 cap}, laid out in that order by build_ports. The
-// caller reaches the function only when the bucket's fact holds, so for the Any
-// bucket only when the value changed, which is when a dump-var touch matters.
-llvm::Function* Backend::static_scan_port_fn(bool vcd, uint32_t edge) {
-    const bool          traced = trace_on();
-    llvm::Module* const m      = &env_->llmod;
-    const auto          key    = std::make_tuple(m, vcd, traced ? edge : 0u);
-    if (const auto it = static_scan_port_fns_.find(key); it != static_scan_port_fns_.end()) {
-        return it->second;
-    }
-    auto* const              ptr = llvm::PointerType::getUnqual(ctx_);
-    auto* const              i64 = b_.getInt64Ty();
-    auto* const              i32 = b_.getInt32Ty();
-    std::vector<llvm::Type*> params{ ptr };
-    if (vcd) {
-        params.push_back(i32);
-    }
-    if (traced) {
-        params.push_back(ptr);
-    }
-    std::string name = vcd ? "clotho.notify.port.vcd" : "clotho.notify.port";
-    if (traced) {
-        name += ".e" + std::to_string(edge);
-    }
-    llvm::Function* const f = shared_fn(*m, llvm::FunctionType::get(b_.getVoidTy(), params, false), name);
-    static_scan_port_fns_.emplace(key, f);
-
-    const llvm::IRBuilderBase::InsertPointGuard guard(b_);
-    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", f));
-    auto* const        triple = llvm::StructType::get(ctx_, { ptr, i64, i32 });
-    llvm::Value* const desc   = f->getArg(0);
-    llvm::Value* const base   = b_.CreateLoad(ptr, b_.CreateStructGEP(triple, desc, 0));
-    llvm::Value* const trig   = b_.CreateLoad(i64, b_.CreateStructGEP(triple, desc, 1));
-    llvm::Value* const cap    = b_.CreateLoad(i32, b_.CreateStructGEP(triple, desc, 2));
-    TraceCause         why{ .kind = RT_TRACE_STATIC, .fact = edge };
-    if (traced) {
-        why.obj = f->getArg(f->arg_size() - 1);
-    }
-    emit_static_scan_rt(base, cap, false, trig, why);
+    emit_static_scan_rt(f->getArg(0), why);
     if (vcd) {
         llvm::Value* const idx = f->getArg(1);
         emit_guarded_vcd_touch(vcd_touch_fn(), [&] { return llvm::SmallVector<llvm::Value*, 2>{ idx }; });
@@ -2358,7 +2271,7 @@ void Backend::service_any_waiters(Signal sig) {
         t.level = true;
         emit_trace_change(RT_TRACE_CHG_LEVEL, sig, storage_ptr(slot_of(sig)), t);
     }
-    if (wait_sta_gv_[i][e] != nullptr) {
+    if (sta_has_[i][e]) {
         service_static_queue(sig, e);
     }
     if (wait_dyn_gv_[i][e] != nullptr) {

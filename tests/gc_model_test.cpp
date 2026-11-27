@@ -164,8 +164,9 @@ struct Model {
     size_t                 finalized_seen = 0;
     uint64_t               last_number    = 0;
 
-    // The precise roots: a table the collector reads in full at every collection.
-    uint64_t    root_words[kRoots]{};
+    // The precise roots: a table whose slots the collector reads when a store to them is logged
+    // (rt_gc_note_state_store) or the collection is full. The word after them holds the card byte.
+    uint64_t    root_words[kRoots + 1]{};
     int32_t     root_obj[kRoots];
     uint32_t    root_offsets[kRoots];
     rt_gc_roots root_table{};
@@ -210,6 +211,8 @@ struct Model {
         }
         root_table.base     = root_words;
         root_table.nhandles = kRoots;
+        root_table.cards    = 8 * kRoots;
+        root_table.bytes    = 8 * kRoots + 1;
         root_table.offsets  = root_offsets;
         rt_gc_roots_add(&root_table);
         rt_gc_frame_link(&frame_node, frame_words, sizeof frame_words);
@@ -296,6 +299,7 @@ struct Model {
         const uint32_t k = below(kRoots);
         root_obj[k]      = i;
         root_words[k]    = reinterpret_cast<uint64_t>(handle_of(i));
+        rt_gc_note_state_store(&root_words[k], sizeof(uint64_t));
     }
 
     // A store of a handle into an object, as generated code does one: the store, and
@@ -582,7 +586,10 @@ struct Heap {
     rt_gc_roots           table{};
     void*                 pend_head = nullptr;
 
-    explicit Heap(uint32_t slots, uint64_t heap_bytes_max = 0) : words(slots, 0), offsets(slots) {
+    // The slots, and after them the card bytes (a word more than the cards need).
+    explicit Heap(uint32_t slots, uint64_t heap_bytes_max = 0)
+      : words(slots + (((8ull * slots - 1) >> RT_GC_CARD_SHIFT) + 1 + 7) / 8, 0)
+      , offsets(slots) {
         for (Shape& s : g_shapes) {
             s.build();
         }
@@ -599,6 +606,8 @@ struct Heap {
         }
         table.base     = words.data();
         table.nhandles = slots;
+        table.cards    = 8 * slots;
+        table.bytes    = 8 * slots + static_cast<uint32_t>(((8ull * slots - 1) >> RT_GC_CARD_SHIFT) + 1);
         table.offsets  = offsets.data();
         rt_gc_roots_add(&table);
     }
@@ -616,6 +625,7 @@ struct Heap {
         store(h, 0, reinterpret_cast<uint64_t>(s.vptr));
         store(h, kStampOffset, stamp);
         words[slot] = reinterpret_cast<uint64_t>(h);
+        rt_gc_note_state_store(&words[slot], sizeof(uint64_t));
         return h;
     }
 
@@ -685,6 +695,28 @@ TEST_CASE("gc model: the collector keeps exactly what a model of the heap says")
 TEST_CASE("gc heap: a freed object's granules are the next allocation's") {
     SUBCASE("freed by a young collection") { check_granule_reuse(RT_GC_KIND_YOUNG); }
     SUBCASE("freed by a full collection") { check_granule_reuse(RT_GC_KIND_FULL); }
+}
+
+// More cards stored to than the log holds: the next young collection reads every slot instead, so a
+// store the log dropped is not lost, and every card is clear after it.
+TEST_CASE("gc heap: a young collection after the card log overflows reads every slot") {
+    constexpr uint32_t kSlots = 512; // eight cards of 64 slots
+    constexpr uint32_t kSmall = 0;
+    Heap               heap(kSlots);
+    heap.collect(RT_GC_KIND_FULL);
+    rt_gc_set_logged_cards_max(3);
+    std::vector<void*> made;
+    for (uint32_t card = 0; card < 8; ++card) {
+        made.push_back(heap.make(card * 64, kSmall, card));
+    }
+    const rt_gc_stats overflowed = heap.collect(RT_GC_KIND_YOUNG);
+    CHECK(overflowed.state_slots_read == kSlots);
+    CHECK(overflowed.objects_live == 8);
+    for (uint32_t card = 0; card < 8; ++card) {
+        REQUIRE(rt_gc_find_object(made[card]) == made[card]);
+        CHECK(load(made[card], kStampOffset) == card);
+    }
+    CHECK(heap.collect(RT_GC_KIND_YOUNG).state_slots_read == 0);
 }
 
 TEST_CASE("gc heap: an object larger than a block has a mapping of its own") {

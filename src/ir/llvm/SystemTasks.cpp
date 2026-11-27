@@ -31,6 +31,15 @@ llvm::Constant* Backend::cover_array(llvm::StructType*                   row_ty,
                                     nm);
 }
 
+// A model string, or a null pointer for an empty one: the runtime reads a null
+// comment as none, and an unset option.name as the generated name.
+llvm::Constant* Backend::cover_string(const std::string& s) {
+    if (s.empty()) {
+        return llvm::Constant::getNullValue(raw_ptr_ty());
+    }
+    return b_.CreateGlobalString(s);
+}
+
 llvm::Constant* Backend::cover_config_global() {
     if (auto* g = env_->llmod.getNamedGlobal("clotho.cover.config")) {
         return g;
@@ -72,16 +81,29 @@ llvm::Constant* Backend::cover_config_global() {
                                                          b_.getInt32(cp.at_least),
                                                          b_.getInt32(cp.is_auto ? 1u : 0u),
                                                          b_.getInt32(cp.auto_total),
-                                                         b_.getInt32(cp.is_signed ? 1u : 0u) }));
+                                                         b_.getInt32(cp.is_signed ? 1u : 0u),
+                                                         cover_string(cp.inst_comment),
+                                                         cover_string(cp.type_comment),
+                                                         b_.getInt32(cp.type_weight),
+                                                         b_.getInt32(cp.type_goal) }));
         }
-        types.push_back(llvm::ConstantStruct::get(cover_type_ty(),
-                                                  { b_.CreateGlobalString(ct.name),
-                                                    b_.CreateGlobalString(ct.banner),
-                                                    b_.getInt32(static_cast<uint32_t>(ct.points.size())),
-                                                    cover_array(cover_point_ty(), points, tn + ".points"),
-                                                    b_.getInt32(ct.weight),
-                                                    b_.getInt32(ct.goal),
-                                                    b_.getInt32(ct.per_instance ? 1u : 0u) }));
+        types.push_back(llvm::ConstantStruct::get(
+          cover_type_ty(),
+          { b_.CreateGlobalString(ct.name),
+            b_.CreateGlobalString(ct.banner),
+            b_.getInt32(static_cast<uint32_t>(ct.points.size())),
+            cover_array(cover_point_ty(), points, tn + ".points"),
+            b_.getInt32(ct.weight),
+            b_.getInt32(ct.type_weight),
+            b_.getInt32(ct.goal),
+            b_.getInt32(ct.per_instance ? 1u : 0u),
+            b_.getInt32(ct.at_least),
+            // An empty option.name is a name, so only an unset one is null.
+            ct.inst_name.has_value() ? static_cast<llvm::Constant*>(b_.CreateGlobalString(*ct.inst_name))
+                                     : llvm::Constant::getNullValue(raw_ptr_ty()),
+            cover_string(ct.inst_comment),
+            cover_string(ct.type_comment),
+            b_.getInt32(ct.type_goal) }));
     }
     llvm::Constant* path = config_.coverage_report.empty()
                              ? llvm::Constant::getNullValue(raw_ptr_ty())
@@ -110,10 +132,20 @@ void Backend::lower_timeformat(Index i) {
     llvm::Value* prec  = cast(must_of(info.precision), 32, true);
     llvm::Value* width = cast(must_of(info.min_width), 32, true);
 
-    const std::string suffix  = ir_->extra_bytes(info.suffix, info.suffix_len);
-    llvm::Value*      sfx_ptr = b_.CreateGlobalString(suffix);
-    b_.CreateCall(timeformat_set_fn(),
-                  { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
+    // A runtime suffix is a string object: the runtime copies its bytes, so its
+    // data pointer and length go where the literal's would.
+    llvm::Value* sfx_ptr = nullptr;
+    llvm::Value* sfx_len = nullptr;
+    if (info.suffix_value != kNoFormatValue) {
+        llvm::Value* handle = str_of(info.suffix_value);
+        sfx_ptr             = b_.CreateCall(str_data_fn(), { handle });
+        sfx_len             = b_.CreateTrunc(b_.CreateCall(str_len_fn(), { handle }), b_.getInt32Ty());
+    } else {
+        const std::string suffix = ir_->extra_bytes(info.suffix, info.suffix_len);
+        sfx_ptr                  = b_.CreateGlobalString(suffix);
+        sfx_len                  = b_.getInt32(static_cast<uint32_t>(suffix.size()));
+    }
+    b_.CreateCall(timeformat_set_fn(), { units, prec, sfx_ptr, sfx_len, width });
 }
 
 // Lower a `strobe_pend`: ramp the target zero-formal deferred-print task
@@ -705,6 +737,50 @@ void Backend::lower_cover_query(Index i) {
         case CoverOp::TypeTotal:
             ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_total", i32), { cover_type_value(info.type_idx) }));
             return;
+        case CoverOp::TypePointCoverage:
+            set_value(i,
+                      real_plane(b_.CreateCall(cover_type_point_query_fn("rt_cover_type_point_coverage", dbl),
+                                               { cover_type_value(info.type_idx), b_.getInt32(info.point) })));
+            return;
+        case CoverOp::TypePointCovered:
+            ival(b_.CreateCall(cover_type_point_query_fn("rt_cover_type_point_covered", i32),
+                               { cover_type_value(info.type_idx), b_.getInt32(info.point) }));
+            return;
+        case CoverOp::TypePointTotal:
+            ival(b_.CreateCall(cover_type_point_query_fn("rt_cover_type_point_total", i32),
+                               { cover_type_value(info.type_idx), b_.getInt32(info.point) }));
+            return;
+        case CoverOp::OptGet:
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_query opt_get takes an option id" };
+            }
+            set_value(i, two_val(b_.CreateCall(cover_opt_get_fn(),
+                                               { handle(), b_.getInt32(info.point), cast(must_of(args[1]), 32, false) })));
+            return;
+        case CoverOp::OptGetStr:
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_query opt_get_str takes an option id" };
+            }
+            b_.CreateCall(cover_opt_get_str_fn(),
+                          { str_of(i), handle(), b_.getInt32(info.point), cast(must_of(args[1]), 32, false),
+                            alloc_site_global(loc_text(i), "string") });
+            return;
+        case CoverOp::TypeOptGet:
+            if (args.size() != 1) {
+                throw BackendError{ "internal: cover_query type_opt_get takes an option id" };
+            }
+            set_value(i, two_val(b_.CreateCall(cover_type_opt_get_fn(),
+                                               { cover_type_value(info.type_idx), b_.getInt32(info.point),
+                                                 cast(must_of(args[0]), 32, false) })));
+            return;
+        case CoverOp::TypeOptGetStr:
+            if (args.size() != 1) {
+                throw BackendError{ "internal: cover_query type_opt_get_str takes an option id" };
+            }
+            b_.CreateCall(cover_type_opt_get_str_fn(),
+                          { str_of(i), cover_type_value(info.type_idx), b_.getInt32(info.point),
+                            cast(must_of(args[0]), 32, false), alloc_site_global(loc_text(i), "string") });
+            return;
         case CoverOp::DesignCoverage:
             set_value(i, real_plane(b_.CreateCall(cover_design_coverage_fn(), {})));
             return;
@@ -740,6 +816,48 @@ void Backend::lower_cover_ctl(Index i) {
             b_.CreateCall(cover_start_fn(),
                           { h, cast(must_of(args[1]), 32, false) });
             return;
+        case CoverOp::StartPoint:
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_ctl start_point takes an enable" };
+            }
+            b_.CreateCall(cover_start_point_fn(),
+                          { h, b_.getInt32(info.point), cast(must_of(args[1]), 32, false) });
+            return;
+        case CoverOp::OptSet:
+            if (args.size() != 3) {
+                throw BackendError{ "internal: cover_ctl opt_set takes an option id and a value" };
+            }
+            b_.CreateCall(cover_opt_set_fn(),
+                          { h, b_.getInt32(info.point), cast(must_of(args[1]), 32, false), cast(must_of(args[2]), 64, true) });
+            return;
+        case CoverOp::OptSetStr: {
+            if (args.size() != 3) {
+                throw BackendError{ "internal: cover_ctl opt_set_str takes an option id and a string" };
+            }
+            const AsciiArg s = spill_ascii_arg(args[2], "cover.opt");
+            b_.CreateCall(cover_opt_set_str_fn(),
+                          { h, b_.getInt32(info.point), cast(must_of(args[1]), 32, false), s.ptr,
+                            b_.CreateZExt(s.len, b_.getInt64Ty()) });
+            return;
+        }
+        case CoverOp::TypeOptSet:
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_ctl type_opt_set takes an option id and a value" };
+            }
+            b_.CreateCall(cover_type_opt_set_fn(),
+                          { cover_type_value(info.type_idx), b_.getInt32(info.point),
+                            cast(must_of(args[0]), 32, false), cast(must_of(args[1]), 64, true) });
+            return;
+        case CoverOp::TypeOptSetStr: {
+            if (args.size() != 2) {
+                throw BackendError{ "internal: cover_ctl type_opt_set_str takes an option id and a string" };
+            }
+            const AsciiArg s = spill_ascii_arg(args[1], "cover.type_opt");
+            b_.CreateCall(cover_type_opt_set_str_fn(),
+                          { cover_type_value(info.type_idx), b_.getInt32(info.point),
+                            cast(must_of(args[0]), 32, false), s.ptr, b_.CreateZExt(s.len, b_.getInt64Ty()) });
+            return;
+        }
         case CoverOp::SetName: {
             if (args.size() != 2) {
                 throw BackendError{ "internal: cover_ctl set_inst_name takes a string" };
@@ -961,9 +1079,9 @@ void Backend::lower_scanf(Index i) {
             if (lv.is_string) {
                 // A `string` object destination (flags bit1): the descriptor
                 // carries the rt_string handle and its alloc site instead of
-                // plane pointers, and the engine assigns the %s token verbatim.
-                // Only %s pairs with a string (the frontend refuses the other
-                // conversions per LRM 21.3.4.3), and a `%5s` field width caps
+                // plane pointers, and the engine assigns a %s token verbatim or
+                // stores another conversion's value cast to string, and a `%5s`
+                // field width caps
                 // the token like any other %s. The snapshot must open before
                 // the Write-use handle is taken (str_chg bracket).
                 olds[k] = service_snapshot(lv);
@@ -1045,20 +1163,10 @@ void Backend::lower_value_plusargs(Index i) {
 
     const Guarded lv = write_dest(dst);
     if (lv.is_string) {
-        if (info.conv != 's') {
-            // TODO: a numeric conversion into a `string` object. LRM §21.6 stores
-            // the CONVERTED value, so this is LRM 6.16's integral-to-string
-            // assignment of it -- a one-byte string holding a character code, which
-            // is a separate question from the "%s -- string (no conversion)" form
-            // the clause's examples and UVM actually use.
-            throw BackendError{ std::string("$value$plusargs %") +
-                                static_cast<char>(info.conv) +
-                                " into a string object is not supported" };
-        }
         llvm::Value* snap = str_chg_snapshot(lv);
         llvm::Value* r    = b_.CreateCall(
           value_plusargs_str_fn(),
-          { prefix_ptr, prefix_len, lv_string_ptr(lv, StringUse::Write),
+          { prefix_ptr, prefix_len, b_.getInt32(info.conv), lv_string_ptr(lv, StringUse::Write),
             alloc_site_global(loc_text(i), "string") });
         str_chg_after(lv, snap);
         set_value(i, two_val(r));
@@ -1110,6 +1218,335 @@ Backend::AsciiArg Backend::spill_ascii_arg(Index v, const char* name) {
     return { ptr, b_.getInt32(len), b_.getInt32(0) };
 }
 
+// The unpacked dimensions of the memory `array_type` below its highest, as the
+// constant (left, right) pairs rt_readmem and rt_fread order the leaves of one word
+// by (LRM 21.4.3), outermost first, with their count. A memory of one dimension has
+// none: null and 0.
+std::pair<llvm::Value*, uint32_t> Backend::mem_inner_dims(Ref array_type) {
+    std::vector<llvm::Constant*> bounds;
+    for (Ref e = std::get<Type>(mod_.pool.get(array_type)).element;;) {
+        const Type t = std::get<Type>(mod_.pool.get(e));
+        if (t.kind != Type::Kind::UnpackedArray) {
+            break;
+        }
+        bounds.push_back(b_.getInt64(t.left));
+        bounds.push_back(b_.getInt64(t.right));
+        e = t.element;
+    }
+    if (bounds.empty()) {
+        return { llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)), 0 };
+    }
+    auto* arr_ty = llvm::ArrayType::get(b_.getInt64Ty(), bounds.size());
+    auto* gv     = new llvm::GlobalVariable(env_->llmod, arr_ty, /*isConstant=*/true,
+                                            llvm::GlobalValue::PrivateLinkage,
+                                            llvm::ConstantArray::get(arr_ty, bounds), "clotho.mem.dims");
+    return { gv, static_cast<uint32_t>(bounds.size() / 2) };
+}
+
+// The array a $readmem or $fread loads (LRM 21.4, 21.3.4.4), resolved for the runtime.
+//
+// `target` is an array lvalue: a memory held in a module signal, a member of an
+// unpacked struct, a class property or an interface member that is an array, an
+// element of one that is itself an array, or a dynamic array or queue wherever it
+// lives. `type` is the array the load fills, and the runtime numbers its words by that
+// type's highest dimension, so an address is an index into the array the task names.
+// An indexed slice `target[base +: n]` / `[base -: n]` is not an lvalue (its first
+// word is at a runtime position): `slice` says so, `slice_base` is its base and
+// `base_type` the type of `target`. Its addresses are the indices it selects, as for
+// `target[a:b]` (21.4: `a[2 +: 4]` is `a[2:5]`), and only the words that lie in `target`'s
+// array exist: 7.4.5 makes writing an array through an invalid index a no-operation,
+// which Clotho applies to each word, as it does to a write of a slice
+// (emit_indexed_slice_copy), so a slice that hangs off the array keeps the alignment
+// of its words. An x or z base leaves none. A slice with constant bounds takes the same
+// form, its base the first of its bounds.
+//
+// A slice of a queue (`slice` is kMemSliceQueue, `slice_base` and `slice_end` its first
+// and last index) is the elements of the queue LRM 7.10.1 gives it: from the first index
+// but not below 0 to the last but not past the end of the queue, none when that range is
+// empty or a bound has an x or z bit. Its words are addressed by their index in the
+// queue, so its range is that of the elements that are left, and its first word is
+// where the ring puts the first of them.
+//
+// Where the leaves are depends on the lvalue. A memory in a module signal is
+// `[N x slot]`, the slot the may-z analysis chose. Every other array has its type's
+// canonical slot: an array inside an aggregate lies one slot after another from the
+// pointer its path reaches, and a dynamic array or queue is `len` words of its element
+// in the buffer its handle holds, addressed 0 to len - 1. LRM 21.4.1 fixes their size:
+// a load does not resize them, and an address past the last word is an address past
+// the end of a memory. A queue's words sit in its ring, which the runtime walks from
+// the head slot (rt_readmem).
+//
+// An associative array is the one target that is not storage the load finds: LRM 21.4.1
+// has a loaded address create the element of that index. The load goes through the handle
+// and the array's descriptor (rt_readmem_assoc, rt_fread_assoc), and the slot facts are
+// those of one element, an array of them (an element that is itself an array) being
+// the leaves of one word. An entry that is itself an array or a container, `aa[k]`, is
+// loaded as the array it is, and created if it is not there.
+//
+// A target that can be invalid (a runtime index outside its array, or with an x or z
+// bit) names no word then: the runtime is handed a word count of 0 and a scratch slot
+// to point at, and does nothing.
+Backend::MemTarget Backend::resolve_mem_target(Index       target,
+                                               Ref         type,
+                                               Ref         base_type,
+                                               uint32_t    slice,
+                                               Index       slice_base,
+                                               Index       slice_end,
+                                               const char* task) {
+    Guarded g = lvalue_of(target);
+    // An entry of an associative array that is itself an array or a container, `aa[k]`, is the
+    // target of the load, which creates it as a store to it would (LRM 7.8.7). An x or z key
+    // names none, which the verdict of the place carries.
+    if (g.is_assoc) {
+        g = assoc_elem_lvalue(g, /*for_write=*/true);
+    }
+    if (g.is_string) {
+        throw BackendError{ std::string(task) + " target is an array of strings, which is not supported" };
+    }
+    emit_bounds_reports(g, /*is_write=*/true);
+
+    const Ref  named     = slice != kMemSliceNone ? base_type : type;
+    const Type named_ty  = std::get<Type>(mod_.pool.get(named));
+    const Type loaded    = std::get<Type>(mod_.pool.get(type));
+    const bool queue     = named_ty.kind == Type::Kind::Queue;
+    const bool assoc     = named_ty.kind == Type::Kind::Assoc;
+    const bool container = queue || assoc || named_ty.kind == Type::Kind::DynArray;
+    // Only a slice of a queue has runtime bounds, and nothing else is cut by them.
+    if (slice != kMemSliceNone && (slice == kMemSliceQueue) != queue) {
+        throw BackendError{ "internal: a slice of a queue is a queue slice, and no other slice is" };
+    }
+
+    // The leaf slot. A memory held in a signal has the one the may-z analysis chose; the
+    // arrays of aggregates and containers the canonical one of their type, as every
+    // other access to them uses (agg_leaf_slot_ty).
+    const bool        flat = !container && !g.is_agg;
+    llvm::StructType* slot_ty;
+    bool              four_state;
+    bool              has_z;
+    uint32_t          width;
+    if (flat) {
+        if (!g.is_signal || g.array_ty == nullptr) {
+            throw BackendError{ std::string(task) + " target is not a memory held in a module signal" };
+        }
+        slot_ty    = g.slot_ty;
+        four_state = g.four_state;
+        has_z      = g.has_z;
+        width      = g.store_width;
+    } else {
+        const Ref  leaf = types::leaf_type(mod_.pool, container ? named_ty.element : type);
+        const Type lt   = std::get<Type>(mod_.pool.get(leaf));
+        // The words of an array of containers have no fixed size, and a string, a class
+        // handle or an unpacked struct in a slot is not a value a file can fill.
+        if (lt.kind == Type::Kind::DynArray || lt.kind == Type::Kind::Queue || lt.kind == Type::Kind::Assoc) {
+            throw BackendError{ std::string(task) + " target is an array of dynamic arrays, queues or associative "
+                                                    "arrays, which is not supported" };
+        }
+        const bool plain = lt.kind == Type::Kind::Logic || lt.kind == Type::Kind::Bit ||
+                           lt.kind == Type::Kind::PackedArray || lt.kind == Type::Kind::Real ||
+                           lt.kind == Type::Kind::ShortReal || (lt.kind == Type::Kind::Struct && lt.is_packed);
+        if (!plain) {
+            throw BackendError{ std::string(task) + " target's elements are not integral or real values" };
+        }
+        const Layout lay = mod_.pool.layout(leaf);
+        width            = lay.width == 0 ? 1 : lay.width;
+        four_state       = lay.domain == Domain::Four;
+        has_z            = four_state;
+        slot_ty          = agg_leaf_slot_ty(leaf);
+    }
+
+    // An associative array has no planes to point at: its elements are created by the load,
+    // which the runtime does through the handle (rt_readmem_assoc, rt_fread_assoc). A
+    // target that can be invalid names no array then, and the runtime does nothing.
+    if (assoc) {
+        const AssocKeyInfo key = assoc_key_info(named);
+        if (key.is_string || key.is_agg) {
+            throw BackendError{ "internal: the index of an associative array a memory load fills is not integral" };
+        }
+        const llvm::DataLayout& dl = env_->llmod.getDataLayout();
+        MemTarget               t;
+        t.assoc        = true;
+        t.assoc_handle = lv_handle_ptr(g, HandleUse::Place);
+        t.assoc_ops    = elem_ops_global(named);
+        t.key_width    = key.W;
+        t.key_signed   = key.is_signed;
+        t.stride       = static_cast<uint32_t>(dl.getTypeAllocSize(slot_ty));
+        t.width        = width;
+        t.four_state   = four_state;
+        t.z_off        = has_z ? static_cast<uint32_t>(dl.getStructLayout(slot_ty)->getElementOffset(1)) : 0;
+        t.inner        = mem_inner_dims(type);
+        t.assoc_valid  = g.valid();
+        t.place        = static_cast<const LValueInfo&>(g);
+        t.container    = true;
+        return t;
+    }
+
+    // The words of the array `target` names, and of the one the load fills. A dynamic
+    // array or queue has as many as it holds now.
+    const auto dim = [](const Type& t) -> int64_t {
+        return (t.left <= t.right ? int64_t{ t.right } - t.left : int64_t{ t.left } - t.right) + 1;
+    };
+    llvm::Value* zero = b_.getInt64(0);
+    llvm::Value* data = nullptr;
+    llvm::Value* head = zero;
+    llvm::Value* cap  = zero;
+    llvm::Value* len  = nullptr;
+    if (container) {
+        // Nothing here notifies: the load does, once it knows it changed a leaf.
+        llvm::Value* h = lv_handle_ptr(g, HandleUse::Place);
+        if (queue) {
+            data = b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(queue_slot_ty(), h, 0));
+            head = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), h, 1));
+            len  = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), h, 2));
+            cap  = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), h, 3));
+        } else {
+            data = b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), h, 0));
+            len  = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), h, 1));
+        }
+    }
+    const int64_t words = dim(loaded);
+    llvm::Value*  size  = container ? len : b_.getInt64(dim(named_ty));
+    llvm::Value*  count = container && slice == kMemSliceNone ? len : b_.getInt64(words);
+    llvm::Value*  lo    = zero;
+    // The bounds of the array the load fills, which its addresses are numbered by.
+    llvm::Value* left_addr  = container && slice == kMemSliceNone ? zero : b_.getInt64(loaded.left);
+    llvm::Value* right_addr = container && slice == kMemSliceNone ? b_.CreateSub(len, b_.getInt64(1))
+                                                                   : b_.getInt64(loaded.right);
+    // The leaf of the whole array where the first word that exists starts.
+    llvm::Value* first = g.elem_idx != nullptr ? cast(g.elem_idx, 64, false) : zero;
+    // The ring slot of the first word that exists, for a queue.
+    llvm::Value* ring_first = head;
+    if (slice == kMemSliceQueue) {
+        // LRM 7.10.1: the indices from the first bound, but not below 0, to the last, but not
+        // past the end of the queue. They are the addresses of the load, and there are none
+        // when the range is empty or a bound has an x or z bit.
+        llvm::Value* from = select_index(value_of(slice_base), type_of(slice_base));
+        llvm::Value* to   = select_index(value_of(slice_end), type_of(slice_end));
+        left_addr         = smax(from, zero);
+        right_addr        = smin(to, b_.CreateSub(len, b_.getInt64(1)));
+        count             = b_.CreateSelect(b_.CreateICmpSLE(left_addr, right_addr),
+                                            b_.CreateAdd(b_.CreateSub(right_addr, left_addr), b_.getInt64(1)), zero);
+        count = b_.CreateSelect(b_.CreateOr(any_unknown(slice_base), any_unknown(slice_end)), zero, count);
+        // The word at `left_addr` is that many slots on from the head, which wraps once at
+        // most: the head is below the capacity and a word that exists below the length.
+        llvm::Value* at = b_.CreateAdd(head, left_addr);
+        ring_first      = b_.CreateSelect(b_.CreateICmpUGE(at, cap), b_.CreateSub(at, cap), at);
+    } else if (slice != kMemSliceNone) {
+        // A dynamic array is always 0-based and ascending (LRM 7.5).
+        const bool     ascending   = container || named_ty.left <= named_ty.right;
+        const int64_t  left        = container ? 0 : int64_t{ named_ty.left };
+        const uint32_t word_leaves = array_leaf_count(named_ty.element);
+        llvm::Value*   at          = select_index(value_of(slice_base), type_of(slice_base));
+        // The lowest coordinate the slice selects. Its first word is that one for an
+        // ascending array and the highest for a descending one (LRM 11.5.1 keeps the
+        // declared direction), and its position in `target`'s array is counted from
+        // the array's left bound.
+        llvm::Value* low = slice == kMemSliceUp ? at : b_.CreateSub(at, b_.getInt64(words - 1));
+        // The slice's own addresses are the indices it selects, whichever way it is written:
+        // `a[2 +: 4]` is `a[2:5]` (LRM 21.4: start and finish lie within the slice's range).
+        llvm::Value* high = b_.CreateAdd(low, b_.getInt64(words - 1));
+        left_addr         = ascending ? low : high;
+        right_addr        = ascending ? high : low;
+        llvm::Value* pos = ascending ? b_.CreateSub(low, b_.getInt64(left))
+                                     : b_.CreateSub(b_.getInt64(left), b_.CreateAdd(low, b_.getInt64(words - 1)));
+        // The slice's words at positions [wlo, whi) are in `target`'s array.
+        llvm::Value* wlo = smax(zero, b_.CreateNeg(pos));
+        llvm::Value* whi = smin(b_.getInt64(words), b_.CreateSub(size, pos));
+        count            = b_.CreateSelect(b_.CreateICmpSGT(whi, wlo), b_.CreateSub(whi, wlo), zero);
+        count            = b_.CreateSelect(any_unknown(slice_base), zero, count);
+        lo               = wlo;
+        first = b_.CreateAdd(first, b_.CreateMul(b_.CreateAdd(pos, wlo), b_.getInt64(word_leaves)));
+    }
+    if (llvm::Value* ok = g.valid()) {
+        count = b_.CreateSelect(ok, count, zero);
+    }
+    // A target that names no word is handed leaf 0 of the array, which exists, so no
+    // address is formed outside its storage.
+    first = b_.CreateSelect(b_.CreateICmpSGT(count, zero), first, zero);
+
+    const auto scratch = [&]() -> llvm::Value* {
+        return entry_alloca(slot_ty, "mem.scratch");
+    };
+    // A never-z memory (always the case for a 2-state element type) stores no z words;
+    // a null z_base tells the runtime to skip the z writes. A 4-state readmem target
+    // is a z seed in compute_may_z, so it always keeps its z field.
+    llvm::Value* no_z = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    MemTarget    t;
+    if (flat) {
+        llvm::Value* slot = g.pointer_or(
+          b_,
+          [&](const LValue& lv) -> llvm::Value* {
+              return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), first });
+          },
+          scratch);
+        const LValue leaf = slot_lvalue(g, slot);
+        t.mm_base         = lv_mm_ptr(leaf);
+        t.z_base          = has_z ? lv_z_ptr(leaf) : no_z;
+    } else {
+        // The ring of a queue is walked by the runtime from its slot 0.
+        llvm::Value* slot = data;
+        if (!queue) {
+            llvm::Value* array = container ? data
+                                           : g.pointer_or(
+                                               b_, [&](const LValue& lv) -> llvm::Value* { return agg_slot_ptr(lv); },
+                                               scratch);
+            slot = b_.CreateInBoundsGEP(slot_ty, array, { first });
+        }
+        t.mm_base = slot;
+        t.z_base  = has_z ? b_.CreateStructGEP(slot_ty, slot, 1) : no_z;
+    }
+    t.stride     = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(slot_ty));
+    t.width      = width;
+    t.four_state = four_state;
+    t.inner      = mem_inner_dims(type);
+    t.left       = left_addr;
+    t.right      = right_addr;
+    t.lo_word    = lo;
+    t.word_count = count;
+    t.ring_head  = queue ? ring_first : zero;
+    t.ring_cap   = queue ? cap : zero;
+    t.place      = static_cast<const LValueInfo&>(g);
+    t.container  = container;
+    return t;
+}
+
+// What a bulk load of `t` owes the design once the runtime has written it: wake what
+// waits on the memory when the load `changed` a leaf, and mark it for the dump. A load
+// has no per-element edge facts, so an array signal's Any-edge readers are woken
+// whenever one landed, as the deferred array-NBA commit does (rt_nba_arr_dirty ->
+// service_any_waiters). A dynamic array or queue wakes through its container notifier
+// (notify_container_mutation), which a waiter on its signal and on a class property
+// each hear; so does an array bound to a `ref` argument, whose actual's waiters the
+// call's thunk wakes.
+void Backend::finish_mem_load(const MemTarget& t, llvm::Value* changed, const char* prefix) {
+    if (silent_stores_) {
+        return;
+    }
+    const LValueInfo& p = t.place;
+    // The wake buckets and the dump-var index are the owner's: the instance a virtual
+    // interface handle names, when the memory was reached through one.
+    CtxOverride ov(*this, p.vif_ctx, lvalue_ctx_anchor(p));
+    const bool waited_signal = p.is_signal && signal_has_waiters(p.sig);
+    const bool wakes = p.ref_wake_fn != nullptr ||
+                       ((t.container && p.chg != nullptr) ? p.chg->container : waited_signal);
+    if (wakes) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* svc  = llvm::BasicBlock::Create(ctx_, std::string(prefix) + ".svc", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, std::string(prefix) + ".cont", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(changed, b_.getInt32(0)), svc, cont);
+        b_.SetInsertPoint(svc);
+        if (t.container || p.ref_wake_fn != nullptr) {
+            notify_container_mutation(p);
+        } else {
+            service_signal_container_mutation(p.sig);
+        }
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    }
+    if (!t.container && p.is_signal) {
+        vcd_touch_array(p.sig);   // bulk write: mark the array for the dump
+    }
+}
+
 // Lower a $fread into a single vector: one element, no addressing. The runtime
 // reads ceil(width/8) bytes MSB-first into the destination planes.
 void Backend::lower_fread_word(Index i) {
@@ -1134,85 +1571,72 @@ void Backend::lower_fread_word(Index i) {
     const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
     const uint32_t flags  = !dest.four_state ? 4u : 0u;
     const ServiceSnapshot old = service_snapshot(lv);
+    const auto     no_ptr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     llvm::Value*   r      = b_.CreateCall(fread_fn(),
-                                          { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(dest.store_width),
-                                            b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
-                                            b_.getInt64(0), b_.getInt32(flags),
-                                            llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
-                                            b_.getInt64(0) });
+                                          { fd, mm, z, b_.getInt32(0), b_.getInt32(dest.store_width),
+                                            b_.getInt32(four), no_ptr, b_.getInt32(0), b_.getInt64(0),
+                                            b_.getInt64(0), b_.getInt64(0), b_.getInt64(1), b_.getInt64(0),
+                                            b_.getInt64(0), b_.getInt64(0),
+                                            b_.getInt64(0), b_.getInt32(flags), no_ptr, b_.getInt64(0) });
     service_after_write(lv, old);
     set_value(i, two_val(r));
 }
 
-// Lower a $fread into a memory: reuse the $readmem geometry (plane bases,
-// stride, count, declared bounds) with optional start-address / element-count
-// operands, and read binary bytes MSB-first per element.
+// Lower a $fread into a memory: reuse the $readmem geometry (plane bases, stride,
+// the highest dimension's declared bounds and the dimensions below it) with optional
+// start-address / word-count operands, and read binary bytes MSB-first per leaf.
 void Backend::lower_fread_mem(Index i) {
     const Index fdi  = ir_->payload(i).op_extra.op;
     const auto  info = ir_->extra_data<FreadMemInfo>(ir_->payload(i).op_extra.extra);
-
-    const SignalSlot& s = slot_of(info.mem);
-    if (!s.is_array) {
-        throw BackendError{ "$fread memory target is not a memory" };
-    }
-    // Element i's planes at base + i*stride (one slot struct per element); a
-    // never-z memory stores no z word, so pass a null z_base.
-    auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
-    llvm::Value* storage = storage_ptr(s);
-    llvm::Value* mm_base =
-      b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
-    llvm::Value* z_base =
-      s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
-              : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
-    const auto  stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
-    const Type& at     = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
+    const MemTarget t = resolve_mem_target(
+      info.target, info.type, info.base_type, info.slice, info.slice_base, info.slice_end, "$fread");
 
     llvm::Value*   fd     = cast(must_of(fdi), 32, true);
     const auto     i64_of = [&](Index idx) { return cast(must_of(idx), 64, true); };
     llvm::Value*   start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
     llvm::Value*   cnt    = info.has_count ? i64_of(info.count) : b_.getInt64(0);
-    const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (!s.four_state ? 4u : 0u);
+    const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (!t.four_state ? 4u : 0u);
+
+    if (t.assoc) {
+        // An associative array: its elements are created as the bytes arrive.
+        llvm::Value* aflags = b_.getInt32(flags | (t.four_state ? 8u : 0u) | (t.key_signed ? 16u : 0u));
+        if (t.assoc_valid != nullptr) {
+            aflags = b_.CreateOr(aflags, b_.CreateSelect(t.assoc_valid, b_.getInt32(0), b_.getInt32(32)));
+        }
+        llvm::Value* r = b_.CreateCall(
+          fread_assoc_fn(), { fd, t.assoc_handle, t.assoc_ops, b_.getInt32(t.key_width), b_.getInt32(t.stride),
+                              b_.getInt32(t.width), b_.getInt32(t.z_off), t.inner.first,
+                              b_.getInt32(t.inner.second), start, cnt, aflags,
+                              alloc_site_global(loc_text(i), "associative array"),
+                              null_site_global(loc_text(i), NullKind::Class) });
+        finish_mem_load(t, r, "fread");
+        set_value(i, two_val(r));
+        return;
+    }
 
     // Only a start address the memory does not have is reported, so the site is the
     // call and the time is read once, ahead of the runtime call.
     llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
     llvm::Value* r   = b_.CreateCall(
-      fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.elem_count),
-                    b_.getInt32(s.width), b_.getInt32(s.four_state ? 1u : 0u), b_.getInt64(at.left),
-                    b_.getInt64(at.right), start, cnt, b_.getInt32(flags),
+      fread_fn(), { fd, t.mm_base, t.z_base, b_.getInt32(t.stride), b_.getInt32(t.width),
+                    b_.getInt32(t.four_state ? 1u : 0u), t.inner.first, b_.getInt32(t.inner.second), t.left,
+                    t.right, t.lo_word, t.word_count, t.ring_head, t.ring_cap, start, cnt, b_.getInt32(flags),
                     null_site_global(loc_text(i), NullKind::Class), now });
-    // A whole-array write has no per-element edge facts; wake the memory's
-    // Any-edge readers when any byte landed, mirroring the deferred
-    // array-NBA commit (rt_nba_arr_dirty -> service_any_waiters).
-    if (!silent_stores_ && signal_has_waiters(info.mem)) {
-        auto* fn   = b_.GetInsertBlock()->getParent();
-        auto* svc  = llvm::BasicBlock::Create(ctx_, "fread.svc", fn);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "fread.cont", fn);
-        b_.CreateCondBr(b_.CreateICmpNE(r, b_.getInt32(0)), svc, cont);
-        b_.SetInsertPoint(svc);
-        service_any_waiters(info.mem);
-        b_.CreateBr(cont);
-        b_.SetInsertPoint(cont);
-    }
-    if (!silent_stores_) {
-        vcd_touch_array(info.mem);   // bulk write: mark the array for the dump
-    }
+    finish_mem_load(t, r, "fread");
     set_value(i, two_val(r));
 }
 
 // Lower a $readmemh / $readmemb: hand the runtime the filename bytes (spilled
 // to a stack buffer, or read from the rt_string handle for a string-typed
-// filename) plus the destination memory's plane bases (element 0) and geometry. The
-// runtime opens the file and writes element planes straight into `state`. The mm
-// and z words of element i sit at the plane bases + i*stride (one slot struct
-// per element), so the two region bases plus the stride address every element.
+// filename) plus the destination array's plane bases and geometry
+// (resolve_mem_target). The runtime opens the file and writes leaf planes straight
+// into `state`. The mm and z words of leaf i sit at the plane bases + i*stride (one
+// slot struct per leaf), so the two region bases plus the stride address every leaf.
 void Backend::lower_readmem(Index i) {
-    const auto        info  = ir_->extra_data<ReadMemInfo>(ir_->payload(i).op_extra.extra);
-    const Index       fname = ir_->payload(i).op_extra.op;
-    const SignalSlot& s     = slot_of(info.target);
-    if (!s.is_array) {
-        throw BackendError{ "$readmem target is not a memory" };
-    }
+    const auto      info  = ir_->extra_data<ReadMemInfo>(ir_->payload(i).op_extra.extra);
+    const Index     fname = ir_->payload(i).op_extra.op;
+    const MemTarget t = resolve_mem_target(
+      info.target, info.type, info.base_type, info.slice, info.slice_base, info.slice_end, "$readmem");
 
     // A string-object filename (LRM §21.4 allows a string-typed expression) is
     // read straight from its rt_string handle: bytes in natural order, so the
@@ -1235,50 +1659,38 @@ void Backend::lower_readmem(Index i) {
         b_.CreateAlignedStore(must_of(fname), path, llvm::Align(1));
     }
 
-    // The runtime addresses element i's planes at base + i*stride, so hand it
-    // element 0's typed field pointers and the slot struct's alloc size.
-    auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
-    llvm::Value* storage = storage_ptr(s);
-    llvm::Value* mm_base =
-      b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
-    // A never-z memory (always the case for a 2-state element type) stores no
-    // z words; a null z_base tells the runtime to skip the z writes. A
-    // 4-state readmem target is a z seed in compute_may_z, so it always keeps
-    // its z field.
-    llvm::Value* z_base =
-      s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
-              : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
-    const auto stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
-
-    const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
-
     const auto   i64_of = [&](Index idx) { return cast(must_of(idx), 64, true); };
     llvm::Value* start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
     llvm::Value* finish = info.has_finish ? i64_of(info.finish) : b_.getInt64(0);
 
     const uint32_t flags = (info.hex ? 1u : 0u) | (info.has_start ? 2u : 0u) |
-                           (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
-                           (fname_is_str ? 16u : 0u) | (!s.four_state ? 32u : 0u);
+                           (info.has_finish ? 4u : 0u) | (t.four_state ? 8u : 0u) |
+                           (fname_is_str ? 16u : 0u) | (!t.four_state ? 32u : 0u) |
+                           (info.slice != kMemSliceNone ? 64u : 0u);
 
-    llvm::Value* changed = b_.CreateCall(readmem_fn(),
-                                         { path, path_len, mm_base, z_base, b_.getInt32(stride),
-                                           b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
-                                           b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
-    // A whole-memory load has no per-element edge facts: wake the memory's Any-edge
-    // readers when the load changed an element, as lower_fread_mem does.
-    if (!silent_stores_ && signal_has_waiters(info.target)) {
-        auto* fn   = b_.GetInsertBlock()->getParent();
-        auto* svc  = llvm::BasicBlock::Create(ctx_, "readmem.svc", fn);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "readmem.cont", fn);
-        b_.CreateCondBr(b_.CreateICmpNE(changed, b_.getInt32(0)), svc, cont);
-        b_.SetInsertPoint(svc);
-        service_any_waiters(info.target);
-        b_.CreateBr(cont);
-        b_.SetInsertPoint(cont);
+    if (t.assoc) {
+        // An associative array: its elements are created as the numbers arrive.
+        llvm::Value* aflags = b_.getInt32(flags | (t.key_signed ? 128u : 0u));
+        if (t.assoc_valid != nullptr) {
+            aflags = b_.CreateOr(aflags, b_.CreateSelect(t.assoc_valid, b_.getInt32(0), b_.getInt32(256)));
+        }
+        llvm::Value* changed = b_.CreateCall(
+          readmem_assoc_fn(), { path, path_len, t.assoc_handle, t.assoc_ops, b_.getInt32(t.key_width),
+                                b_.getInt32(t.stride), b_.getInt32(t.width), b_.getInt32(t.z_off), t.inner.first,
+                                b_.getInt32(t.inner.second), start, finish, aflags,
+                                alloc_site_global(loc_text(i), "associative array"),
+                                null_site_global(loc_text(i), NullKind::Class) });
+        finish_mem_load(t, changed, "readmem");
+        return;
     }
-    if (!silent_stores_) {
-        vcd_touch_array(info.target);   // bulk write: mark the array for the dump
-    }
+
+    llvm::Value* changed =
+      b_.CreateCall(readmem_fn(),
+                    { path, path_len, t.mm_base, t.z_base, b_.getInt32(t.stride), b_.getInt32(t.width),
+                      t.inner.first, b_.getInt32(t.inner.second), t.left, t.right, t.lo_word, t.word_count,
+                      t.ring_head, t.ring_cap, start, finish, b_.getInt32(flags),
+                      null_site_global(loc_text(i), NullKind::Class) });
+    finish_mem_load(t, changed, "readmem");
 }
 
 // The runtime rt_finishing byte, set once a $finish / $stop has been taken.
@@ -1336,12 +1748,12 @@ void Backend::emit_defer_gen_bump() {
     emit_defer_gen_bump_at(defer_gen_ptr());
 }
 
-void Backend::emit_defer_gen_bump_at(llvm::Value* gen) {
+void Backend::emit_defer_gen_bump_at(llvm::Value* gen, uint64_t delta) {
     if (gen == nullptr) {
         return;
     }
     auto* i64 = b_.getInt64Ty();
-    b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i64, gen), b_.getInt64(1)), gen);
+    b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i64, gen), b_.getInt64(delta)), gen);
 }
 
 // The ptr global holding the report generation of the running thread. Created at the

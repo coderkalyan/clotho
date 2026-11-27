@@ -229,17 +229,44 @@ void Lowerer::finalize_sim_nets() {
             net_resolve_op_[net_u] = net_resolve_tag(kind);
         }
         // "The simulated net shall take the delay specified for the dominating
-        // net": the owner's delay goes when another net dominates it.
+        // net": the owner's delay goes when another net dominates it, and the
+        // dominating net's own takes its place, in the time unit of the module
+        // that declares it (net_delay_of), which is not the owner's.
         if (sim.dominating != sim.owner) {
             net_delay_.erase(net_u);
             if (dominating.getDelay() != nullptr && dominating.getInitializer() == nullptr) {
-                // TODO: the net delay of a collapsed net that dominates its owner.
-                // net_delay_ lowers in the owner's context, which is not this
-                // net's module (its time unit).
-                fail("a net delay on a net that dominates the net its inout port connects to is not supported");
+                net_delay_.emplace(net_u, net_delay_of(dominating));
+                if (resolved_nets_.insert(net_u).second) {
+                    net_resolve_op_[net_u] = net_resolve_tag(kind);
+                }
             }
         }
     }
+}
+
+// The delay of a net declared with one (LRM 28.16) and the multipliers of its time
+// unit. The unit is the declaring module's (LRM 3.14.1), read from the net itself:
+// the delay is lowered once the whole top is walked, and a net that dominates an
+// inout port's net (LRM 23.3.3.7) is declared in an instance other than the owner's.
+Lowerer::NetDelay Lowerer::net_delay_of(const NetSymbol& net) {
+    const Expression* expr = single_delay_expr(*net.getDelay());
+    if (expr == nullptr) {
+        fail(std::string(kNetDelayTriple));
+    }
+    NetDelay d{ expr, 1, 1 };
+    if (tick_fs_ != 0) {
+        if (const auto ts = effective_time_scale(*net.getParentScope(), true)) {
+            d.time_mul       = tsv_to_fs(ts->base) / tick_fs_;
+            d.prec_over_tick = tsv_to_fs(ts->precision) / tick_fs_;
+        }
+    }
+    return d;
+}
+
+ir::Index Lowerer::scaled_net_delay(const NetDelay& d, ir::Builder& b) {
+    const Restore<uint64_t> mul(time_mul_, d.time_mul);
+    const Restore<uint64_t> prec(prec_over_tick_, d.prec_over_tick);
+    return scaled_delay(*d.expr, b);
 }
 
 // Input and output ports against LRM 23.3.3.7.
@@ -982,7 +1009,8 @@ void Lowerer::reject_concat_resolved_driver(const Expression& lhs) {
 // transitions inertially and emit_wire_resolvers re-folds when any slot
 // changes. Delaying the resolved net instead would smear every driver's
 // timing together, so the delay always rides this slot store.
-void Lowerer::store_driver_slot(const Expression& left,
+void Lowerer::store_driver_slot(ir::Signal        net,
+                                const Expression& left,
                                 ir::Signal        slot,
                                 ir::Index         val,
                                 const Expression* delay_expr,
@@ -994,15 +1022,35 @@ void Lowerer::store_driver_slot(const Expression& left,
         return;
     }
     if (!is_whole_net_lvalue(left)) {
-        // A partial driver's slot carries a Z background in the bits it does
-        // not drive, but a slot powers up all-x and a delayed driver does not
-        // write it until `now + d` — so the undriven bits would fold as x for
-        // the whole initial window instead of z. iverilog (`assign #5 v[1:0]`
-        // beside `assign v[3:2]`) shows `v=11xx` there, which needs a Z-seeded
-        // slot power-up value Clotho has no representation for.
-        // TODO: delayed partial driver of a multiply-driven net — seed the
-        // slot's power-up value with the Z background.
-        fail("delay on a partial driver of a multiply-driven (resolved) net is not supported");
+        // A partial driver's slot carries a Z background in the bits it does not
+        // drive, but a slot powers up all-x and a delayed driver does not write it
+        // until `now + d`, so the undriven bits would fold as x for the whole
+        // initial window instead of z (iverilog: `assign #5 v[1:0]` beside
+        // `assign v[3:2]` shows `v=11xx`). The slot powers up as the driver's own
+        // initial output, x, in its bits and z elsewhere, stored by the run-once
+        // initializers before any process runs. build_driver_slot_value has already
+        // refused every region that is not a constant packed one.
+        const ValueSymbol* root = lvalue_root(left);
+        assert(root != nullptr && "a partial driver slot is rooted at a net");
+        const NetRegion reg   = net_region_of(left, *root);
+        const uint32_t  net_w = module_.pool.layout(module_.signal(net).type).width;
+        std::vector<slang::SVInt> parts;
+        if (reg.bit_hi < net_w - 1) {
+            parts.push_back(slang::SVInt::createFillZ(net_w - 1 - reg.bit_hi, false));
+        }
+        parts.push_back(slang::SVInt::createFillX(reg.bit_hi - reg.bit_lo + 1, false));
+        if (reg.bit_lo > 0) {
+            parts.push_back(slang::SVInt::createFillZ(reg.bit_lo, false));
+        }
+        const slang::SVInt seed = parts.size() == 1 ? parts.front() : slang::SVInt::concat(parts);
+        if (!preinit_) {
+            preinit_.emplace(module_);
+        }
+        ir::Builder& pb = *preinit_;
+        pb.binary(ir::Inst::Tag::Store,
+                  pb.signal(slot, l),
+                  pb.constant(svint_to_ref(seed, make_int_type(net_w, true)), l),
+                  l);
     }
     b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);
 }
@@ -1020,7 +1068,7 @@ void Lowerer::emit_resolved_driver(ir::Signal                  net,
                                    const Expression*           delay_expr) {
     const ir::Index  val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
     const ir::Signal slot = driver_slot(net, left, l, strength);
-    store_driver_slot(left, slot, val, delay_expr, b, l);
+    store_driver_slot(net, left, slot, val, delay_expr, b, l);
     add_continuous_process(continuous_events(a), l, b);
 }
 
@@ -1208,13 +1256,13 @@ void Lowerer::emit_wire_resolvers() {
         if (delayed && forced) {
             const NetDelayShadow& sh    = sh_it->second;
             const ir::Index       dst   = b.signal(sh.delayed, l);
-            const ir::Index       ticks = scaled_delay(*nd_it->second, b);
+            const ir::Index       ticks = scaled_net_delay(nd_it->second, b);
             b.binary(ir::Inst::Tag::Store, b.signal(sh.fold, l), acc, l);
             b.store_inertial_delay(dst, acc, ticks, l);
             value = b.unary(ir::Inst::Tag::Load, b.signal(sh.delayed, l), l);
         } else if (delayed) {
             const ir::Index dst   = b.signal(net, l);
-            const ir::Index ticks = scaled_delay(*nd_it->second, b);
+            const ir::Index ticks = scaled_net_delay(nd_it->second, b);
             b.store_inertial_delay(dst, acc, ticks, l);
         }
         if (forced) {
@@ -2035,9 +2083,10 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
         bool               is_net = false;
         const ValueSymbol* sym    = force_target(a.left(), &is_net);
         if (sym == nullptr && !stmt_force_site_.contains(&s)) {
-            fail("force is only supported on a whole variable/net or a constant "
-                 "bit/part-select of a net (LRM 10.6.2); a select of a variable, "
-                 "a concatenation, and an aggregate are not yet supported");
+            fail("force of a bit-select or part-select of a variable is illegal (LRM 10.6.2; "
+                 "10.6.1 for assign); force is only supported on a whole variable/net or a "
+                 "constant bit/part-select of a net; a concatenation and an aggregate are not "
+                 "yet supported");
         }
         if (is_net || stmt_force_site_.contains(&s)) {
             // Net force (LRM 10.6.2), whole or a constant bit/part-select: set the
@@ -2623,15 +2672,53 @@ Lowerer::GateTerm Lowerer::lower_gate_output(const Expression& conn) {
     if (conn.kind != ExpressionKind::Assignment) {
         fail("malformed gate output terminal");
     }
-    const Expression& lhs  = conn.as<AssignmentExpression>().left();
-    const auto        term = gate_static_term(lhs, Fold::Required);
-    if (!term) {
-        // TODO: concatenation / part-select / unpacked-element gate output
-        // lvalues (rare in netlists).
-        fail("unsupported gate output terminal");
+    const Expression& lhs = conn.as<AssignmentExpression>().left();
+    if (const auto term = gate_static_term(lhs, Fold::Required)) {
+        return *term;
     }
+    if (const auto term = gate_packed_term(lhs)) {
+        return *term;
+    }
+    // TODO: concatenation / part-select / unpacked-element gate output
+    // lvalues (rare in netlists).
+    fail("unsupported gate output terminal");
+}
 
-    return *term;
+// A bit of a packed net or variable reached through packed-struct members and
+// constant selects (`s.lo[0]`, `s.f[3:3]`): the region net_region_of gives a
+// multiply driven net's partial driver, when it is one bit of an integral root.
+std::optional<Lowerer::GateTerm> Lowerer::gate_packed_term(const Expression& lhs) {
+    const Expression* base = &lhs;
+    for (;;) {
+        if (base->kind == ExpressionKind::ElementSelect) {
+            base = &base->as<ElementSelectExpression>().value();
+        } else if (base->kind == ExpressionKind::RangeSelect) {
+            base = &base->as<RangeSelectExpression>().value();
+        } else if (base->kind == ExpressionKind::MemberAccess) {
+            base = &base->as<MemberAccessExpression>().value();
+        } else if (base->kind == ExpressionKind::Conversion) {
+            base = &base->as<ConversionExpression>().operand();
+        } else {
+            break;
+        }
+    }
+    if (base->kind != ExpressionKind::NamedValue) {
+        return std::nullopt;
+    }
+    const ValueSymbol& sym = base->as<NamedValueExpression>().symbol;
+    if (sym.kind == SymbolKind::Parameter || !sigmap_.contains(&sym) ||
+        !sym.getType().getCanonicalType().isIntegral()) {
+        return std::nullopt;
+    }
+    const NetRegion reg = net_region_of(lhs, sym);
+    if (reg.elem_lo != 0 || reg.elem_hi != 0 || reg.bit_hi == UINT32_MAX || reg.bit_lo != reg.bit_hi) {
+        return std::nullopt;
+    }
+    const ir::Signal sig = signal_of(sym);
+    if (reg.bit_hi >= module_.pool.layout(module_.signal(sig).type).width) {
+        return std::nullopt;
+    }
+    return GateTerm{ .sig = sig, .bit = reg.bit_lo };
 }
 
 // A pullup (drives constant 1) / pulldown (drives constant 0) source (LRM
@@ -2647,30 +2734,50 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     // the driven net is its left().
     const Expression& out =
       conns[0]->kind == ExpressionKind::Assignment ? conns[0]->as<AssignmentExpression>().left() : *conns[0];
-    // A pull source has no single canonical net for a bit/part-select target.
-    if (out.kind != ExpressionKind::NamedValue && out.kind != ExpressionKind::HierarchicalValue) {
-        // TODO: pullup/pulldown on a bit/part-select or concat target.
-        fail("pullup/pulldown on a non-whole-net target is not supported");
-    }
-    const ValueSymbol& sym = canonical_value_symbol(out.as<ValueExpressionBase>().symbol);
-    if (sym.kind != SymbolKind::Net) {
-        fail("pullup/pulldown target must be a net");
-    }
     // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
     // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
     const auto [ds0, ds1] = gi.getDriveStrength();
     const uint8_t driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
-    emit_pull_driver(sym, up, driven, to_source_loc(gi.location), /*program_driver=*/false);
+    lower_pull_terminal(out, up, driven, to_source_loc(gi.location));
 }
 
-// A permanent driver of all ones (`up`) or all zeros on a whole net at drive
-// strength `level`, lowered as a strength driver slot so it folds against any
-// real driver: a stronger driver wins, else the net holds the pull value. The
-// source a pullup / pulldown primitive (LRM 28.5) is, and an unconnected input
-// port under `unconnected_drive (LRM 22.9) is.
-void Lowerer::emit_pull_driver(const ValueSymbol& sym, bool up, uint8_t level, ir::SourceLoc l, bool program_driver) {
+// The terminal is a net_lvalue (LRM 28.10): a whole net, a bit- or part-select of one,
+// which drives its own region like any partial driver, or a concatenation of those,
+// whose every element is a net the source places its value on ("place a logic value 1
+// on the nets connected in its terminal list"), so each takes the pull.
+void Lowerer::lower_pull_terminal(const Expression& term, bool up, uint8_t level, ir::SourceLoc l) {
+    const Expression& e = unwrap_conversions(term);
+    if (e.kind == ExpressionKind::Concatenation) {
+        for (const Expression* op : e.as<ConcatenationExpression>().operands()) {
+            lower_pull_terminal(*op, up, level, l);
+        }
+        return;
+    }
+    const ValueSymbol* root = lvalue_root(e);
+    if (root == nullptr) {
+        fail("pullup/pulldown target must be a net");
+    }
+    const ValueSymbol& sym = canonical_value_symbol(*root);
+    if (sym.kind != SymbolKind::Net) {
+        fail("pullup/pulldown target must be a net");
+    }
+    emit_pull_driver(sym, is_whole_net_lvalue(e) ? nullptr : &e, up, level, l, /*program_driver=*/false);
+}
+
+// A permanent driver of all ones (`up`) or all zeros on a net, or on the bits of it
+// `part` selects, at drive strength `level`, lowered as a strength driver slot so it
+// folds against any real driver: a stronger driver wins, else the net holds the
+// pull value. The source a pullup / pulldown primitive (LRM 28.5) is, and an
+// unconnected input port under `unconnected_drive (LRM 22.9) is.
+void Lowerer::emit_pull_driver(
+  const ValueSymbol& sym, const Expression* part, bool up, uint8_t level, ir::SourceLoc l, bool program_driver) {
     if (cur_pass_ == Pass::Classify) {
-        record_net_driver_whole(sym);
+        if (part != nullptr) {
+            const ValueSymbol* root = lvalue_root(*part);
+            record_net_driver_region(*root, contribution_port(*part) != nullptr ? kWholeNet : net_region_of(*part, *root));
+        } else {
+            record_net_driver_whole(sym);
+        }
         force_net_resolved(signal_of(sym));
         if (level != 4) {
             weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(sym)));
@@ -2685,12 +2792,22 @@ void Lowerer::emit_pull_driver(const ValueSymbol& sym, bool up, uint8_t level, i
     // (highz0, level1) for a pull up, (level0, highz1) for a pull down.
     const uint16_t   strength = up ? static_cast<uint16_t>(level) : static_cast<uint16_t>(level << 8);
     ir::Builder      b(module_);
-    // A pull on a net the instance reaches through an inout port drives it through
-    // a contribution, like any other driver of such a net (contribute).
-    const ir::Signal slot = driver_slot_via(contribution_port(sym), net, l, strength, program_driver);
-    const ir::Index  dst  = b.signal(slot, l);
-    const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
-    b.binary(ir::Inst::Tag::Store, dst, val, l);
+    ir::Signal       slot;
+    ir::Index        val;
+    if (part == nullptr) {
+        // A pull on a net the instance reaches through an inout port drives it through
+        // a contribution, like any other driver of such a net (contribute).
+        slot = driver_slot_via(contribution_port(sym), net, l, strength, program_driver);
+        val  = b.constant(def_constant_ref(w, up), l);
+    } else {
+        // The pull fills the bits it selects, as a pull on a whole vector fills all
+        // of it. build_driver_slot_value refuses a region it cannot slot.
+        const NetRegion reg  = net_region_of(*part, *lvalue_root(*part));
+        const uint32_t  fill = reg.bit_hi == UINT32_MAX ? 1 : reg.bit_hi - reg.bit_lo + 1;
+        val                  = build_driver_slot_value(net, *part, b.constant(def_constant_ref(fill, up), l), b, l);
+        slot                 = driver_slot(net, *part, l, strength, program_driver);
+    }
+    b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
     // A permanent source: self-starting, never re-evaluated (empty sensitivity).
     add_continuous_process({}, l, b, program_driver);
 }
@@ -2714,7 +2831,7 @@ void Lowerer::lower_unconnected_drive(const PortSymbol& p, bool up, bool program
         fail("`unconnected_drive on an unconnected input port that is not a whole packed net is not "
              "supported");
     }
-    emit_pull_driver(sym, up, /*level=*/2, to_source_loc(p.location), program_driver);
+    emit_pull_driver(sym, nullptr, up, /*level=*/2, to_source_loc(p.location), program_driver);
 }
 
 // A cmos / rcmos switch (LRM 28.9). The LRM defines it purely by
@@ -3303,6 +3420,10 @@ void Lowerer::emit_gate_as_process(GateTerm                   output,
                                    ir::Builder&               b,
                                    ir::SourceLoc              l,
                                    const Expression*          delay_expr) {
+    // A 2-state member of a 4-state packed net converts the gate's value to 2-state
+    // (gate_output_value), but the bit it stores to is a bit of the 4-state net.
+    const bool four = module_.pool.layout(module_.signal(output.sig).type).domain == ir::Domain::Four;
+    val             = b.convert(val, make_int_type(1, four), false, l);
     const ir::Index lv = gate_bit_lvalue(output.sig, output.bit, b, l);
     if (delay_expr != nullptr) {
         b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);
@@ -3332,7 +3453,7 @@ void Lowerer::emit_gate_resolved_driver(const Expression&          left,
                                         const Expression*          delay_expr) {
     const ir::Index  slot_val = build_driver_slot_value(net, left, val, b, l);
     const ir::Signal slot     = driver_slot(net, left, l, strength);
-    store_driver_slot(left, slot, slot_val, delay_expr, b, l);
+    store_driver_slot(net, left, slot, slot_val, delay_expr, b, l);
     add_continuous_process(std::move(wait_events), l, b);
 }
 

@@ -124,8 +124,10 @@ extern "C" void rt_observed_flush() {
     // warning interleaves.
     std::fflush(stdout);
     for (const ObservedCaseViol& r : g_observed_case) {
-        // A report whose process has run since (a flush point, LRM 16.4.2) is dropped.
-        if (r.gen != nullptr && *r.gen != r.gen_val) {
+        // A report whose process has run since (a flush point, LRM 12.4.2.1 / 16.4.2) is dropped.
+        // Only the low half of the counter counts resumes and activation starts; the high half
+        // counts `disable`s, which flush a deferred assertion's report (16.4.4) but not this one.
+        if (r.gen != nullptr && static_cast<uint32_t>(*r.gen ^ r.gen_val) != 0) {
             continue;
         }
         std::string line = r.banner;
@@ -589,6 +591,54 @@ extern "C" void rt_fread_range_report(const rt_null_site* site, int64_t start, i
     fmt::print(stderr, body, " nothing was read and the result is 0, at {}", when);
     fmt::print(stderr, "\n");
     if (hits == bounds_report_cap) {
+        fmt::print(stderr, tag, "  note:");
+        fmt::print(stderr, body, " further reports from this call are suppressed");
+        fmt::print(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+
+// ---- $readmemh / $readmemb diagnostics (LRM 21.4) ----
+
+void rt_internal::mem_load_report(const rt_null_site* site, bool error, const std::string& headline,
+                                  const std::string& note) {
+    uint32_t* hits = nullptr;
+    if (site != nullptr) {
+        hits = &g_bounds_hits[reinterpret_cast<uint64_t>(site) * 2];
+        if (*hits >= bounds_report_cap) {
+            return;
+        }
+        ++*hits;
+    }
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::terminal_color colour = error ? fmt::terminal_color::red : fmt::terminal_color::yellow;
+    const fmt::text_style     label  = styled(fmt::emphasis::bold | fmt::fg(colour));
+    const fmt::text_style     head   = styled(fmt::emphasis::bold);
+    const fmt::text_style     loc    = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style     tag    = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style     body   = styled(fmt::emphasis::faint);
+    const fmt::text_style     caret  = styled(fmt::emphasis::bold | fmt::fg(colour));
+
+    std::string when;
+    append_finish_time(when, rt_diag_now());
+    fmt::print(stderr, label, "{}", error ? "error:" : "warning:");
+    fmt::print(stderr, head, " {}", headline);
+    fmt::print(stderr, "\n");
+    if (site != nullptr) {
+        fmt::print(stderr, loc, "{}", site->where);
+        fmt::print(stderr, "\n");
+        if (site->line != nullptr && site->line[0] != '\0') {
+            print_snippet(snippet_text(site->line), site->line_no,
+                          { SnippetMark{ site->column, mark_width(site->column, site->end_column), '^' } }, loc,
+                          caret);
+        }
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " {}, at {}", note, when);
+    fmt::print(stderr, "\n");
+    if (hits != nullptr && *hits == bounds_report_cap) {
         fmt::print(stderr, tag, "  note:");
         fmt::print(stderr, body, " further reports from this call are suppressed");
         fmt::print(stderr, "\n");

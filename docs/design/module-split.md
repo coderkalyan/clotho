@@ -21,7 +21,7 @@ hash of the unit's body when several units share the name.
 - `M_unit`: the groups of the unit's instances, lowered once per family of
   instances that lower alike and run with the instance's record; the functions
   and tasks of the unit, once per family; the entry of a schedule group of one
-  row (it takes the address of its process's wake pair, a field of the record);
+  row (it takes the address of its process's wake slot and the instance's record);
   the commit function of each NBA block those bodies register (`void(desc)`,
   `desc` being the block's `{ commit fn, writer's record, next }` entry in root's
   `clotho.nba_blocks`).

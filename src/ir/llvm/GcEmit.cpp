@@ -862,35 +862,39 @@ void Backend::emit_gc_root_tables() {
         const int64_t off = dl.getIndexedOffsetInType(owner, idx);
         assert(off >= 0 && "a signal cannot sit before its own state buffer");
         signal_handle_offsets(s, static_cast<uint64_t>(off), by_region[region]);
+        const size_t first_container = cont_by_region[region].size();
         signal_gc_containers(s, static_cast<uint64_t>(off), cont_by_region[region]);
+        for (size_t k = first_container; k < cont_by_region[region].size(); ++k) {
+            GcContainer& c = cont_by_region[region][k];
+            assert(s.cflag_base != SignalSlot::no_flags && "a signal that holds a container has flag bytes");
+            c.flag = s.cflag_base + static_cast<uint32_t>((c.offset - static_cast<uint64_t>(off)) >> RT_GC_CFLAG_SHIFT);
+        }
     }
     auto*                        ptr     = raw_ptr_ty();
     uint32_t                     emitted = 0;
     std::vector<llvm::Constant*> root_rows;
     for (size_t r = 0; r < by_region.size(); ++r) {
-        if (by_region[r].empty()) {
-            continue; // a region with no class handle needs no table
+        const uint32_t cards = r == root_region ? root_cards_field_ : anchors_[r].cards_field;
+        const uint32_t flags = r == root_region ? root_flags_field_ : anchors_[r].flags_field;
+        if (cards == Anchor::no_cards) {
+            assert(by_region[r].empty() && cont_by_region[r].empty() &&
+                   "a region with a handle slot or container has card bytes");
+            continue; // a region that cannot hold a class handle needs no table
         }
+        assert((flags != Anchor::no_flags) == !cont_by_region[r].empty() &&
+               "a region has flag bytes exactly when it holds a container of handles");
         llvm::Constant* base =
           r == root_region ? sym(state_global_) : sym(anchors_[r].state_gv);
-        root_rows.push_back(gc_roots_global(base, by_region[r], emitted++));
+        llvm::StructType* owner = r == root_region ? state_ty_ : anchors_[r].ty;
+        std::sort(by_region[r].begin(), by_region[r].end());
+        std::sort(cont_by_region[r].begin(), cont_by_region[r].end(), [](const GcContainer& a, const GcContainer& b) {
+            return a.offset < b.offset;
+        });
+        root_rows.push_back(gc_roots_global(base, by_region[r], cont_by_region[r], emitted++, owner, cards, flags));
     }
     assert(emitted <= by_region.size() && "one table per region at most");
     emit_rows(root_rows, ptr, "clotho.gcroots.regions", [&](llvm::Value* row) {
         b_.CreateCall(gc_roots_add_fn(), { b_.CreateLoad(ptr, row) });
-    });
-    uint32_t                     cont_emitted = 0;
-    std::vector<llvm::Constant*> cont_rows;
-    for (size_t r = 0; r < cont_by_region.size(); ++r) {
-        if (cont_by_region[r].empty()) {
-            continue; // a region with no handle-bearing container needs no table
-        }
-        llvm::Constant* base =
-          r == root_region ? sym(state_global_) : sym(anchors_[r].state_gv);
-        cont_rows.push_back(gc_containers_global(base, cont_by_region[r], cont_emitted++));
-    }
-    emit_rows(cont_rows, ptr, "clotho.gccontainers.regions", [&](llvm::Value* row) {
-        b_.CreateCall(gc_containers_add_fn(), { b_.CreateLoad(ptr, row) });
     });
     // NBA shadows that can stage a handle, one range per region that has any.
     std::vector<bool> shadow_roots(anchors_.size() + 1, false);
@@ -915,7 +919,6 @@ void Backend::emit_gc_root_tables() {
                         b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(range_ty, row, 1)) });
     });
     emit_gc_nba_queues();
-    assert(cont_emitted <= cont_by_region.size() && "one container table per region at most");
 }
 
 // The NBA staging queues (the shared rt_nba_arr_* buffers) whose records can hold a class
@@ -1016,44 +1019,62 @@ void Backend::signal_gc_containers(const SignalSlot& s, uint64_t base, std::vect
     }
 }
 
-// `clotho.gcroots.<n>`: an rt_gc_roots constant plus its [N x i32] offset array.
-llvm::Constant* Backend::gc_roots_global(llvm::Constant* base, const std::vector<uint32_t>& offsets, uint32_t index) {
-    assert(!offsets.empty() && "an empty root table would register nothing");
-    const std::string nm  = "clotho.gcroots." + std::to_string(index);
-    llvm::Constant*   arr = gc_offsets_global(offsets, nm + ".offsets");
-    auto*             init = llvm::ConstantStruct::get(
-      gc_roots_ty(),
-      { base, b_.getInt32(static_cast<uint32_t>(offsets.size())), b_.getInt32(0), arr });
-    return new llvm::GlobalVariable(env_->llmod, gc_roots_ty(), /*isConstant=*/true,
-                                    llvm::GlobalValue::PrivateLinkage, init, nm);
-}
-
-// `clotho.gccontainers.<n>`: an rt_gc_container_table constant plus its
-// [N x rt_gc_container] entry array. `ops` is each container's OWN descriptor, so
-// its kind matches the entry's kind (gc_container_kind feeds both).
-llvm::Constant* Backend::gc_containers_global(llvm::Constant*                 base,
-                                              const std::vector<GcContainer>& entries,
-                                              uint32_t                        index) {
-    assert(!entries.empty() && "an empty container table would register nothing");
-    const std::string            nm = "clotho.gccontainers." + std::to_string(index);
-    std::vector<llvm::Constant*> rows;
-    rows.reserve(entries.size());
-    for (const GcContainer& c : entries) {
-        rows.push_back(llvm::ConstantStruct::get(
-          gc_container_ty(), { b_.getInt64(c.offset), b_.getInt32(gc_container_kind(c.type)),
-                               b_.getInt32(0), elem_ops_for(c.type) }));
+// `clotho.gcroots.<n>`: an rt_gc_roots constant plus its [N x i32] offset array and its
+// [M x rt_gc_container] entry array. `owner` is the region's state struct, `cards_field` the field
+// of it that holds the card bytes and `flags_field` the one that holds the container flag bytes
+// after them, if any. Each entry's `ops` is the container's OWN descriptor, so its kind matches
+// the entry's kind (gc_container_kind feeds both).
+llvm::Constant* Backend::gc_roots_global(llvm::Constant*                 base,
+                                         const std::vector<uint32_t>&    offsets,
+                                         const std::vector<GcContainer>& containers,
+                                         uint32_t                        index,
+                                         llvm::StructType*               owner,
+                                         uint32_t                        cards_field,
+                                         uint32_t                        flags_field) {
+    assert(std::is_sorted(offsets.begin(), offsets.end()) && "a root table's offsets ascend");
+    const llvm::DataLayout&   dl    = env_->llmod.getDataLayout();
+    const llvm::StructLayout* sl    = dl.getStructLayout(owner);
+    const std::string         nm    = "clotho.gcroots." + std::to_string(index);
+    llvm::Constant*           arr   = gc_offsets_global(offsets, nm + ".offsets");
+    const uint64_t            cards = sl->getElementOffset(cards_field);
+    uint64_t                  bytes = cards + dl.getTypeAllocSize(owner->getElementType(cards_field));
+    uint64_t                  flags = 0;
+    if (flags_field != Anchor::no_flags) {
+        flags = sl->getElementOffset(flags_field);
+        assert(flags == bytes && "the flag bytes follow the card bytes");
+        bytes = flags + dl.getTypeAllocSize(owner->getElementType(flags_field));
     }
-    assert(rows.size() == entries.size() && "every container became one entry");
-    auto* arr_ty = llvm::ArrayType::get(gc_container_ty(), rows.size());
-    auto* arr    = new llvm::GlobalVariable(env_->llmod, arr_ty, /*isConstant=*/true,
-                                            llvm::GlobalValue::PrivateLinkage,
-                                            llvm::ConstantArray::get(arr_ty, rows),
-                                            nm + ".entries");
-    auto* init   = llvm::ConstantStruct::get(
-      gc_container_table_ty(),
-      { base, b_.getInt32(static_cast<uint32_t>(rows.size())), b_.getInt32(0), arr });
-    return new llvm::GlobalVariable(env_->llmod, gc_container_table_ty(), /*isConstant=*/true,
-                                    llvm::GlobalValue::PrivateLinkage, init, nm);
+    llvm::Constant* entries = llvm::Constant::getNullValue(raw_ptr_ty());
+    if (!containers.empty()) {
+        std::vector<llvm::Constant*> rows;
+        rows.reserve(containers.size());
+        for (const GcContainer& c : containers) {
+            rows.push_back(llvm::ConstantStruct::get(gc_container_ty(),
+                                                     { b_.getInt64(c.offset),
+                                                       b_.getInt32(gc_container_kind(c.type)),
+                                                       b_.getInt32(c.flag),
+                                                       elem_ops_for(c.type) }));
+        }
+        auto* arr_ty = llvm::ArrayType::get(gc_container_ty(), rows.size());
+        entries      = new llvm::GlobalVariable(env_->llmod,
+                                                arr_ty,
+                                                /*isConstant=*/true,
+                                                llvm::GlobalValue::PrivateLinkage,
+                                                llvm::ConstantArray::get(arr_ty, rows),
+                                                nm + ".containers");
+    }
+    auto* init = llvm::ConstantStruct::get(gc_roots_ty(),
+                                           { base,
+                                             b_.getInt32(static_cast<uint32_t>(offsets.size())),
+                                             b_.getInt32(static_cast<uint32_t>(bytes)),
+                                             arr,
+                                             b_.getInt32(static_cast<uint32_t>(cards)),
+                                             b_.getInt32(static_cast<uint32_t>(flags)),
+                                             b_.getInt32(static_cast<uint32_t>(containers.size())),
+                                             b_.getInt32(0),
+                                             entries });
+    return new llvm::GlobalVariable(
+      env_->llmod, gc_roots_ty(), /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init, nm);
 }
 
 // `clotho.gc.config`: the rt_gc_config rt_gc_init reads. Every field is an
@@ -1514,12 +1535,31 @@ void Backend::emit_gc_barrier(llvm::Value* owner) {
     b_.SetInsertPoint(done);
 }
 
-// The barrier for a store through `lv`, or nothing when `lv` does not name a place
-// inside a class object. THE call site for every instrumented store: the owner
-// test lives here, once, rather than repeated at each of the eleven store sites,
-// so a new store site is instrumented by routing through this function and cannot
-// forget it.
-void Backend::emit_gc_barrier_for(const LValueInfo& lv) {
+// The barrier for a store through `lv`, or nothing when `lv` does not name a place inside a
+// class object, reached through a `ref` formal, or inside design state that can hold a class
+// handle. THE call site for every instrumented store: the owner test lives here, once, rather
+// than repeated at each store site, so a new store site is instrumented by routing through this
+// function and cannot forget it. `bytes` is how much of the place the store writes.
+//
+// An object owner needs nothing of the place's validity, but the other two compute an address
+// from the place, so they are emitted where it is valid.
+void Backend::emit_gc_barrier_for(const Guarded& lv, uint64_t bytes, GcWrite what) {
+    assert((lv.gc_owner == nullptr || lv.gc_ref_slot == nullptr) &&
+           "a place is rooted at an object or at a ref formal, not both");
+    assert((lv.gc_state_base == nullptr || (lv.gc_owner == nullptr && lv.gc_ref_slot == nullptr)) &&
+           "a place is in design state or in an object or behind a ref, never two of them");
+    if (lv.gc_ref_slot != nullptr) {
+        assert(!lv.is_string && "a string place never carries a GC owner");
+        lv.when_valid(b_, [&](const LValue& v) {
+            emit_gc_note_ref_store(v.gc_ref_chain != nullptr ? v.gc_ref_slot : slot_ptr(v), v.gc_ref_chain, bytes);
+        });
+        return;
+    }
+    if (lv.gc_state_base != nullptr) {
+        assert(!lv.is_string && "a string place never carries a GC owner");
+        lv.when_valid(b_, [&](const LValue& v) { emit_gc_state_barrier(v, bytes, what); });
+        return;
+    }
     if (lv.gc_owner == nullptr) {
         return;
     }
@@ -1533,68 +1573,106 @@ void Backend::emit_gc_barrier_for(const LValueInfo& lv) {
     emit_gc_barrier(lv.gc_owner);
 }
 
-// Record the OUTER container on an element lvalue that has just re-based into that
-// container's malloc'd payload. Only the outermost is kept -- `obj.qq[1][2]` records
-// `obj.qq`, whose handle is in the body -- because that is the only address on the
-// path that a ring growth cannot relocate, and the collector's container walk
-// reaches every nested element from it (visit_elem_image pushes a nested container
-// and drain_containers runs both worklists to a fixpoint, Gc.cpp:1266-1271, :1381).
-// `parent` is the container's own lvalue, so an already-payload-rebased parent hands
-// its record down and this only records where the OUTERMOST one is still unknown.
-// Inheriting and recording in one call is deliberate: split across two statements at
-// five element sites, one of them would eventually be written without the other.
-//
-// Skipped when there is no owner, which also skips the case that needs nothing: a
-// frame-local container is already a registered root for its activation, so its
-// elements are reached without any of this.
-void Backend::note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, llvm::Value* handle, Ref container_type) {
-    assert(handle != nullptr && "a container root needs its handle address");
-    assert(container_type != Ref::Invalid && "a container root names its type");
-    if (lv.gc_owner == nullptr) {
-        return;
-    }
-    lv.gc_container_root = parent.gc_container_root;
-    lv.gc_container_type = parent.gc_container_type;
-    if (lv.gc_container_root != nullptr) {
-        return; // an outer container already stands in for this whole path
-    }
-    lv.gc_container_root = handle;
-    lv.gc_container_type = container_type;
+void Backend::emit_gc_container_barrier(const Guarded& lv) {
+    emit_gc_barrier_for(lv, sizeof(void*), GcWrite::Container);
 }
 
-// A `ref` actual aiming INSIDE a container owned by a class object hands the callee
-// a payload-interior pointer. rt_gc_find_object cannot resolve one -- it is
-// indistinguishable from an integer -- so the conservative frame scan cannot reach
-// the owner and relog_conservative_roots cannot carry it across the suspend that
-// precedes the callee's store. Registering the outer container STANDS IN for that
-// resolution, and therefore has to do both halves of what the frame scan does:
-//
-//   reach the elements -- push_container_roots walks a registered container in full
-//     at every collection of either kind, so the handle the callee stores is found
-//     from the root path whatever the owner's age and whether or not it is logged;
-//   keep the owner alive -- rt_gc_container_add resolves the owner once at
-//     registration and push_container_roots marks it before reading the payload, so
-//     an unpaired registration can only LEAK its owner and can never name memory a
-//     dead object's finalizer freed.
-//
-// That makes the nested case behave exactly like a direct property container, where
-// the frame scan already pins and marks the owner off a body-interior pointer.
-//
-// Task AND function calls. A task can suspend across a collection, and since an
-// allocation that has outrun its budget collects (design §6.1) a function can too: the
-// callee may allocate between the call-site barrier and its store, so the barrier alone
-// no longer covers it.
-llvm::Value* Backend::emit_gc_ref_container_add(const LValueInfo& lv) {
-    if (lv.gc_container_root == nullptr) {
-        return nullptr;
+uint64_t Backend::gc_store_bytes(const LValueInfo& lv) const {
+    if (lv.gc_state_base == nullptr || !lv.is_signal || lv.elem_idx != nullptr || !lv.agg_path.empty()) {
+        return sizeof(void*);
     }
-    assert(lv.gc_owner != nullptr && "a container root is recorded only inside an object");
-    assert(lv.gc_container_type != Ref::Invalid && "a registered container names its type");
-    b_.CreateCall(gc_container_add_fn(),
-                  { lv.gc_container_root,
-                    b_.getInt32(gc_container_kind(lv.gc_container_type)),
-                    elem_ops_for(lv.gc_container_type) });
-    return lv.gc_container_root;
+    return std::max<uint64_t>(env_->llmod.getDataLayout().getTypeAllocSize(slot_of(lv.gc_state_sig).storage_ty),
+                              sizeof(void*));
+}
+
+// What an element, a member or a resolved entry of `from` inherits for the write barrier:
+// the object it is inside, the `ref` formal it is reached through, or the state signal.
+void Backend::carry_gc_place(LValueInfo& to, const LValueInfo& from) {
+    to.gc_owner      = from.gc_owner;
+    to.gc_ref_slot   = from.gc_ref_slot;
+    to.gc_ref_chain  = from.gc_ref_chain;
+    to.gc_state_base = from.gc_state_base;
+    to.gc_state_sig  = from.gc_state_sig;
+}
+
+// The barrier of a store through an address the code cannot attribute to an owner
+// statically: the aliased place of a `ref` formal, or the actual of an output formal.
+// The runtime finds what holds `slot` -- the object, or the one that owns the container
+// `chain` names when the place is an element of one, or the state region -- and logs it
+// (rt_gc_note_ref_store). A call and not an inlined test: what holds the place is not known
+// without finding it, and a handle stored through a `ref` is rare enough that the lookup is
+// not a cost worth a second code path. Emitted at each store and not once at the call, because
+// a task can suspend across a collection between two stores.
+void Backend::emit_gc_note_ref_store(llvm::Value* slot, llvm::Value* chain, uint64_t bytes) {
+    assert(slot != nullptr && "a ref store names the place it aliases");
+    auto* null = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+    auto* call = b_.CreateCall(gc_note_ref_store_fn(), { slot, chain != nullptr ? chain : null, b_.getInt64(bytes) });
+    call->addFnAttr(llvm::Attribute::Cold);
+}
+
+// The barrier of a store of `bytes` into design state (docs/design/garbage-collection.md §7):
+// test the byte that says it was logged and call rt_gc_note_state_store only when it is clear. The
+// byte is found from the signal's own storage, `v.gc_state_base`, and constants of the signal's
+// definition -- where the signal and the card and flag bytes sit in its state struct -- so the code
+// is the same for every instance of a unit.
+//
+// A slot is logged by the card byte of the place. A container -- the place is its handle (`what`),
+// or lies in its payload, which it does when the place has an epoch chain, whose first pointer is
+// the epoch word of the outermost container -- by the flag byte of the word the address is in.
+// The container's own flag, and not its card, because what a logged container costs a collection
+// is its whole payload, whatever slots lie beside its handle.
+//
+// One load, a compare and a branch that is not taken. A store of more than a word is one call.
+void Backend::emit_gc_state_barrier(const LValue& v, uint64_t bytes, GcWrite what) {
+    assert(v.gc_state_base != nullptr && "a state barrier needs the signal's storage");
+    const SignalSlot&         s     = slot_of(v.gc_state_sig);
+    const llvm::DataLayout&   dl    = env_->llmod.getDataLayout();
+    llvm::StructType* const   owner = s.anchor == SignalSlot::no_anchor ? state_ty_ : anchors_[s.anchor].ty;
+    std::vector<llvm::Value*> path{ b_.getInt32(0) };
+    for (const uint32_t f : s.path) {
+        path.push_back(b_.getInt32(f));
+    }
+    const bool     in_payload = !v.epoch_chain.empty();
+    const bool     container  = in_payload || what == GcWrite::Container;
+    const int64_t  sig_off    = dl.getIndexedOffsetInType(owner, path);
+    auto*          i64        = b_.getInt64Ty();
+    llvm::Value*   addr       = in_payload ? v.epoch_chain.front() : slot_ptr(v);
+    const uint64_t span       = in_payload ? 1 : bytes;
+    llvm::Value*   base_int   = b_.CreatePtrToInt(v.gc_state_base, i64);
+    llvm::Value*   addr_int   = b_.CreatePtrToInt(addr, i64);
+
+    llvm::Function* fn    = b_.GetInsertBlock()->getParent();
+    auto*           cold  = llvm::BasicBlock::Create(ctx_, "gc.state.log", fn);
+    auto*           done  = llvm::BasicBlock::Create(ctx_, "gc.state.logged", fn);
+    llvm::Value*    clean = nullptr;
+    if (span > sizeof(void*)) {
+        clean = b_.getTrue(); // more than a word (an aggregate copy): the runtime logs each card and container
+    } else if (container) {
+        // A word is aligned, and a container's flag bytes are all set together, so the byte of
+        // the word the address is in says whether the container is logged.
+        const int64_t flags_off =
+          static_cast<int64_t>(dl.getStructLayout(owner)->getElementOffset(gc_flags_field(s))) + s.cflag_base;
+        llvm::Value* rel = b_.CreateSub(addr_int, base_int);
+        llvm::Value* idx = b_.CreateLShr(rel, b_.getInt64(RT_GC_CFLAG_SHIFT));
+        llvm::Value* off = b_.CreateAdd(idx, b_.getInt64(static_cast<uint64_t>(flags_off - sig_off)));
+        llvm::Value* ptr = b_.CreateGEP(b_.getInt8Ty(), v.gc_state_base, off);
+        clean            = b_.CreateICmpEQ(b_.CreateLoad(b_.getInt8Ty(), ptr, "gc.flag"), b_.getInt8(0));
+    } else {
+        // A word is aligned and so lies in one card, and a header is found by any byte of it.
+        const int64_t cards_off = static_cast<int64_t>(dl.getStructLayout(owner)->getElementOffset(gc_cards_field(s)));
+        llvm::Value* rel = b_.CreateAdd(b_.CreateSub(addr_int, base_int), b_.getInt64(static_cast<uint64_t>(sig_off)));
+        llvm::Value* idx = b_.CreateLShr(rel, b_.getInt64(RT_GC_CARD_SHIFT));
+        llvm::Value* off = b_.CreateAdd(idx, b_.getInt64(static_cast<uint64_t>(cards_off - sig_off)));
+        llvm::Value* ptr = b_.CreateGEP(b_.getInt8Ty(), v.gc_state_base, off);
+        clean            = b_.CreateICmpEQ(b_.CreateLoad(b_.getInt8Ty(), ptr, "gc.card"), b_.getInt8(0));
+    }
+    llvm::BranchInst* br = b_.CreateCondBr(clean, cold, done);
+    br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+    b_.SetInsertPoint(cold);
+    auto* call = b_.CreateCall(gc_note_state_store_fn(), { addr, b_.getInt64(span) });
+    call->addFnAttr(llvm::Attribute::Cold);
+    b_.CreateBr(done);
+    b_.SetInsertPoint(done);
 }
 
 } // namespace clotho::ir::backend

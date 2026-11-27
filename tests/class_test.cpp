@@ -114,10 +114,14 @@ TEST_CASE("null and handle identity") {
     CHECK(run_capture(src) == "1 1 1 0\n");
 }
 
-// The object a method is called on is read by the call, so an always_comb block
-// (LRM 9.2.2.2.1) and a wait (9.4.3) that call a method are sensitive to the handle
-// variable: pointing it at another object runs them again.
-TEST_CASE("a method call is sensitive to the handle it is called on") {
+// The object a method is called on is read by the call, so a wait (9.4.3) and an `@*`
+// (9.4.2.2: every variable the statement reads) that call a method are sensitive to the
+// handle variable: pointing it at another object runs them again. An always_comb is not:
+// "References to class objects and method calls of class objects do not add anything to
+// the sensitivity list of an always_comb" (9.2.2.2.1). iverilog 13 runs the always_comb
+// again (x=6, as does the pre-change binary), against the clause; the expectation is the
+// clause's, as decided.
+TEST_CASE("a method call is sensitive to the handle it is called on in @* and wait, not in an always_comb") {
     constexpr std::string_view src = R"(
         module m;
             class C;
@@ -126,19 +130,62 @@ TEST_CASE("a method call is sensitive to the handle it is called on") {
                 function int get(); return v; endfunction
             endclass
             C a = new(1), b = new(5), c = a;
-            int x;
+            int x, y;
             always_comb x = c.get() + 1;
+            always @* y = c.get() + 1;
             initial begin
                 fork
                     begin wait (c.get() == 5); $display("wait %0t", $time); end
                 join_none
-                #1 $display("x=%0d", x);
+                #1 $display("x=%0d y=%0d", x, y);
                 c = b;
-                #1 $display("x=%0d", x);
+                #1 $display("x=%0d y=%0d", x, y);
             end
         endmodule
     )";
-    CHECK(run_capture(src) == "x=2\nwait 1\nx=6\n");
+    CHECK(run_capture(src) == "x=2 y=0\nwait 1\nx=2 y=6\n");
+}
+
+// 9.2.2.2.1 again: an always_comb or always_latch takes from a method call of a class
+// object only the contributions of its argument expressions. Not the handle it is called
+// on, and not what the method's body reads (g): they are no variable the block reads, they
+// are inside the call. `k` is an argument and does wake the block, which then calls the
+// method on the object `c` names by then. iverilog 13 runs the blocks again on `c = b`
+// (6 2 5 6) and on `g = 5` (6 6 5 6), against the clause; the expectation is the clause's,
+// as decided.
+TEST_CASE("an always_comb takes only the arguments of a method call of a class object") {
+    constexpr std::string_view src = R"(
+        module m;
+            int g = 1, k = 0;
+            class C;
+                int v;
+                function new(int v); this.v = v; endfunction
+                function int get(); return v; endfunction
+                function int get_g(); return g; endfunction
+                function int add(int n); return v + n; endfunction
+            endclass
+            C a = new(1), b = new(5), c = a;
+            int x, y, z, w;
+            bit en = 1;
+            always_comb x = c.get() + 1;
+            always_comb y = c.get_g() + 1;
+            always_comb z = c.add(k);
+            always_latch if (en) w = c.get() + 1;
+            initial begin
+                #1 $display("%0d %0d %0d %0d", x, y, z, w);
+                c = b;
+                #1 $display("%0d %0d %0d %0d", x, y, z, w);
+                g = 5;
+                #1 $display("%0d %0d %0d %0d", x, y, z, w);
+                k = 10;
+                #1 $display("%0d %0d %0d %0d", x, y, z, w);
+                en = 0;
+                #1 en = 1;
+                #1 $display("%0d %0d %0d %0d", x, y, z, w);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 2 1 2\n2 2 1 2\n2 2 1 2\n2 2 15 2\n2 2 15 6\n");
 }
 
 // Self-referential property (a handle to the enclosing class) + nested member path

@@ -24,9 +24,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const auto first_block = static_cast<uint32_t>(block_commits_.size());
 
     // A group of an instance addresses everything of that instance through its
-    // record. A coroutine group's flag is its own wake word in the instance's
-    // record (ctx_sched_base plus the def-local ordinal, materialize_group_ctx)
-    // -- while a thunk row touches no flag but the wake word it is handed. An
+    // record. A coroutine group's flag is its own wake word, in the slot at the
+    // record's wake base plus the def-local ordinal (materialize_group_ctx) --
+    // while a thunk row touches no flag but the wake word it is handed. An
     // unscoped group has no record and keeps the folded constant.
     const uint32_t g_ = group_of_[proc_index];
     own_anchor_       = group_unit_anchor_[g_];
@@ -110,18 +110,24 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         runs_once_ = false;
     };
     // A trigger mask the code being lowered tests the wake word against. An
-    // instance's own code (own_anchor_ set) loads it from its record, where
-    // main stored it at startup with the design-global colours, so no colour
-    // reaches unit code; code that addresses absolutely (the dispatcher of a
-    // group spanning instances, an unscoped group) bakes it, which is root
-    // glue. `field` is the record's array (ctx_mmask_base / ctx_gmask_base)
-    // and `m` the process whose def-local ordinal indexes it.
-    const auto mask_value = [&](uint64_t baked, uint32_t Anchor::*field, uint32_t m) -> llvm::Value* {
+    // instance's own code (own_anchor_ set) loads it from clotho.wake.mask, at
+    // the wake slot its record names, where the compile put the design-global
+    // colours, so no colour reaches unit code; code that addresses absolutely
+    // (the dispatcher of a group spanning instances, an unscoped group) bakes it,
+    // which is root glue. `field` is 0 for a process's own bits and 1 for its
+    // group's, and `m` the process whose slot holds them. A thunk row finds its
+    // instance's masks once, at its entry (`mask_row`), since it tests one per
+    // member on every activation.
+    llvm::Value* mask_row   = nullptr;
+    const auto   mask_value = [&](uint64_t baked, uint32_t field, uint32_t m) -> llvm::Value* {
         if (own_anchor_ == SignalSlot::no_anchor) {
             return b_.getInt64(baked);
         }
-        Anchor& a = anchors_[own_anchor_];
-        return ctx_field(a, a.*field + proc_sched_ord_[m], b_.getInt64Ty());
+        llvm::Value* const at =
+          mask_row != nullptr && proc_sched_anchor_[m] == own_anchor_
+            ? b_.CreateInBoundsGEP(wake_mask_ty(), mask_row, { b_.getInt32(proc_sched_ord_[m]), b_.getInt32(field) })
+            : b_.CreateInBoundsGEP(wake_mask_ty(), sym(wake_mask_gv_), { wake_slot_value(m), b_.getInt32(field) });
+        return b_.CreateLoad(b_.getInt64Ty(), at);
     };
     // Open the guarded region of a coroutine group: returns true when its
     // members are guarded, having ensured the wake word carries at least one of
@@ -131,7 +137,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         if (!group_guarded_[g]) {
             return false;
         }
-        emit_trigger_failsafe(sched_ptr_, mask_value(group_trig_mask_[g], &Anchor::ctx_gmask_base, members.front()));
+        emit_trigger_failsafe(sched_ptr_, mask_value(group_trig_mask_[g], 1, members.front()));
         return true;
     };
     // Open member `i`'s guard: run it only if one of ITS OWN events has
@@ -158,7 +164,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         }
         auto* run  = llvm::BasicBlock::Create(ctx_, "mem.run", fn_);
         auto* join = llvm::BasicBlock::Create(ctx_, "mem.skip", fn_);
-        auto* mask = mask_value(member_mask(g, i), &Anchor::ctx_mmask_base, members[i]);
+        auto* mask = mask_value(member_mask(g, i), 0, members[i]);
         auto* bits = b_.CreateAnd(b_.CreateLoad(sched_word_ty(), sched_ptr_), mask);
         b_.CreateCondBr(b_.CreateICmpNE(bits, b_.getInt64(0)), run, join);
         b_.SetInsertPoint(run);
@@ -229,8 +235,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         }
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), params, false);
         // Internal: its callers are the entry of its schedule group, in this
-        // module when the group has no other row (where the inliner may fold the
-        // body in), or a dispatcher in root, which promotes it through sym().
+        // module when the group has no other row (where the body is moved into
+        // the entry, emit_sched_entries), or a dispatcher in root, which promotes
+        // it through sym().
         fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
         fn_->getArg(0)->setName("ctx");
         wheel_ = fn_->getArg(1);
@@ -252,6 +259,11 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         own_ctx_   = own_anchor_ != SignalSlot::no_anchor ? fn_->getArg(0) : nullptr;
         sched_ptr_ = takes_flag ? fn_->getArg(2) : nullptr;
         begin_activation();
+        if (takes_flag && own_anchor_ != SignalSlot::no_anchor) {
+            Anchor& a = anchors_[own_anchor_];
+            mask_row  = b_.CreateInBoundsGEP(wake_mask_ty(), sym(wake_mask_gv_),
+                                             ctx_field(a, a.ctx_wake_base, b_.getInt32Ty()), "mask.row");
+        }
         // Run each member body per activation, freeing its string temporaries
         // afterward — a thunk has no frame to persist them in (a per-call cost
         // paid only by string-using bodies). frame_slots_ is empty for a
@@ -263,6 +275,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_dynarr_temps();
             build_agg_elem_temps();
             llvm::BasicBlock* join = open_guard(takes_flag, g_, i);
+            if (takes_flag) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
@@ -545,6 +560,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
             llvm::BasicBlock* join = open_guard(guarded, g_, i);
+            if (guarded) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
@@ -1642,7 +1660,7 @@ void Backend::lower_task(FunctionId id) {
     // Frame buffer and the task's own scheduled flag, placed just after
     // coro.begin so CoroSplit spills them into the coroutine frame (both live
     // across suspends; the frame's address escapes to callees). The flag backs
-    // intra-body @event waits, exactly like a process's proc_sched slot.
+    // intra-body @event waits, exactly like a process's wake slot.
     frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
     sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
     group_first_block_ = -1;
@@ -1902,6 +1920,9 @@ void Backend::lower_task(FunctionId id) {
         auto*        rty    = fork_record_ty(heap);
         auto*        cntp   = b_.CreateStructGEP(rty, rec, 0);
         llvm::Value* cnt    = b_.CreateSub(b_.CreateLoad(b_.getInt32Ty(), cntp), b_.getInt32(1));
+        // The completion is reported to the record before it is counted, so before the wake it may
+        // make (R22).
+        emit_trace_child_done(hdl_, rec);
         b_.CreateStore(cnt, cntp);
         llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(rty, rec, 1));
         llvm::Value* due    = heap
@@ -2056,6 +2077,13 @@ void Backend::emit_copyout(const Function& f) {
         // plain (flat-stored) array it is the caller's canonical temp, which the
         // frontend then copies into the actual (emit_call_copyouts).
         if (is_agg_abi(f.param_types[k])) {
+            // The actual may be a class property or design state, which the caller
+            // cannot have remembered for a store that happens now.
+            if (reaches_class_handle(f.param_types[k])) {
+                emit_gc_note_ref_store(fn_->getArg(base),
+                                       nullptr,
+                                       env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(f.param_types[k])));
+            }
             emit_agg_storage_copy(fn_->getArg(base),
                                   b_.CreateStructGEP(frame_ty_, frame_, k), f.param_types[k]);
             continue;
@@ -2063,6 +2091,11 @@ void Backend::emit_copyout(const Function& f) {
         // A dynamic-array / queue output / inout formal deep-copies its frame
         // handle back into the caller's handle (the single passed pointer).
         if (is_handle_type(f.param_types[k])) {
+            if (reaches_class_handle(f.param_types[k])) {
+                emit_gc_note_ref_store(fn_->getArg(base),
+                                       nullptr,
+                                       env_->llmod.getDataLayout().getTypeAllocSize(handle_slot_ty(f.param_types[k])));
+            }
             emit_handle_assign(fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k),
                                f.param_types[k]);
             continue;
@@ -2079,6 +2112,11 @@ void Backend::emit_copyout(const Function& f) {
             continue;
         }
         const Plane v = lower_load(local_lvalue(k));
+        // A class or event handle is one word stored through the caller's pointer, which in a
+        // process is a state signal, so the store is logged here (rt_gc_note_ref_store).
+        if (reaches_class_handle(f.param_types[k])) {
+            emit_gc_note_ref_store(fn_->getArg(base), nullptr, sizeof(void*));
+        }
         b_.CreateStore(v.mm, fn_->getArg(base));
         if (abi_four_state(f.param_types[k])) {
             b_.CreateStore(v.z, fn_->getArg(base + 1));
@@ -2257,10 +2295,6 @@ void Backend::lower_call_common(Index               i,
     // its wait queue must be serviced with the call's net old -> new transition.
     // Snapshot each before the (atomic, zero-time) function call; service after.
     std::vector<std::pair<Guarded, ServiceSnapshot>> ref_svc;
-    // Outer containers registered as roots for this call, as lower_task_call_inst does for a
-    // task: a function can now allocate -- and so collect -- between the barrier below and
-    // the callee's store (design §6.1), exactly the window a task's suspension always opened.
-    std::vector<llvm::Value*> ref_containers;
     size_t k = 0;
     for (Index a : ir_->region(arg_slice)) {
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
@@ -2272,26 +2306,10 @@ void Backend::lower_call_common(Index               i,
             // handle, an aggregate image — so `ref` has one shape.
             const Guarded&   lv = lvalue_of(a);
             // A `ref` formal is a raw interior pointer into the actual's storage that
-            // the CALLEE writes through, and the callee has no owner identity to
-            // remember: a `ref` bound to a class property is exactly the "reference
-            // the frame holds with no class-typed value anywhere in sight" that
-            // frame_may_hold_gc_ref's door 3 and design §8's prerequisite 2 are
-            // about. So the barrier goes HERE, at the one place the owner is known.
-            //
-            // A function cannot suspend, but it can allocate, and an allocation that has
-            // outrun its budget collects (design §6.1), so a collection can consume the
-            // remembered-set entry between this barrier and the callee's store, as it can
-            // across a task's suspension. What closes that is the same thing: the callee
-            // needs the actual after the allocation, so it holds it -- an interior pointer
-            // into the object, or the container epoch pointer that is -- the collection
-            // finds it on the stack and re-logs the owner (relog_conservative_roots). See
-            // lower_task_call_inst for the full argument.
-            emit_gc_barrier_for(lv);
-            // And the payload-interior case the stack cannot resolve, registered exactly
-            // as for a task.
-            if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
-                ref_containers.push_back(root);
-            }
+            // the CALLEE writes through. The callee's own barrier finds the owner from
+            // that address at each store (emit_gc_note_ref_store), so nothing is
+            // recorded here: a record made at the call is consumed by any collection
+            // that runs before the store.
             const RefActual rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
@@ -2303,8 +2321,7 @@ void Backend::lower_call_common(Index               i,
                 // The callee wakes at each write.
             } else if (!is_handle_type(f.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
-            } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
-                       lv.mut_sig_valid) {
+            } else if (lv.chg != nullptr || lv.is_signal || lv.mut_sig_valid) {
                 // A `ref` to a waited-on container property: the callee mutates
                 // through a raw aliased pointer and never copies back, so the
                 // notify can only be at the call's RETURN. The fire is then one
@@ -2319,13 +2336,12 @@ void Backend::lower_call_common(Index               i,
             const Guarded& alv = lvalue_of(a);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             // An out / inout container actual is filled BY THE CALLEE through this
-            // handle pointer, so the owner acquires whatever references the callee's
-            // elements hold. An `In` container is only read. Same reasoning as the
-            // ref case above.
+            // handle pointer, which finds the owner from the address when it copies
+            // out (emit_copyout). The frontend never hands it a place inside another
+            // container's payload, which has no owner the address can name.
             if (dir == ArgDir::Out || dir == ArgDir::Inout) {
-                emit_gc_barrier_for(alv);
-                if ((alv.chg != nullptr && alv.chg->container) || alv.is_signal ||
-                    alv.mut_sig_valid) {
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
+                if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
             }
@@ -2347,16 +2363,14 @@ void Backend::lower_call_common(Index               i,
         } else if (is_agg_abi(f.param_types[k])) {
             // An aggregate actual passes its storage pointer, one per formal in
             // every direction (the frontend emitted it as an lvalue): In copies
-            // it in, a struct-bearing out / inout copies the frame Local back
-            // out through the same pointer.
+            // it in, an out / inout copies the frame Local back out through the
+            // same pointer (emit_copyout). An out / inout actual is always a caller
+            // temp, which the frontend assigns to the actual after the call
+            // (Lowerer::build_call_args), so the pointer is never into a
+            // container's payload and the copy-out needs no barrier of the call's.
             argv.push_back(agg_arg_ptr(lvalue_of(a), f.param_types[k], dir));
-            // A struct-bearing out / inout formal is copied back out through THIS
-            // pointer by the callee itself (emit_copyout, :5706-5708), so if the
-            // actual is a class property the callee writes handles into an object it
-            // cannot name. Same reasoning as the ref case above.
-            if (dir == ArgDir::Out || dir == ArgDir::Inout) {
-                emit_gc_barrier_for(lvalue_of(a));
-            }
+            assert((dir == ArgDir::In || lvalue_of(a).epoch_chain.empty()) &&
+                   "an aggregate output actual is a caller temp, not a place in a container's payload");
         } else {
             push_scalar_arg(argv, value_of(a), abi_four_state(f.param_types[k]));
         }
@@ -2379,9 +2393,6 @@ void Backend::lower_call_common(Index               i,
         }
         argv.push_back(tmp);
         b_.CreateCall(fnty, callee, argv);
-        for (llvm::Value* root : ref_containers) {
-            b_.CreateCall(gc_container_remove_fn(), { root });
-        }
         LValue lv{};
         lv.base    = tmp;
         lv.root_ty = st;
@@ -2394,9 +2405,6 @@ void Backend::lower_call_common(Index               i,
         // trailing out-param); str_of(i) was pre-set by build_str_temps.
         argv.push_back(str_of(i));
         b_.CreateCall(fnty, callee, argv);
-        for (llvm::Value* root : ref_containers) {
-            b_.CreateCall(gc_container_remove_fn(), { root });
-        }
         for (auto& [lv, snap] : ref_svc) {
             service_after_write(lv, snap);
         }
@@ -2414,18 +2422,12 @@ void Backend::lower_call_common(Index               i,
         set_lvalue(i, lv);
         argv.push_back(temp);
         b_.CreateCall(fnty, callee, argv);
-        for (llvm::Value* root : ref_containers) {
-            b_.CreateCall(gc_container_remove_fn(), { root });
-        }
         for (auto& [lv2, snap] : ref_svc) {
             service_after_write(lv2, snap);
         }
         return;
     }
     llvm::Value* r = b_.CreateCall(fnty, callee, argv);
-    for (llvm::Value* root : ref_containers) {
-        b_.CreateCall(gc_container_remove_fn(), { root });
-    }
     for (auto& [lv, snap] : ref_svc) {
         service_after_write(lv, snap);
     }
@@ -2501,10 +2503,6 @@ void Backend::lower_task_call_inst(Index i) {
     // Per-write mid-suspend waking needs callee-side servicing (a generic
     // runtime wake keyed by signal id); TODO once that exists.
     std::vector<std::pair<Guarded, ServiceSnapshot>> ref_svc;
-    // Outer containers registered as dynamically-scoped roots for this call, removed
-    // at cont_bb. Empty unless a ref actual aims inside a container a class object
-    // owns, which is the one shape neither the barrier nor the frame scan covers.
-    std::vector<llvm::Value*> ref_containers;
     for (uint32_t k = 0; k < args.size(); ++k) {
         if (tf.arg_dirs[k] == ArgDir::Ref) {
             // The ref, as at a function call: aliased storage and the chain of
@@ -2512,44 +2510,12 @@ void Backend::lower_task_call_inst(Index i) {
             // where the epoch earns its keep — it can suspend, and the container
             // can be restructured by another process while the ref stays live.
             const Guarded&   lv = lvalue_of(args[k]);
-            // The same barrier lower_call_common emits, for the same reason: the
-            // callee writes through a raw interior pointer and cannot name the owner.
-            //
-            // REQUIRED, not belt-and-braces. Here the dominance argument that makes
-            // it airtight for a function does not hold -- a task can suspend, so a
-            // collection can run between this barrier and the callee's store and
-            // consume the remembered-set entry. Two separate windows result, and this
-            // barrier is the only thing covering the first:
-            //
-            //   no collection intervenes (a task that never suspends before storing)
-            //     -- nothing else logs the object at all, so this call is load-bearing;
-            //   a collection intervenes
-            //     -- the collector re-enters every conservatively-reached object into
-            //        the remembered set for the next collection
-            //        (relog_conservative_roots in Gc.cpp, for young AND full, since a
-            //        full collection also clears LOGGED and drops the set). To perform
-            //        the store after resuming, the activation must hold the interior
-            //        pointer across the suspend that PRECEDES the store, so CoroSplit
-            //        keeps it in the frame, the frame scan resolves it
-            //        (rt_gc_find_object resolves interior pointers, Gc.h:433-439) and
-            //        it is re-logged there.
-            //
-            // What does NOT close it, and was an earlier draft of this comment: a
-            // conservatively-reached OLD object is not traced in a young collection --
-            // mark_and_push refuses OLD uniformly, so the frame scan pins and stops.
-            // Tracing it would not have sufficed anyway, since the pointer need not
-            // still be live at the first safepoint AFTER the store.
-            emit_gc_barrier_for(lv);
-            // A ref aiming INSIDE a container this object owns hands the callee a
-            // payload-interior pointer, which the frame scan cannot resolve, so the
-            // re-log above cannot carry the owner across the suspend. Register the
-            // OUTER container for the call's duration instead; see
-            // emit_gc_ref_container_add for why it is the outer one and how it both
-            // reaches the elements and keeps the owner alive. Paired at cont_bb,
-            // which every completion and resume path below reaches.
-            if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
-                ref_containers.push_back(root);
-            }
+            // Nothing is recorded for the owner here. The callee writes through a raw
+            // interior pointer, and a record made at the call is consumed by any
+            // collection that runs while the task is suspended, before its store. The
+            // callee's own barrier finds the owner from the address at each store
+            // (emit_gc_note_ref_store), and the owner of an element of a container
+            // from the witness chain, so the store is logged whenever it happens.
             const RefActual rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
@@ -2561,8 +2527,7 @@ void Backend::lower_task_call_inst(Index i) {
                 // The callee wakes at each write, not at this call's return.
             } else if (!is_handle_type(tf.param_types[k])) {
                 ref_svc.emplace_back(lv, service_snapshot(lv));
-            } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
-                       lv.mut_sig_valid) {
+            } else if (lv.chg != nullptr || lv.is_signal || lv.mut_sig_valid) {
                 // See the function-call site: a `ref` container is mutated
                 // through a raw pointer, so the notify lands at cont_bb, past
                 // every suspend the task took.
@@ -2574,24 +2539,23 @@ void Backend::lower_task_call_inst(Index i) {
             const Guarded& alv = lvalue_of(args[k]);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
-                emit_gc_barrier_for(alv);
-                if ((alv.chg != nullptr && alv.chg->container) || alv.is_signal ||
-                    alv.mut_sig_valid) {
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
+                if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
             }
         } else if (is_agg_abi(tf.param_types[k])) {
             // An unpacked struct / whole unpacked array actual: one storage
             // pointer for every direction (the frontend emitted it as an lvalue —
-            // the actual itself for a struct-bearing formal, a canonical temp for
-            // a flat array). The callee copies in at its body start and copies an
+            // the actual itself for a struct-bearing input, a canonical temp
+            // otherwise). The callee copies in at its body start and copies an
             // output / inout back at completion, so the caller must keep the
-            // storage alive across the task's suspends: both shapes are frame
-            // Locals / signals, never a short-lived alloca.
+            // storage alive across the task's suspends: an output / inout actual
+            // is a frame Local or a signal, never a short-lived alloca and never a
+            // place in a container's payload.
             argv.push_back(agg_arg_ptr(lvalue_of(args[k]), tf.param_types[k], tf.arg_dirs[k]));
-            if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
-                emit_gc_barrier_for(lvalue_of(args[k]));
-            }
+            assert((tf.arg_dirs[k] == ArgDir::In || lvalue_of(args[k]).epoch_chain.empty()) &&
+                   "an aggregate output actual is a caller temp, not a place in a container's payload");
         } else if (is_string_type(tf.param_types[k])) {
             // One rt_string handle pointer in every direction: In passes the
             // actual's handle (deep-copied into the frame slot at body start),
@@ -2650,9 +2614,6 @@ void Backend::lower_task_call_inst(Index i) {
     b_.SetInsertPoint(cont_bb);
     for (auto& [lv, snap] : ref_svc) {
         service_after_write(lv, snap);
-    }
-    for (llvm::Value* root : ref_containers) {
-        b_.CreateCall(gc_container_remove_fn(), { root });
     }
     emit_finish_check(virt ? virtual_call_may_finish() : callee_may_finish(fid));
 }
@@ -2730,7 +2691,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const
                 fv = b_.CreateFPExt(fv, b_.getDoubleTy());
             }
             store_field(sty, elt, 0, b_.getInt32(64));
-            store_field(sty, elt, 1, b_.getInt32(0b101u | time_flag));
+            store_field(sty, elt, 1, b_.getInt32(0b101u | time_flag | (t.width == 32 ? 0b10000u : 0u)));
             store_field(sty, elt, 2, put(b_.CreateBitCast(fv, i64), 1));
             store_field(sty, elt, 3, null);
             store_field(sty, elt, 4, null);

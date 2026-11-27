@@ -107,16 +107,17 @@ them in step.
 - Suspended frames and the native stack are scanned conservatively until frames
   have explicit stack maps; object fields and design state are scanned precisely.
 - A young collection costs what happened since the last collection (allocation,
-  logged writes, frames that ran), never the size of the design. **Not yet:**
-  each one reads every state root, walks every state-resident container and scans
-  every registered frame, and with a small live set every collection is full.
+  logged writes, frames that ran), never the size of the design. Design-state
+  handle slots are read by dirty card, and each state-resident container is
+  walked only if a mutation of it was logged. **Not yet:** a young collection
+  scans every registered frame.
 - An object is finalized only if it owns a buffer outside the heap when it dies.
   **Not yet:** every dead object with a string or container property runs a
   finalizer.
 - A handle stored through a `ref` argument is recorded by a barrier in the
-  callee, which finds the owning object from the address. **Not yet:** the call
-  site records the owner, and every collection re-records whatever frames
-  reference.
+  callee, which finds the owning object from the address, or from the witness
+  chain when the place is an element of a container. An output argument is
+  never such an element: the caller assigns a temporary to it after the call.
 - Any process may run on any worker thread, but two run at the same time only
   when what they may access does not overlap with a write, and a run is
   reproducible. So values and containers need no protection against concurrent
@@ -136,9 +137,10 @@ them in step.
 - A young collection runs after a fixed amount of allocation (8 MiB, counting
   the buffers objects own).
 - A full collection runs when the old generation has grown by a fixed factor
-  since the last one. The factor is a constant of the build: a collector tuning
-  value becomes a user setting only once a measurement shows it must. **Not
-  yet:** the test compares the committed heap, which includes the young budget.
+  since the last one: what a collection has marked and the buffers it owns, never
+  the committed heap, which includes the young budget. The factor is a constant of
+  the build: a collector tuning value becomes a user setting only once a
+  measurement shows it must.
 - A collection runs at the next boundary between process slices once the budget
   is spent, and inside an allocation only past an overshoot or at the heap's
   ceiling. **Not yet:** the boundary is the end of a time step.

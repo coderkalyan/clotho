@@ -456,9 +456,9 @@ llvm::Value* Backend::lv_handle_ptr(const Guarded& g, HandleUse use) {
     return g.pointer_or(b_, form, sink);
 }
 
-// Fire a waited-on CONTAINER class property's change notifier (LRM 9.4.3), or
-// emit nothing at all when the property carries none -- which is every property
-// in a design that waits on no container.
+// Fire a waited-on CONTAINER class property's change notifier (LRM 9.4.3), or that of the
+// aggregate property the container is a member of, or emit nothing at all when the
+// property carries none -- which is every property in a design that waits on no container.
 //
 // UNCONDITIONAL, unlike the integral service_change_notify: the property's value
 // is the container's CONTENTS, and `q.size()` is computed rather than stored, so
@@ -505,9 +505,9 @@ void Backend::notify_container_mutation(const LValueInfo& lv) {
         }
         return;
     }
-    if (!lv.chg->container) {
-        return;
-    }
+    // A container property's own notifier, or that of the aggregate property the container
+    // is a member of: either way the property changed, and every such property carries an
+    // any-change notifier.
     if (!lv.chg->wants(Edge::Any)) {
         throw BackendError{ "internal: container change notifier with no any-change field" };
     }
@@ -526,7 +526,7 @@ void Backend::service_signal_container_mutation(Signal sig) {
         t.level = true;
         emit_trace_change(RT_TRACE_CHG_LEVEL, sig, storage_ptr(slot_of(sig)), t);
     }
-    if (wait_sta_gv_[i][e] != nullptr) {
+    if (sta_has_[i][e]) {
         service_static_queue(sig, e);
     }
     if (wait_dyn_gv_[i][e] != nullptr) {
@@ -567,9 +567,17 @@ llvm::Constant* Backend::chg_shared_slot(uint32_t k) {
       chg_shared_ty_, sym(chg_shared_gv_), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
 }
 
-// Pre-write CONTENT snapshot of a waited-on STRING class property (LRM 9.4.2 on
-// a 6.16 value), or null when nothing waits on this place -- which is every
-// string place in a design that waits on no string property.
+// Whether something waits on the signal a string place belongs to: a string
+// variable, a string member of an aggregate variable, an element of an array of
+// strings. A PreInit store has no waiter yet (service_snapshot).
+bool Backend::str_signal_waited(const LValueInfo& lv) const {
+    return !silent_stores_ && lv.is_signal && signal_has_waiters(lv.sig);
+}
+
+// Pre-write CONTENT snapshot of a waited-on STRING place (LRM 9.4.2 on a 6.16
+// value), or null when nothing waits on it -- which is every string place in a
+// design that waits on no string. The place is a class property with a change
+// notifier, the actual of a `ref` formal, or part of a signal with waiters.
 //
 // A string is the one notified type whose value is NOT the word the place holds.
 // `obj.s = t` replaces the rt_string's buffer, so comparing handles would call
@@ -578,12 +586,12 @@ llvm::Constant* Backend::chg_shared_slot(uint32_t k) {
 // -- re-assigning the same text must fire nothing. So the content is copied out
 // before the write and compared with rt_string_cmp after it.
 //
-// The copy costs a malloc, paid only for a property some `@` / `wait` names. The
+// The copy costs a malloc, paid only for a place some `@` / `wait` depends on. The
 // scratch handle is an ENTRY-block alloca, so a bracket inside a loop reuses one
 // slot rather than growing the stack, and the init / deinit pair is balanced
 // across the bracket so each pass copies into a fresh handle.
 llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
-    if (lv.chg == nullptr && lv.ref_wake_fn == nullptr) {
+    if (lv.chg == nullptr && lv.ref_wake_fn == nullptr && !str_signal_waited(lv)) {
         return nullptr;
     }
     if (lv.chg != nullptr && !lv.chg->wants(Edge::Any)) {
@@ -602,35 +610,34 @@ llvm::Value* Backend::str_chg_snapshot(const Guarded& lv) {
     return snap;
 }
 
-// Close a str_chg_snapshot bracket: fire the property's any-change notifier iff
-// the characters differ, then release the snapshot.
+// Close a str_chg_snapshot bracket: wake what waits on the place iff the characters
+// differ, then release the snapshot.
 void Backend::str_chg_after(const Guarded& lv, llvm::Value* snap) {
     if (snap == nullptr) {
         return;
     }
     --str_chg_open_;
     llvm::Value* changed =
-      b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { snap, lv_string_ptr(lv, StringUse::Read) }),
-                      b_.getInt32(0));
-    if (lv.ref_wake_fn != nullptr) {
-        // A write through a `ref` formal: the call's thunk wakes what the actual's owner has waiting.
-        auto* f    = b_.GetInsertBlock()->getParent();
-        auto* body = llvm::BasicBlock::Create(ctx_, "refs.body", f);
-        auto* cont = llvm::BasicBlock::Create(ctx_, "refs.cont", f);
-        b_.CreateCondBr(changed, body, cont);
-        b_.SetInsertPoint(body);
-        emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
-        b_.CreateBr(cont);
-        b_.SetInsertPoint(cont);
-        b_.CreateCall(str_deinit_fn(), { snap });
-        return;
-    }
+      b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { snap, lv_string_ptr(lv, StringUse::Read) }), b_.getInt32(0));
     auto* fn   = b_.GetInsertBlock()->getParent();
     auto* body = llvm::BasicBlock::Create(ctx_, "chgs.body", fn);
     auto* cont = llvm::BasicBlock::Create(ctx_, "chgs.cont", fn);
     b_.CreateCondBr(changed, body, cont);
     b_.SetInsertPoint(body);
-    fire_prop_notifier(lv, Edge::Any);
+    if (lv.ref_wake_fn != nullptr) {
+        // A write through a `ref` formal: the call's thunk wakes what the actual's owner has waiting.
+        emit_ref_wake_call(lv.ref_wake_fn, lv.ref_wake_ctx, b_.getTrue(), b_.getFalse(), b_.getFalse());
+    } else if (lv.chg != nullptr) {
+        fire_prop_notifier(lv, Edge::Any);
+    } else {
+        // A signal's waiters are all in its Any bucket: a string has no edges
+        // (Table 9-2), so the frontend takes no other subscription on one. The
+        // buckets are the owner's, as for any written signal (service_after_write).
+        lv.when_valid(b_, [&](const LValue& v) {
+            CtxOverride ov(*this, v.vif_ctx, lvalue_ctx_anchor(v));
+            service_signal_container_mutation(v.sig);
+        });
+    }
     b_.CreateBr(cont);
     b_.SetInsertPoint(cont);
     b_.CreateCall(str_deinit_fn(), { snap });
@@ -746,6 +753,9 @@ void Backend::lower_dyn_array_new(Index i) {
     // zero-extending would turn `new[-1]` on a 32-bit int into a 4294967295-element
     // request. The frontend zero-extends an unsigned count past its top bit.
     llvm::Value* n = cast(must_of(da.arg), 64, true);
+    // Plain `new[n]` adds no reference of an element it keeps, but constructs each element it adds,
+    // and an event element's construction makes an object the container then holds.
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_new_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     elem_ops_global(da.array_type),
@@ -761,7 +771,7 @@ void Backend::lower_dyn_array_new_init(Index i) {
     // `new[n](src)` copies src's elements in, so the owner acquires every reference
     // src held. Plain `new[n]` (lower_dyn_array_new) is deliberately bare: it
     // preserves or drops elements and adds no reference. See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_new_copy_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     elem_ops_global(da.array_type),
@@ -782,7 +792,7 @@ void Backend::lower_dyn_array_copy(Index i) {
     const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
     // Whole-array assign: the owner acquires every reference the source held.
     // See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_assign_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(da.arg), HandleUse::Read),
@@ -795,7 +805,7 @@ void Backend::lower_dyn_array_copy_queue(Index i) {
     const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
     // Whole-array assign from a queue (LRM 7.5.1's resizeable assignment).
     // See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_assign_queue_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(da.arg), HandleUse::Read),
@@ -876,7 +886,7 @@ LValue Backend::dyn_agg_elem_lvalue(const LValueInfo& container,
     // trace map (Gc.h:324-326), so the owner travels with the element lvalue. No
     // reachability gate here, unlike agg_member: a container reaches a class handle
     // exactly when its element does, so the owner is already null if it cannot.
-    sel.gc_owner      = container.gc_owner;
+    carry_gc_place(sel, container);
     return sel;
 }
 
@@ -956,10 +966,9 @@ void Backend::lower_queue_push(Index i, bool front) {
     // no reference, so only the ops that ADD one are instrumented; pop, delete,
     // reset, resize and the ordering methods are deliberately bare.
     //
-    // gc_owner is null unless the container is reached through a class property,
-    // so a queue in design state, a static, or a frame local emits nothing -- all
-    // three are scanned in full at every collection (Gc.h:319-323).
-    emit_gc_barrier_for(lvalue_of(p.op));
+    // A container in design state is logged by its own flag instead (emit_gc_state_barrier), the
+    // same call; a frame local needs nothing, since a frame is scanned in full at every collection.
+    emit_gc_container_barrier(lvalue_of(p.op));
     if (e.is_string) {
         // A string value is already an rt_string handle pointer; the runtime
         // deep-copies it into the new slot, so it is passed directly.
@@ -1078,7 +1087,7 @@ void Backend::lower_queue_insert(Index i) {
     llvm::Value*  bound = queue_bound_of(qlv, bound_v);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     // A new element, so a new reference. See lower_queue_push.
-    emit_gc_barrier_for(qlv);
+    emit_gc_container_barrier(qlv);
     // Inserting AT the size is an append, so the legal range is [0, size].
     emit_queue_bounds_check(i, handle, qi.idx, qlv, /*allow_append=*/true);
     if (e.is_string) {
@@ -1119,7 +1128,7 @@ void Backend::lower_queue_copy(Index i) {
     const auto  qa = ir_->extra_data<QueueArg>(p.extra);
     // Whole-container assign: the owner acquires every reference the source held.
     // See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     const uint64_t bound = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
     b_.CreateCall(queue_assign_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
@@ -1135,7 +1144,7 @@ void Backend::lower_queue_copy_dynarr(Index i) {
     const auto& p  = ir_->payload(i).op_extra;
     const auto  qa = ir_->extra_data<QueueArg>(p.extra);
     // Whole-container assign from a dynamic array. See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     const uint64_t bound = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
     b_.CreateCall(queue_assign_dynarr_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
@@ -1150,11 +1159,15 @@ void Backend::lower_queue_append_range(Index i) {
     const auto  qs    = ir_->extra_data<QueueSliceInfo>(p.extra);
     const uint64_t bound_v = std::get<Type>(mod_.pool.get(qs.queue_type)).left;
     llvm::Value* bound = queue_bound_of(lvalue_of(p.op), bound_v);
-    // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); sign-extend.
-    llvm::Value* lo = cast(must_of(qs.lo), 64, /*sign=*/true);
-    llvm::Value* hi = cast(must_of(qs.hi), 64, /*sign=*/true);
+    // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); the lowering widened each by
+    // its own signedness. An x or z bit in either makes the slice empty (LRM 7.10.1: lo > hi).
+    llvm::Value* lo = select_index(value_of(qs.lo), type_of(qs.lo));
+    llvm::Value* hi = select_index(value_of(qs.hi), type_of(qs.hi));
+    llvm::Value* bad = b_.CreateOr(any_unknown(qs.lo), any_unknown(qs.hi));
+    lo               = b_.CreateSelect(bad, b_.getInt64(1), lo);
+    hi               = b_.CreateSelect(bad, b_.getInt64(0), hi);
     // A slice append copies a range of elements in. See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     queue_engine_call(queue_append_range_fn(),
                       { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                         lv_handle_ptr(lvalue_of(qs.src), HandleUse::Read),

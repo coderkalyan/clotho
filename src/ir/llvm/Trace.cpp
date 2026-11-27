@@ -459,6 +459,49 @@ void Backend::emit_trace_abort(llvm::Value* a, llvm::Value* list, uint32_t kind)
 #endif
 }
 
+void Backend::emit_trace_fork(llvm::Value* rec, uint32_t kind, uint32_t width) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i32 = b_.getInt32Ty();
+    // A function has no activation: a fork there can only be a join_none, which parks nobody.
+    llvm::Value* a = in_coroutine_body() ? static_cast<llvm::Value*>(hdl_) : llvm::ConstantPointerNull::get(ptr);
+    b_.CreateCall(rt_fn("rt_trace_fork", b_.getVoidTy(), { ptr, ptr, i32, i32 }),
+                  { a, rec, b_.getInt32(kind), b_.getInt32(width) });
+#else
+    (void)rec;
+    (void)kind;
+    (void)width;
+#endif
+}
+
+void Backend::emit_trace_child_done(llvm::Value* a, llvm::Value* rec) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_child_done", b_.getVoidTy(), { ptr, ptr }), { a, rec });
+#else
+    (void)a;
+    (void)rec;
+#endif
+}
+
+void Backend::emit_trace_join(llvm::Value* rec) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_join", b_.getVoidTy(), { ptr, ptr }), { hdl_, rec });
+#else
+    (void)rec;
+#endif
+}
+
 void Backend::emit_trace_once(uint32_t kind) {
 #ifdef CLOTHO_EXTRA_ASSERTS
     if (!trace_on()) {
@@ -470,7 +513,7 @@ void Backend::emit_trace_once(uint32_t kind) {
 #endif
 }
 
-// A thunk group is an activation named by the address of its wake pair with bit 0 set, which
+// A thunk group is an activation named by the address of its wake slot with bit 0 set, which
 // is also what the seed hands out; its entry returns to its leading control.
 void Backend::emit_trace_thunk_park(llvm::Value* wake, const std::string& where) {
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -489,7 +532,7 @@ void Backend::emit_trace_thunk_park(llvm::Value* wake, const std::string& where)
 }
 
 void Backend::emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Value* ctl, llvm::Value* list,
-                                  llvm::Value* n, llvm::Value* parked_now) {
+                                  llvm::Value* n, llvm::Value* parked_now, const TraceMembers& members) {
 #ifdef CLOTHO_EXTRA_ASSERTS
     auto* const ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* const i32  = b_.getInt32Ty();
@@ -497,9 +540,18 @@ void Backend::emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Val
     b_.CreateCall(rt_fn("rt_trace_spawn", b_.getVoidTy(), { ptr, ptr, ptr }),
                   { h, origin, llvm::ConstantPointerNull::get(ptr) });
     b_.CreateCall(rt_fn("rt_trace_subscribe", b_.getVoidTy(), { ptr, ptr, i32 }), { h, list, n });
-    llvm::Function* fn   = b_.GetInsertBlock()->getParent();
-    auto* const     park = llvm::BasicBlock::Create(ctx_, "trace.park", fn);
-    auto* const     done = llvm::BasicBlock::Create(ctx_, "trace.parked", fn);
+    llvm::Function* fn      = b_.GetInsertBlock()->getParent();
+    auto* const     guarded = llvm::BasicBlock::Create(ctx_, "trace.members", fn);
+    auto* const     park    = llvm::BasicBlock::Create(ctx_, "trace.park", fn);
+    auto* const     done    = llvm::BasicBlock::Create(ctx_, "trace.parked", fn);
+    auto* const     decided = llvm::BasicBlock::Create(ctx_, "trace.membered", fn);
+    // Only a guarded group has members to report.
+    b_.CreateCondBr(b_.CreateICmpNE(members.members, b_.getInt32(0)), guarded, decided);
+    b_.SetInsertPoint(guarded);
+    b_.CreateCall(rt_fn("rt_trace_members", b_.getVoidTy(), { ptr, ptr, i32, i32, i32 }),
+                  { h, members.list, members.n, members.members, members.exact });
+    b_.CreateBr(decided);
+    b_.SetInsertPoint(decided);
     b_.CreateCondBr(parked_now, park, done);
     b_.SetInsertPoint(park);
     b_.CreateCall(rt_fn("rt_trace_park", b_.getVoidTy(), { ptr, ptr, i64 }), { h, ctl, b_.getInt64(0) });
@@ -512,6 +564,41 @@ void Backend::emit_trace_seed_row(llvm::Value* h, llvm::Value* origin, llvm::Val
     (void)list;
     (void)n;
     (void)parked_now;
+    (void)members;
+#endif
+}
+
+void Backend::emit_trace_member(uint32_t index) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i64 = b_.getInt64Ty();
+    // A thunk row is no coroutine: its activation is the wake slot its flag points at, with bit 0 set
+    // (emit_trace_thunk_park).
+    llvm::Value* a = hdl_ != nullptr
+                       ? static_cast<llvm::Value*>(hdl_)
+                       : b_.CreateIntToPtr(b_.CreateOr(b_.CreatePtrToInt(sched_ptr_, i64), b_.getInt64(1)), ptr);
+    b_.CreateCall(rt_fn("rt_trace_member", b_.getVoidTy(), { ptr, b_.getInt32Ty() }), { a, b_.getInt32(index) });
+#else
+    (void)index;
+#endif
+}
+
+void Backend::emit_trace_inertial_arm(llvm::Value* idx, llvm::Value* rec, llvm::Value* ticks, llvm::Value* epoch) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    b_.CreateCall(rt_fn("rt_trace_inertial_arm", b_.getVoidTy(), { b_.getInt32Ty(), ptr, b_.getInt64Ty(), b_.getInt64Ty() }),
+                  { idx, rec, ticks, epoch });
+#else
+    (void)idx;
+    (void)rec;
+    (void)ticks;
+    (void)epoch;
 #endif
 }
 
@@ -615,7 +702,7 @@ Backend::TraceNba Backend::trace_nba_of(const LValue& lv, Plane rhs, bool gated)
     return t;
 }
 
-void Backend::emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path) {
+void Backend::emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path, llvm::Value* ticks) {
 #ifdef CLOTHO_EXTRA_ASSERTS
     if (!t.on) {
         return;
@@ -629,12 +716,32 @@ void Backend::emit_trace_nba(llvm::Value* rec, const TraceNba& t, uint32_t path)
                       { site, t.dst0, or_none(t.dst1), or_none(t.val0), or_none(t.mask0), or_none(t.val1), or_none(t.mask1) });
         return;
     }
-    b_.CreateCall(rt_fn("rt_trace_nba_stage", b_.getVoidTy(), { ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr }),
-                  { rec, site, t.dst0, or_none(t.dst1), or_none(t.val0), or_none(t.mask0), or_none(t.val1), or_none(t.mask1) });
+    b_.CreateCall(rt_fn("rt_trace_nba_stage", b_.getVoidTy(), { ptr, b_.getInt64Ty(), ptr, ptr, ptr, ptr, ptr, ptr, ptr }),
+                  { rec, ticks != nullptr ? ticks : b_.getInt64(0), site, t.dst0, or_none(t.dst1), or_none(t.val0),
+                    or_none(t.mask0), or_none(t.val1), or_none(t.mask1) });
 #else
     (void)rec;
     (void)t;
     (void)path;
+    (void)ticks;
+#endif
+}
+
+void Backend::emit_trace_nba_events(llvm::Value* rec, llvm::Value* count, llvm::ArrayRef<TraceTrigger> trigs) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    if (!trace_on()) {
+        return;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i32 = b_.getInt32Ty();
+    for (const TraceTrigger& t : trigs) {
+        b_.CreateCall(rt_fn("rt_trace_nba_event", b_.getVoidTy(), { ptr, i32, ptr, i32 }),
+                      { rec, count, t.x, b_.getInt32(t.edge) });
+    }
+#else
+    (void)rec;
+    (void)count;
+    (void)trigs;
 #endif
 }
 

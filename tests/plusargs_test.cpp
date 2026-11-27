@@ -227,6 +227,31 @@ TEST_CASE("$value$plusargs: %s into a string object") {
     }
 }
 
+// A numeric conversion into a `string` stores the converted value cast to string
+// (LRM 21.6 stores the converted value; 6.16 casts an integral value to string),
+// sized like an unsized literal (5.7.1: at least 32 bits, signed for %d), the
+// reading decided in docs/LRM_NOTES.md. No clause gives the width, and iverilog 13
+// asserts on this, so the expectations are derived from the LRM text: 0x4142 is
+// "AB" ("\0" bytes are dropped), and -5 is 32 bits, FF FF FF FB.
+TEST_CASE("$value$plusargs: a numeric conversion into a string object") {
+    const char* src = R"(
+        module m;
+            string s;
+            int n;
+            initial begin
+                n = $value$plusargs("N=%d", s);
+                $display("%0d [%s] %0d", n, s, s.len());
+                n = $value$plusargs("M=%h", s);
+                $display("%0d [%s] %0d", n, s, s.len());
+                n = $value$plusargs("K=%d", s);
+                $display("%0d %0d %h", n, s.len(), {s[0], s[1], s[2], s[3]});
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src, { "N=16706", "M=4142", "K=-5" }) == "1 [AB] 2\n1 [AB] 2\n1 4 fffffffb\n");
+}
+
 // No width cap: a value longer than the 64 bits a packed-vector target holds
 // arrives whole. This is the property that distinguishes the string path from
 // the plane path, so it is worth its own case.
@@ -541,20 +566,6 @@ TEST_CASE("$value$plusargs: an integral conversion into a real is rejected") {
 // instruction tripped the guard, so every refusal made while lowering an
 // instruction is located, not just these two.
 TEST_CASE("a backend refusal carries a source location and a diagnostic code") {
-    SUBCASE("a numeric conversion into a string object") {
-        // TODO(clotho): LRM §21.6 stores the CONVERTED value, so %d into a
-        // `string` is LRM 6.16's integral-to-string assignment of it.
-        const std::string err = backend_error("module m;\n"
-                                              "    string s;\n"
-                                              "    initial begin\n"
-                                              "        void'($value$plusargs(\"X=%d\", s));\n"
-                                              "    end\n"
-                                              "endmodule\n");
-        CHECK(err == "source:4:15: error: $value$plusargs %d into a string object is not supported "
-                     "[unsupported-construct]\n"
-                     "        void'($value$plusargs(\"X=%d\", s));\n"
-                     "              ^\n");
-    }
     SUBCASE("a part-select target") {
         const std::string err = backend_error("module m;\n"
                                               "    logic [31:0] v;\n"

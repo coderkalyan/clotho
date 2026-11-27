@@ -784,10 +784,11 @@ Guarded Backend::assoc_elem_lvalue(const Guarded& lv, bool for_write) {
     // that the VALUE path knows nothing about -- `int m[Cell]` in a class property
     // writes an int and still needs the barrier (§7). Emitted here, on the write
     // resolution, because this is the one place an entry is created; a read
-    // (get_ptr) adds no reference and gets nothing. assoc_key_handle is false unless
-    // the map is reached through a class property AND its key is a bare handle.
-    if (for_write && lv.assoc_key_handle) {
-        emit_gc_barrier_for(lv);
+    // (get_ptr) adds no reference and gets nothing. assoc_put_handle is false unless the map
+    // is reached through a class property, a ref or design state AND creating an entry stores a
+    // handle into it.
+    if (for_write && lv.assoc_put_handle) {
+        emit_gc_container_barrier(lv);
     }
     // A write resolution creates or replaces an entry, so it mutates a waited-on
     // map property (LRM 9.4.3). This is the ONE place an assoc element place is
@@ -899,10 +900,7 @@ Guarded Backend::assoc_elem_lvalue(const Guarded& lv, bool for_write) {
     // The owner travels with the resolved element: a handle stored into an assoc
     // entry lands in the map's malloc'd payload, which only the OWNING object's
     // trace map reaches (Gc.h:324-326), so the store still needs the barrier (§7).
-    el.gc_owner    = lv.gc_owner;
-    // Root and owner travel together; see agg_member for the invariant.
-    el.gc_container_root = lv.gc_container_root;
-    el.gc_container_type = lv.gc_container_type;
+    carry_gc_place(el, lv);
     // Valid where the key is and, for a read, where the entry was found. The deferred
     // place itself carries no verdict here: a base inside an invalid container was
     // opened (lv_handle_ptr) when the place was formed.
@@ -1018,7 +1016,7 @@ void Backend::lower_assoc_copy(Index i) {
     const auto  aa = ir_->extra_data<AssocArg>(p.extra);
     // Whole-map assign: every entry's key and value is copied in, so the owner
     // acquires every reference the source held. See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(assoc_assign_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(aa.arg), HandleUse::Read),
@@ -1040,12 +1038,27 @@ void Backend::lower_assoc_traverse(Index i, Inst::Tag tag) {
         status = b_.CreateCall(assoc_end_fn(tag == Inst::Tag::AssocLast),
                                { handle, outptr, outlen });
     } else {
-        // next / prev take the current key as a PROBE (LRM 7.9.4 allows one that
-        // is not present), so an x/z probe is normalized as its must bits rather
-        // than gated -- the clause defines no invalid-probe behaviour.
+        // next / prev take the current key as a PROBE (LRM 7.9.6 / 7.9.7), which an x or z bit
+        // makes an invalid index (7.8.4, 7.8.6; docs/LRM_NOTES.md note 74): the call finds no
+        // entry, returns 0, leaves the argument alone and warns as any invalid index does.
         const auto cur = normalize_assoc_key_lvalue(key_lv, aa.assoc_type);
         status =
           b_.CreateCall(assoc_step_fn(tag == Inst::Tag::AssocPrev), { handle, cur.ptr, cur.len, outptr, outlen });
+        if (cur.valid != nullptr) {
+            if (sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+                const Guarded arr = lvalue_of(p.op);
+                emit_bounds_report(BoundsCheck{
+                                     .inrange = cur.valid,
+                                     .index   = b_.getInt64(0),
+                                     .unknown = b_.getInt1(true),
+                                     .extent  = b_.getInt64(0),
+                                     .site    = bounds_site_global(loc_text(i), loc_text(i), bounds_name(arr),
+                                                                   BoundsWhat::AssocKey, 0, 0),
+                                   },
+                                   /*is_write=*/false);
+            }
+            status = b_.CreateSelect(cur.valid, status, zero(32));
+        }
     }
     auto* got  = b_.CreateICmpNE(status, zero(32));
     auto* fn   = b_.GetInsertBlock()->getParent();
@@ -1060,7 +1073,22 @@ void Backend::lower_assoc_traverse(Index i, Inst::Tag tag) {
     // owner survives agg_member only for a member that reaches a class handle, so a
     // non-empty gc_owner here already proves the key variable can hold one (§7).
     // Inside the found block, so a miss writes nothing and logs nothing.
-    emit_gc_barrier_for(key_lv);
+    // A key that is, or holds, a container or an aggregate is written as a whole, so the barrier
+    // covers all of the variable.
+    uint64_t key_bytes = sizeof(void*);
+    {
+        const Type& at = std::get<Type>(mod_.pool.get(aa.assoc_type));
+        if (at.right == 0) {
+            const Ref key_type = static_cast<Ref>(at.fields_id);
+            if ((is_handle_type(key_type) || is_agg_abi(key_type)) && reaches_class_handle(key_type)) {
+                key_bytes =
+                  std::max<uint64_t>(2 * sizeof(void*),
+                                     env_->llmod.getDataLayout().getTypeAllocSize(
+                                       is_handle_type(key_type) ? handle_slot_ty(key_type) : agg_storage_ty(key_type)));
+            }
+        }
+    }
+    emit_gc_barrier_for(key_lv, key_bytes);
     denormalize_assoc_key(b_.CreateLoad(raw_ptr_ty(), outptr),
                           b_.CreateLoad(b_.getInt32Ty(), outlen), aa.assoc_type, key_lv, i);
     b_.CreateBr(cont);
