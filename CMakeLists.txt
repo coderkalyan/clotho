@@ -302,11 +302,13 @@ FetchContent_Declare(
   # expression. The value now parses as a data type when it is no expression, and the
   # override reaches the type parameter's builder through the hierarchy override node,
   # keyed by its declarator like a value parameter's (LRM 6.20.3, 23.10.2). Not upstream.
-  # slang-string-unbounded-range: `s inside {["m":$]}` and `case (s) inside ["m":$]`
-  # (IEEE 1800-2023 11.4.13) aborted in ConversionExpression::makeImplicit's assertion:
-  # ValueRangeExpression::propagateType converted the `$` bound to `string`, which
-  # an unbounded literal is not assignable to. A `$` over strings now stays unconverted;
-  # a string has no lowest or highest value, so the side bounds nothing. Not upstream.
+  # slang-string-unbounded-range: `s inside {["m":$]}`, `case (s) inside ["m":$]` and
+  # `r inside {[5.0:$]}` (IEEE 1800-2023 11.4.13) aborted in ConversionExpression::
+  # makeImplicit's assertion (a slang Debug build; a Release one went on): ValueRange-
+  # Expression::propagateType converted the `$` bound to `string` or `real`, which an
+  # unbounded literal is not assignable to. A `$` over either now stays unconverted;
+  # the lowerer reads the literal itself (is_unbounded_bound), and a string has no lowest
+  # or highest value, so that side bounds nothing. Not upstream.
   #
   # slang-bits-class-handle: `$bits` of an expression that is, or holds, a class handle
   # (IEEE 1800-2023 20.6.2) folded to the size of the handle's declared class in every

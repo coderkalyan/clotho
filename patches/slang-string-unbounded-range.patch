@@ -2,16 +2,17 @@ diff --git a/source/ast/expressions/OperatorExpressions.cpp b/source/ast/express
 index 03e33e9c1..0258fd2c4 100644
 --- a/source/ast/expressions/OperatorExpressions.cpp
 +++ b/source/ast/expressions/OperatorExpressions.cpp
-@@ -2565,9 +2565,16 @@ Expression& ValueRangeExpression::fromSyntax(Compilation& comp,
+@@ -2565,9 +2565,17 @@ Expression& ValueRangeExpression::fromSyntax(Compilation& comp,
  
  bool ValueRangeExpression::propagateType(const ASTContext& context, const Type& newType,
                                           SourceRange opRange, ConversionKind) {
 -    contextDetermined(context, left_, this, newType, opRange);
-+    // A `$` bound over strings is no value to convert (IEEE 1800-2023 11.4.13: it
-+    // stands for the lowest or highest value of the left operand's type, and a
-+    // string has neither); converting it to `string` trips makeImplicit's assertion.
++    // A `$` bound over strings or reals is no value to convert (IEEE 1800-2023
++    // 11.4.13: it stands for the lowest or highest value of the left operand's type,
++    // and a string has neither); converting it to `string` or `real` trips
++    // makeImplicit's assertion, an unbounded literal not being assignable to either.
 +    auto propagate = [&](Expression*& bound) {
-+        if (!(newType.isString() && bound->type->isUnbounded()))
++        if (!((newType.isString() || newType.isFloating()) && bound->type->isUnbounded()))
 +            contextDetermined(context, bound, this, newType, opRange);
 +    };
 +    propagate(left_);
