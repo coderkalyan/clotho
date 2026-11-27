@@ -1165,6 +1165,40 @@ bool Backend::service_wait_queue(Signal       sig,
         return false;
     }
     const SignalSlot& slot = slot_of(sig);
+    if (uniform(sig) && !trace_on() && port_reachable(slot)) {
+        // Bound storage: the store tests only whether its value changed and
+        // whether the port's wake mask names anything (a bucket, a trigger, a
+        // dump), and hands the shared bound_store_fn the LSB planes, which it
+        // classifies into edges. The dump-var touch rides along, so the caller
+        // makes none.
+        const EdgeFacts f =
+          emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z, false, false, true);
+        auto* const i32  = b_.getInt32Ty();
+        auto* const fn   = b_.GetInsertBlock()->getParent();
+        auto* const chg  = llvm::BasicBlock::Create(ctx_, "bound.changed", fn);
+        auto* const call = llvm::BasicBlock::Create(ctx_, "bound.notify", fn);
+        auto* const cont = llvm::BasicBlock::Create(ctx_, "bound.cont", fn);
+        b_.CreateCondBr(f.changed, chg, cont);
+        b_.SetInsertPoint(chg);
+        llvm::Value* const mask = b_.CreateLoad(i32, port_elem_ptr(slot, port_of(slot)->mask));
+        b_.CreateCondBr(b_.CreateICmpNE(mask, b_.getInt32(0)), call, cont);
+        b_.SetInsertPoint(call);
+        // The LSB of each plane (must, then may for a 4-state slot): bits 0-1 the
+        // old value's, 2-3 the new one's.
+        const auto lsb = [&](llvm::Value* mm) {
+            llvm::Value* const bits = b_.CreateZExt(b_.CreateTrunc(mm, b_.getInt1Ty()), i32);
+            if (!slot.four_state) {
+                return bits;
+            }
+            llvm::Value* const may = b_.CreateTrunc(b_.CreateLShr(mm, slot.width), b_.getInt1Ty());
+            return b_.CreateOr(bits, b_.CreateShl(b_.CreateZExt(may, i32), b_.getInt32(1)));
+        };
+        llvm::Value* const edges = b_.CreateOr(lsb(old_mm), b_.CreateShl(lsb(new_mm), b_.getInt32(2)));
+        b_.CreateCall(bound_store_fn(*port_of(slot), slot.four_state), { port_elem_ptr(slot, 0), mask, edges });
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+        return true;
+    }
     const EdgeFacts   f =
       emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
                       signal_has_bucket(sig, Edge::Positive), signal_has_bucket(sig, Edge::Negative),
@@ -1191,10 +1225,14 @@ bool Backend::service_wait_queue(Signal       sig,
 
 // Fire each of `sig`'s per-edge buckets that exists behind one branch on its fact.
 // Bound storage reached through its port has every bucket, `<= @` trigger id
-// included, and scans or fires each one the port does not mark empty.
+// included, and is served by emit_bound_notify.
 void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
     const auto i     = static_cast<uint32_t>(sig);
     const bool canon = uniform(sig) && port_reachable(slot_of(sig));
+    if (canon && !trace_on()) {
+        emit_bound_notify(sig, f, nullptr);
+        return;
+    }
 
     // One change is one release moment for the `<= @` records it matures, however many
     // of the buckets below it satisfies.
@@ -1243,6 +1281,36 @@ void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
     }
 }
 
+// The wake of a change `f` of bound storage `sig` reached through its port: the
+// change's edge facts masked by the port's wake mask (`mask`, loaded here when
+// null), and one call of the module's shared bound_notify_fn when anything is
+// left, so a store site holds no more code than one with a single bucket.
+void Backend::emit_bound_notify(Signal sig, const EdgeFacts& f, llvm::Value* mask) {
+    assert(f.changed != nullptr && f.pos != nullptr && f.neg != nullptr && "bound storage classifies every edge");
+    // Bit e of `edges` is Edge e's fact; spread over the mask's three groups it
+    // keeps the buckets and triggers this change satisfies and the port fills.
+    const SignalSlot& s     = slot_of(sig);
+    auto* const       i32   = b_.getInt32Ty();
+    llvm::Value*      edges = b_.CreateOr(
+      b_.CreateZExt(f.pos, i32),
+      b_.CreateOr(b_.CreateShl(b_.CreateZExt(f.neg, i32), b_.getInt32(1)),
+                  b_.CreateShl(b_.CreateZExt(f.changed, i32), b_.getInt32(2))));
+    edges = b_.CreateOr(edges, b_.CreateOr(b_.CreateShl(edges, b_.getInt32(PortLayout::mask_dyn)),
+                                           b_.CreateShl(edges, b_.getInt32(PortLayout::mask_trig))));
+    if (mask == nullptr) {
+        mask = b_.CreateLoad(i32, port_elem_ptr(s, port_of(s)->mask));
+    }
+    llvm::Value* const want = b_.CreateAnd(edges, mask);
+    auto* const        fn   = b_.GetInsertBlock()->getParent();
+    auto* const        body = llvm::BasicBlock::Create(ctx_, "bound.notify", fn);
+    auto* const        cont = llvm::BasicBlock::Create(ctx_, "bound.cont", fn);
+    b_.CreateCondBr(b_.CreateICmpNE(want, b_.getInt32(0)), body, cont);
+    b_.SetInsertPoint(body);
+    b_.CreateCall(bound_notify_fn(*port_of(s)), { port_elem_ptr(s, 0), want });
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
+}
+
 // The `<= @(edge sig)` trigger id of bound storage, from its port: no_id when
 // nothing lists that edge of this instance's signal.
 llvm::Value* Backend::port_trigger_id(Signal sig, uint32_t edge) {
@@ -1265,6 +1333,133 @@ void Backend::fire_port_trigger(Signal sig, uint32_t edge) {
     emit_trigger_fire(id);
     b_.CreateBr(cont);
     b_.SetInsertPoint(cont);
+}
+
+// The wake of a bound signal's change, shared by every store site of the module
+// with port layout `pl` (service_wake_buckets): (port ptr, want i32), `want` the
+// change's edge facts masked by the port's wake mask (PortLayout::mask). Starts
+// the change's release moment when it satisfies a `<= @` trigger, then per edge
+// scans the static bucket, the dynamic one and fires the trigger `want` names.
+llvm::Function* Backend::bound_notify_fn(const PortLayout& pl) {
+    llvm::Module* const m   = &env_->llmod;
+    const auto          key = std::make_pair(m, pl.ty);
+    if (const auto it = bound_notify_fns_.find(key); it != bound_notify_fns_.end()) {
+        return it->second;
+    }
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    auto* const i32 = b_.getInt32Ty();
+    // Named alike in every module; LLVM numbers a second layout's within one.
+    llvm::Function* const f = llvm::Function::Create(llvm::FunctionType::get(b_.getVoidTy(), { ptr, i32 }, false),
+                                                     llvm::Function::InternalLinkage, "clotho.notify.bound", *m);
+    f->addFnAttr(llvm::Attribute::NoInline);
+    f->addFnAttr(llvm::Attribute::NoUnwind);
+    bound_notify_fns_.emplace(key, f);
+
+    const llvm::IRBuilderBase::InsertPointGuard guard(b_);
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", f));
+    emit_bound_wake(pl, f->getArg(0), f->getArg(1));
+    b_.CreateRetVoid();
+    return f;
+}
+
+// The body of bound_notify_fn at the insertion point: from the port `port` and the
+// wanted wakes `want`, the release moment, then per edge the static scan, the
+// dynamic scan and the trigger.
+void Backend::emit_bound_wake(const PortLayout& pl, llvm::Value* port, llvm::Value* want) {
+    auto* const ptr  = llvm::PointerType::getUnqual(ctx_);
+    auto* const i32  = b_.getInt32Ty();
+    auto* const i64  = b_.getInt64Ty();
+    auto* const f    = b_.GetInsertBlock()->getParent();
+    const auto  elem = [&](llvm::Type* ty, uint32_t k) { return b_.CreateLoad(ty, b_.CreateStructGEP(pl.ty, port, k)); };
+    const auto  when = [&](llvm::Value* cond, const char* label, auto&& emit) {
+        auto* const body = llvm::BasicBlock::Create(ctx_, label, f);
+        auto* const cont = llvm::BasicBlock::Create(ctx_, std::string(label) + ".cont", f);
+        b_.CreateCondBr(cond, body, cont);
+        b_.SetInsertPoint(body);
+        emit();
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    };
+    const auto has = [&](uint32_t bit) { return b_.CreateICmpNE(b_.CreateAnd(want, b_.getInt32(bit)), b_.getInt32(0)); };
+    if (!intra_trigger_edge_.empty()) {
+        when(has(7u << PortLayout::mask_trig), "moment", [&] { b_.CreateCall(intra_moment_fn(), {}); });
+    }
+    // Any, then the edges, as service_wake_buckets scans them.
+    for (const uint32_t e : { static_cast<uint32_t>(Edge::Any), static_cast<uint32_t>(Edge::Positive),
+                              static_cast<uint32_t>(Edge::Negative) }) {
+        when(has(1u << (PortLayout::mask_sta + e)), "sta", [&] {
+            emit_static_scan_rt(elem(ptr, pl.sta[e]), { .kind = RT_TRACE_STATIC, .fact = e });
+        });
+        when(has(1u << (PortLayout::mask_dyn + e)), "dyn", [&] {
+            emit_dynamic_scan_rt(elem(ptr, pl.dyn[e].base), elem(ptr, pl.dyn[e].len),
+                                 { .kind = RT_TRACE_DYNAMIC, .fact = e });
+        });
+        if (!trigger_id_.empty()) {
+            when(has(1u << (PortLayout::mask_trig + e)), "trig", [&] {
+                emit_trigger_fire(elem(i32, pl.id[static_cast<uint32_t>(IdFamily::TrigPos) + e]));
+            });
+        }
+    }
+}
+
+// A changed store to bound storage, shared by every such store site of the module
+// with port layout `pl` and plane count `four` (service_wait_queue): (port ptr,
+// mask i32, lsb i32), `mask` the port's nonzero wake mask, `lsb` the old (bits
+// 0-1) and new (bits 2-3) value's LSB planes. Classifies the edges as
+// emit_edge_facts does for the whole value, wakes what the mask names
+// (emit_bound_wake), and touches the dump-var index of a dumped signal.
+llvm::Function* Backend::bound_store_fn(const PortLayout& pl, bool four) {
+    llvm::Module* const m   = &env_->llmod;
+    const auto          key = std::make_tuple(m, pl.ty, four);
+    if (const auto it = bound_store_fns_.find(key); it != bound_store_fns_.end()) {
+        return it->second;
+    }
+    auto* const i32 = b_.getInt32Ty();
+    auto* const ptr = llvm::PointerType::getUnqual(ctx_);
+    // Named alike in every module; LLVM numbers a second shape's within one.
+    llvm::Function* const f = llvm::Function::Create(llvm::FunctionType::get(b_.getVoidTy(), { ptr, i32, i32 }, false),
+                                                     llvm::Function::InternalLinkage, "clotho.store.bound", *m);
+    f->addFnAttr(llvm::Attribute::NoInline);
+    f->addFnAttr(llvm::Attribute::NoUnwind);
+    bound_store_fns_.emplace(key, f);
+
+    const llvm::IRBuilderBase::InsertPointGuard guard(b_);
+    b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", f));
+    llvm::Value* const port = f->getArg(0);
+    llvm::Value* const mask = f->getArg(1);
+    llvm::Value* const lsb  = f->getArg(2);
+    // A one-bit value of the slot's planes: must, then may for a 4-state slot.
+    llvm::Type* const  bit  = b_.getIntNTy(four ? 2 : 1);
+    const EdgeFacts    e    = emit_edge_facts(b_.CreateTrunc(lsb, bit), b_.CreateTrunc(b_.CreateLShr(lsb, 2), bit), 1, four,
+                                              nullptr, nullptr, true, true, false);
+    llvm::Value* edges = b_.CreateOr(b_.CreateOr(b_.CreateZExt(e.pos, i32), b_.CreateShl(b_.CreateZExt(e.neg, i32), 1)),
+                                     b_.getInt32(1u << static_cast<uint32_t>(Edge::Any)));
+    edges = b_.CreateOr(edges, b_.CreateOr(b_.CreateShl(edges, PortLayout::mask_dyn),
+                                           b_.CreateShl(edges, PortLayout::mask_trig)));
+    llvm::Value* const want = b_.CreateAnd(edges, mask);
+    const auto         when = [&](llvm::Value* cond, const char* label, auto&& emit) {
+        auto* const body = llvm::BasicBlock::Create(ctx_, label, f);
+        auto* const cont = llvm::BasicBlock::Create(ctx_, std::string(label) + ".cont", f);
+        b_.CreateCondBr(cond, body, cont);
+        b_.SetInsertPoint(body);
+        emit();
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    };
+    when(b_.CreateICmpNE(want, b_.getInt32(0)), "wake", [&] { emit_bound_wake(pl, port, want); });
+    if (pl.vcd != no_port_elem) {
+        llvm::Value* const dumped = b_.CreateICmpNE(b_.CreateAnd(mask, b_.getInt32(1u << PortLayout::mask_vcd)),
+                                                    b_.getInt32(0));
+        when(dumped, "dumped", [&] {
+            emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                return llvm::SmallVector<llvm::Value*, 2>{
+                    b_.CreateLoad(i32, b_.CreateStructGEP(pl.ty, port, pl.vcd))
+                };
+            });
+        });
+    }
+    b_.CreateRetVoid();
+    return f;
 }
 
 // Service a waited-on class property's change notifiers after a blocking write to

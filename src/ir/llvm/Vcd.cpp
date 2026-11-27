@@ -247,17 +247,24 @@ void Backend::vcd_touch_signal(Signal sig) {
 // write.
 bool Backend::vcd_touch_bound(Signal sig) {
     const SignalSlot& s = slot_of(sig);
-    if (!uniform(sig) || s.is_array) {
+    if (!uniform(sig) || s.is_array || port_of(s) == nullptr || binding_of(s) == no_bind) {
         return false;
     }
-    llvm::Value* const port = bound_port(s);
-    if (port == nullptr) {
-        return false;
-    }
-    llvm::Value* const index = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(port_of(s)->ty, port, port_of(s)->vcd));
-    emit_guarded_vcd_touch(
-      vcd_touch_fn(), [&] { return llvm::SmallVector<llvm::Value*, 2>{ index }; },
-      b_.CreateICmpNE(index, b_.getInt32(~0u)));
+    // The dump flag first, as emit_guarded_vcd_touch tests it: a store pays one
+    // load and branch while nothing is dumped.
+    llvm::Function* const f      = b_.GetInsertBlock()->getParent();
+    llvm::Value* const    active = b_.CreateLoad(b_.getInt8Ty(), vcd_active_gv());
+    auto* const           chk    = llvm::BasicBlock::Create(ctx_, "vcd.bound", f);
+    auto* const           touch  = llvm::BasicBlock::Create(ctx_, "vcd.touch", f);
+    auto* const           cont   = llvm::BasicBlock::Create(ctx_, "vcd.cont", f);
+    b_.CreateCondBr(b_.CreateICmpNE(active, b_.getInt8(0)), chk, cont);
+    b_.SetInsertPoint(chk);
+    llvm::Value* const index = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(port_of(s)->ty, bound_port(s), port_of(s)->vcd));
+    b_.CreateCondBr(b_.CreateICmpNE(index, b_.getInt32(~0u)), touch, cont);
+    b_.SetInsertPoint(touch);
+    b_.CreateCall(vcd_touch_fn(), { index });
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
     return true;
 }
 
