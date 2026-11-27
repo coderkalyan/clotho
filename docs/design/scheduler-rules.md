@@ -308,7 +308,7 @@ Rows involving no speedup of §2: B1, B4, B14, B27, B31, B45, B46.
 |---|---|---|---|---|
 | NBA creation order × staging paths and ready lists | R12 × S23, S24 | B9, B12, B22, B38, B40, B42, B49 | none | `intra_assign_test.cpp` (many); `nba-glitch` adds `nba_update_order_test.cpp` |
 | disable/kill × one-wake token, inline runs, claim gating | R23 × S2, S15, S16 | B13, B28, B29, B32, B44 | none | `loop_test.cpp`, `process_test.cpp`, `sync_test.cpp` |
-| force × continuous processes, inertial commit, NBA commit | R14 × S21, S22, S26 | B10, B26, B33, B35, B36, B47 | none | `force_release_test.cpp`, `net_delay_test.cpp` |
+| force × continuous processes, inertial commit, NBA commit | R14 × S21, S22, S26 | B10, B26, B33, B35, B36, B47 | none | `force_release_test.cpp`, `net_delay_test.cpp`; the trace's R14.1 to R14.3 (`trace_check_test.cpp`) |
 | `$finish` × cooperative finish | R24 × S11, S17 | B19, B34, B37 | none (S11: `dedup`) | `function_test.cpp`, `class_test.cpp`, `llvm_backend_test.cpp` |
 | `->>` × pend chain and region elision | R20 × S13, S25 | B20, B21, B41 | none | `event_test.cpp`, `intra_assign_test.cpp` |
 | per-update events × block commit, ready lists, event nets | R8, R9 × S21, S22, S23, S24 | B48, B49, B50 | none | none on main (`nba-glitch` only) |
