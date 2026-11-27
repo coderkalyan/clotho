@@ -3536,3 +3536,47 @@ TEST_CASE("trace check: a design that forces, releases, assigns and deassigns ru
     CHECK(after.override_resolves > before.override_resolves);
 }
 #endif // CLOTHO_EXTRA_ASSERTS
+
+// A design that forces and releases a variable and a net: the override marks plant trace calls only in a build
+// with CLOTHO_EXTRA_ASSERTS and the config asking for it, and in no other build the code is the one the config
+// that turns the check off gives.
+TEST_CASE("the override events are generated only in a CLOTHO_EXTRA_ASSERTS build, and the force sites' code is the same without them") {
+    const auto text = [](const ir::SimulationConfig& config) {
+        const LowerResult r = lower_text(R"(
+            module t;
+              logic [7:0] v, a = 1;
+              wire  [7:0] n = a;
+              initial begin
+                #1 force v = 8'd7; force n = 8'd3; assign v = a;
+                #1 release n; deassign v; release v;
+              end
+            endmodule)");
+        REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+        auto host = ir::host_target();
+        REQUIRE(static_cast<bool>(host));
+        auto tm = host->createTargetMachine();
+        REQUIRE(static_cast<bool>(tm));
+        llvm::LLVMContext ctx;
+        const auto        built = ir::build_modules_unoptimized(*r.module, ctx, **tm, config);
+        std::string              out;
+        llvm::raw_string_ostream os(out);
+        for (const auto& m : built.modules) {
+            m->print(os, nullptr);
+        }
+        return out;
+    };
+    ir::SimulationConfig off;
+    off.trace_check = false;
+    ir::SimulationConfig asked;
+    asked.trace_check = true;
+    const std::string without = text(off);
+    CHECK(without.find("rt_trace_") == std::string::npos);
+    const std::string with = text(asked);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    for (const char* fn : { "rt_trace_override_state", "rt_trace_override_apply", "rt_trace_override_resolve" }) {
+        CHECK_MESSAGE(with.find(fn) != std::string::npos, fn);
+    }
+#else
+    CHECK(with == without);
+#endif
+}
