@@ -3219,10 +3219,6 @@ private:
         b.SetInsertPoint(cont);
     }
 
-    // The static wake scan, emitted once per LLVM module and shape and called from
-    // The shared static scans (static_scan_fn) per LLVM module and shape.
-    std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*> static_scan_fns_;
-
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why);
 
     // Run the simulation: seed the active queue with every process, then alternate
