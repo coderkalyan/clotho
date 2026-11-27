@@ -282,6 +282,16 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
     for (const InstanceScope& child : scope.children) {
         scope_type(child, claimed, hier + "." + child.name);
     }
+    bool     any_handle = false;
+    uint32_t nflags     = 0;
+    for (const Signal sig : defined) {
+        SignalSlot& s = slots_[static_cast<uint32_t>(sig)];
+        any_handle    = any_handle || reaches_class_handle(s.ir_type);
+        nflags += assign_gc_flags(s, nflags);
+    }
+    const uint32_t cards_field = add_gc_cards(fields, any_handle);
+    anchors_[aid].cards_field  = cards_field;
+    anchors_[aid].flags_field  = add_gc_flags(fields, nflags);
 
     for (const auto& [def, flds, ty] : def_types_) {
         if (def == scope.def_name && flds == fields) {
@@ -610,7 +620,102 @@ void Backend::build_state_types() {
         }
     }
 
+    {
+        bool     any_handle = false;
+        uint32_t nflags     = 0;
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (claimed[i]) {
+                continue;
+            }
+            any_handle = any_handle || reaches_class_handle(slots_[i].ir_type);
+            nflags += assign_gc_flags(slots_[i], nflags);
+        }
+        root_cards_field_ = add_gc_cards(root_fields, any_handle);
+        root_flags_field_ = add_gc_flags(root_fields, nflags);
+    }
     state_ty_ = llvm::StructType::create(ctx_, root_fields, "clotho.state");
+}
+
+// A region that can hold a class handle ends in one byte of dirty flag for each RT_GC_CARD_BYTES
+// of what lies before them (Gc.h, rt_gc_roots), so that the card of any place in it is a constant
+// offset from the region's own base, whichever instance's region it is. The fields before the
+// cards keep every offset they had.
+uint32_t Backend::add_gc_cards(std::vector<llvm::Type*>& fields, bool any_handle) {
+    if (!any_handle) {
+        return Anchor::no_cards;
+    }
+    assert(!fields.empty() && "a region that holds a handle has a field");
+    const llvm::DataLayout& dl = root_env_->llmod.getDataLayout();
+    const auto*             sl = dl.getStructLayout(llvm::StructType::get(ctx_, fields));
+    const uint64_t          end =
+      sl->getElementOffset(static_cast<unsigned>(fields.size() - 1)) + dl.getTypeAllocSize(fields.back());
+    assert(end < UINT32_MAX / 2 && "a state region is smaller than 2 GiB");
+    const uint64_t ncards = ((end - 1) >> RT_GC_CARD_SHIFT) + 1;
+    fields.push_back(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx_), ncards));
+    return static_cast<uint32_t>(fields.size() - 1);
+}
+
+uint32_t Backend::gc_cards_field(const SignalSlot& s) const {
+    const uint32_t field = s.anchor == SignalSlot::no_anchor ? root_cards_field_ : anchors_[s.anchor].cards_field;
+    assert(field != Anchor::no_cards && "a signal that holds a handle is in a region with card bytes");
+    return field;
+}
+
+uint32_t Backend::gc_flags_field(const SignalSlot& s) const {
+    const uint32_t field = s.anchor == SignalSlot::no_anchor ? root_flags_field_ : anchors_[s.anchor].flags_field;
+    assert(field != Anchor::no_flags && s.cflag_base != SignalSlot::no_flags &&
+           "a signal that holds a container of handles is in a region with flag bytes");
+    return field;
+}
+
+// The container flag bytes follow the card bytes, so the two arrays are one run: the table
+// says where the flags start by the cards' end (gc_roots_global asserts it).
+uint32_t Backend::add_gc_flags(std::vector<llvm::Type*>& fields, uint32_t nflags) {
+    if (nflags == 0) {
+        return Anchor::no_flags;
+    }
+    assert(!fields.empty() && fields.back()->isArrayTy() && "the flag bytes follow the card bytes");
+    fields.push_back(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx_), nflags));
+    return static_cast<uint32_t>(fields.size() - 1);
+}
+
+uint32_t Backend::assign_gc_flags(SignalSlot& s, uint32_t first) {
+    if (!holds_gc_container(s.ir_type)) {
+        return 0;
+    }
+    const uint64_t bytes = root_env_->llmod.getDataLayout().getTypeAllocSize(s.storage_ty);
+    s.cflag_base         = first;
+    return static_cast<uint32_t>((bytes + RT_GC_CFLAG_BYTES - 1) >> RT_GC_CFLAG_SHIFT);
+}
+
+// The shapes collect_gc_containers finds entries for: a container that reaches a class handle is
+// a boundary, and unpacked arrays and structs are looked through.
+bool Backend::holds_gc_container(Ref type) {
+    assert(type != Ref::Invalid && "a container search needs a real type");
+    [[maybe_unused]] static constexpr uint32_t kWalkStepsMax = 1u << 20;
+    std::vector<Ref>                           work{ type };
+    [[maybe_unused]] uint32_t                  steps = 0;
+    while (!work.empty()) {
+        ++steps;
+        assert(steps < kWalkStepsMax && "container search did not converge");
+        const Ref r = work.back();
+        work.pop_back();
+        if (types::is_container(mod_.pool, r)) {
+            if (reaches_class_handle(r)) {
+                return true;
+            }
+            continue;
+        }
+        const Type& t = std::get<Type>(mod_.pool.get(r));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            work.push_back(t.element);
+        } else if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                work.push_back(fld.type);
+            }
+        }
+    }
+    return false;
 }
 
 const SignalSlot& Backend::slot_of(Signal s) const {

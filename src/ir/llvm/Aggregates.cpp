@@ -68,7 +68,7 @@ void Backend::emit_class_body_init(Ref class_ref, llvm::Value* body_ptr) {
     uint32_t                  f   = 0;
     for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
         path.push_back(b_.getInt32(hdr + f++));
-        emit_agg_init(fld.type, body_ptr, path, root_ty);
+        emit_agg_init(fld.type, body_ptr, path, root_ty, /*object_body=*/true);
         path.pop_back();
     }
 }
@@ -206,14 +206,12 @@ Guarded Backend::agg_member(Guarded lv, Ref struct_type, uint32_t field_index) {
     // question, so an aggregate member and a nested struct member keep the owner
     // of the object they belong to -- which is the right owner, since an interior
     // aggregate is part of that same object's traced image.
-    if (lv.gc_owner != nullptr && !reaches_class_handle(mt)) {
-        lv.gc_owner = nullptr;
-        // Root and owner travel together, so that `gc_container_root != nullptr`
-        // always implies an owner. `obj.qq[1].count` reaches an int leaf inside a
-        // payload: no GC edge can land there, so a `ref` to it needs no container
-        // registration any more than it needs a barrier.
-        lv.gc_container_root = nullptr;
-        lv.gc_container_type = Ref::Invalid;
+    if ((lv.gc_owner != nullptr || lv.gc_ref_slot != nullptr || lv.gc_state_base != nullptr) &&
+        !reaches_class_handle(mt)) {
+        lv.gc_owner      = nullptr;
+        lv.gc_ref_slot   = nullptr;
+        lv.gc_ref_chain  = nullptr;
+        lv.gc_state_base = nullptr;
     }
     lv.agg_leaf = is_leaf_type(mt);
     if (lv.agg_leaf) {
@@ -253,7 +251,11 @@ Guarded Backend::agg_elem(Guarded lv, Ref array_type, uint32_t pos) {
 // runtime loops (keeping init O(size) in emitted instructions), struct fields
 // straight-line GEPs. `root_ty` is the aggregate's storage type; `path`
 // accumulates GEP indices from its root.
-void Backend::emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path, llvm::Type* root_ty) {
+void Backend::emit_agg_init(Ref                        type,
+                            llvm::Value*               base,
+                            std::vector<llvm::Value*>& path,
+                            llvm::Type*                root_ty,
+                            bool                       object_body) {
     const Type& t = std::get<Type>(mod_.pool.get(type));
     if (t.kind == Type::Kind::UnpackedArray) {
         const uint32_t n     = array_dim(t);
@@ -270,7 +272,7 @@ void Backend::emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value
         b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(n)), body, done);
         b_.SetInsertPoint(body);
         path.push_back(idx);
-        emit_agg_init(t.element, base, path, root_ty);
+        emit_agg_init(t.element, base, path, root_ty, object_body);
         path.pop_back();
         idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
@@ -281,7 +283,7 @@ void Backend::emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value
         uint32_t f = 0;
         for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
             path.push_back(b_.getInt32(f++));
-            emit_agg_init(fld.type, base, path, root_ty);
+            emit_agg_init(fld.type, base, path, root_ty, object_body);
             path.pop_back();
         }
         return;
@@ -300,8 +302,16 @@ void Backend::emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value
         // property -- binds its own object. This one arm serves all three,
         // because module signals (init_state), frame locals (init_frame) and
         // class object bodies (emit_class_body_init) all reach this walk.
-        b_.CreateStore(b_.CreateCall(event_new_fn()),
-                       b_.CreateInBoundsGEP(root_ty, base, idx));
+        // The event is allocated before it is stored, and that allocation can run a
+        // collection with the object this body belongs to live only in a register: the
+        // collection finds it on the stack and promotes it, and then the store lands in
+        // an old object nothing has logged. The barrier follows the allocation, then.
+        llvm::Value* event = b_.CreateCall(event_new_fn());
+        llvm::Value* where = b_.CreateInBoundsGEP(root_ty, base, idx);
+        if (object_body) {
+            emit_gc_barrier(base);
+        }
+        b_.CreateStore(event, where);
         return;
     }
     if (t.kind == Type::Kind::String) {

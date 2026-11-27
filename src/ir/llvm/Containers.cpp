@@ -753,6 +753,9 @@ void Backend::lower_dyn_array_new(Index i) {
     // zero-extending would turn `new[-1]` on a 32-bit int into a 4294967295-element
     // request. The frontend zero-extends an unsigned count past its top bit.
     llvm::Value* n = cast(must_of(da.arg), 64, true);
+    // Plain `new[n]` adds no reference of an element it keeps, but constructs each element it adds,
+    // and an event element's construction makes an object the container then holds.
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_new_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     elem_ops_global(da.array_type),
@@ -768,7 +771,7 @@ void Backend::lower_dyn_array_new_init(Index i) {
     // `new[n](src)` copies src's elements in, so the owner acquires every reference
     // src held. Plain `new[n]` (lower_dyn_array_new) is deliberately bare: it
     // preserves or drops elements and adds no reference. See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_new_copy_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     elem_ops_global(da.array_type),
@@ -789,7 +792,7 @@ void Backend::lower_dyn_array_copy(Index i) {
     const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
     // Whole-array assign: the owner acquires every reference the source held.
     // See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_assign_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(da.arg), HandleUse::Read),
@@ -802,7 +805,7 @@ void Backend::lower_dyn_array_copy_queue(Index i) {
     const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
     // Whole-array assign from a queue (LRM 7.5.1's resizeable assignment).
     // See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     b_.CreateCall(dynarr_assign_queue_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(da.arg), HandleUse::Read),
@@ -883,7 +886,7 @@ LValue Backend::dyn_agg_elem_lvalue(const LValueInfo& container,
     // trace map (Gc.h:324-326), so the owner travels with the element lvalue. No
     // reachability gate here, unlike agg_member: a container reaches a class handle
     // exactly when its element does, so the owner is already null if it cannot.
-    sel.gc_owner      = container.gc_owner;
+    carry_gc_place(sel, container);
     return sel;
 }
 
@@ -963,10 +966,9 @@ void Backend::lower_queue_push(Index i, bool front) {
     // no reference, so only the ops that ADD one are instrumented; pop, delete,
     // reset, resize and the ordering methods are deliberately bare.
     //
-    // gc_owner is null unless the container is reached through a class property,
-    // so a queue in design state, a static, or a frame local emits nothing -- all
-    // three are scanned in full at every collection (Gc.h:319-323).
-    emit_gc_barrier_for(lvalue_of(p.op));
+    // A container in design state is logged by its own flag instead (emit_gc_state_barrier), the
+    // same call; a frame local needs nothing, since a frame is scanned in full at every collection.
+    emit_gc_container_barrier(lvalue_of(p.op));
     if (e.is_string) {
         // A string value is already an rt_string handle pointer; the runtime
         // deep-copies it into the new slot, so it is passed directly.
@@ -1085,7 +1087,7 @@ void Backend::lower_queue_insert(Index i) {
     llvm::Value*  bound = queue_bound_of(qlv, bound_v);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     // A new element, so a new reference. See lower_queue_push.
-    emit_gc_barrier_for(qlv);
+    emit_gc_container_barrier(qlv);
     // Inserting AT the size is an append, so the legal range is [0, size].
     emit_queue_bounds_check(i, handle, qi.idx, qlv, /*allow_append=*/true);
     if (e.is_string) {
@@ -1126,7 +1128,7 @@ void Backend::lower_queue_copy(Index i) {
     const auto  qa = ir_->extra_data<QueueArg>(p.extra);
     // Whole-container assign: the owner acquires every reference the source held.
     // See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     const uint64_t bound = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
     b_.CreateCall(queue_assign_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
@@ -1142,7 +1144,7 @@ void Backend::lower_queue_copy_dynarr(Index i) {
     const auto& p  = ir_->payload(i).op_extra;
     const auto  qa = ir_->extra_data<QueueArg>(p.extra);
     // Whole-container assign from a dynamic array. See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     const uint64_t bound = std::get<Type>(mod_.pool.get(qa.queue_type)).left;
     b_.CreateCall(queue_assign_dynarr_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
@@ -1165,7 +1167,7 @@ void Backend::lower_queue_append_range(Index i) {
     lo               = b_.CreateSelect(bad, b_.getInt64(1), lo);
     hi               = b_.CreateSelect(bad, b_.getInt64(0), hi);
     // A slice append copies a range of elements in. See lower_queue_push.
-    emit_gc_barrier_for(lvalue_of(p.op));
+    emit_gc_container_barrier(lvalue_of(p.op));
     queue_engine_call(queue_append_range_fn(),
                       { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                         lv_handle_ptr(lvalue_of(qs.src), HandleUse::Read),

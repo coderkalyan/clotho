@@ -498,30 +498,33 @@ struct LValueInfo {
     // The invariant, which every propagation site preserves: non-null implies a class
     // handle can land at or under this place, inside that owner.
     llvm::Value* gc_owner = nullptr;
-    // This assoc's key CONTAINS a class or event handle (rt_elem_ops carries its key
-    // shape, `assoc_key_shape`), so creating an entry stores a handle into
-    // the map's key storage -- a reference the owner acquires even when the VALUE is an
-    // int, and one that no further member selection is party to. Lifted onto the assoc
-    // lvalue at AssocSelect and consumed by assoc_elem_lvalue's put_ptr path, which is
-    // where the key is actually written.
-    bool assoc_key_handle = false;
-    // The OUTERMOST container on the path from `gc_owner` to this place whose handle
-    // still lives inside the owner's BODY, with its interned type. Non-null only once a
-    // select has re-based into that container's malloc'd payload, which is exactly when
-    // a `ref` formed here hands the callee a payload-interior pointer that
-    // rt_gc_find_object cannot resolve -- so the conservative frame scan cannot reach
-    // the owner and the collector's re-log cannot carry it forward across a suspension.
-    //
-    // The outermost one, and never the inner element: an element address is inside a
-    // payload that an outer ring growth reallocates, whereas a container handle in the
-    // object body is at a fixed address and never relocates. Registering the inner one
-    // would leave the collector reading freed memory after exactly the restructuring
-    // the ref epoch exists to detect (:22568-22569).
-    //
-    // Consumed only by lower_task_call_inst, which registers it as a dynamically-scoped
-    // container root for the call's duration (emit_gc_ref_container_add).
-    llvm::Value* gc_container_root = nullptr;
-    Ref          gc_container_type = Ref::Invalid;
+    // Creating an entry of this assoc stores a handle into the map -- a key that holds a class
+    // or event handle (rt_elem_ops carries its key shape, `assoc_key_shape`), or a value that
+    // can (an entry's value is constructed, and an event's construction makes an object) -- a
+    // reference the place's owner acquires even when the value stored afterwards is an int, and
+    // one that no further member selection is party to. Lifted onto the assoc lvalue at
+    // AssocSelect and consumed by assoc_elem_lvalue's put_ptr path, which is where the entry is
+    // created.
+    bool assoc_put_handle = false;
+    // The place is reached through a `ref` formal, which aliases storage the callee
+    // cannot attribute to an owner statically: an object's body, design state, a frame, or
+    // an element of a container some object owns. `gc_ref_slot` is the aliased address
+    // and `gc_ref_chain` the witness chain the call passed (null for a place that cannot
+    // move), which together let the runtime find the owner when a store lands
+    // (rt_gc_note_ref_store). Set only where the formal's type can hold a class handle,
+    // and cleared by agg_member for a member that cannot, as `gc_owner` is. Never set
+    // together with `gc_owner`: a HandleDeref starts a new place.
+    llvm::Value* gc_ref_slot  = nullptr;
+    llvm::Value* gc_ref_chain = nullptr;
+    // The place is inside the storage of design-state signal `gc_state_sig`, whose first byte is
+    // `gc_state_base`, and a class handle can land at or under it (docs/design/garbage-collection.md
+    // §7). Such a store is logged in the card of the region it lands in (emit_gc_state_barrier).
+    // Set at exactly one place, signal_lvalue; cleared by agg_member for a member that cannot reach
+    // a handle; carried by carry_gc_place through every element step. For a place inside a
+    // container's payload the card is the one of the outermost container, `epoch_chain.front()`.
+    // Never set together with `gc_owner` or `gc_ref_slot`.
+    llvm::Value* gc_state_base = nullptr;
+    Signal       gc_state_sig{ 0 };
     // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
     //
     // The notifiers of the class property this place selects, or lies inside, when some
@@ -934,6 +937,11 @@ struct SignalSlot {
     // which is addressed directly off @clotho.state.
     static constexpr uint32_t no_anchor = ~0u;
     uint32_t anchor = no_anchor;
+    // Index of this signal's first container flag byte among its region's (Gc.h, rt_gc_roots),
+    // one byte for each RT_GC_CFLAG_BYTES of its storage; no_flags unless it holds a container
+    // that can reach a class handle.
+    static constexpr uint32_t no_flags   = ~0u;
+    uint32_t                  cflag_base = no_flags;
     // A nonblocking target some virtual interface writes (LRM 25.9). Its writes
     // defer a record carrying the destination pointer AND the instance context,
     // instead of the per-signal block shadow: a handle supplies only a
@@ -1065,6 +1073,14 @@ struct Anchor {
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
+    // Field of the state struct that holds the card bytes of the region (Gc.h, rt_gc_roots), or
+    // no_cards when the scope holds no class handle.
+    static constexpr uint32_t no_cards    = ~0u;
+    uint32_t                  cards_field = no_cards;
+    // Field of the state struct that holds the container flag bytes of the region, after the
+    // card bytes, or no_flags when no signal of the scope holds a container of handles.
+    static constexpr uint32_t no_flags    = ~0u;
+    uint32_t                  flags_field = no_flags;
 
     // Instance context: ONE per-instance record (@clotho.inst.<hier>.ctx)
     // holding every base a def-relative body needs, laid out per definition so
@@ -1735,6 +1751,11 @@ private:
 
     bool reaches_class_handle(Ref type);
 
+    // Whether storage of this type holds a dynamic array, queue or associative array that can
+    // reach a class handle, through unpacked arrays and structs: a container of design state
+    // the collector walks by flag.
+    bool holds_gc_container(Ref type);
+
     std::vector<uint32_t> class_handle_offsets(Ref class_ref);
 
     std::vector<llvm::Constant*> class_elem_leaves(Ref class_ref);
@@ -1782,6 +1803,9 @@ private:
     struct GcContainer {
         uint64_t offset;
         Ref      type;
+        // Index of the flag byte of the container's first word in its region's flags
+        // (gc_roots_global; frame-resident containers have none).
+        uint32_t flag = 0;
     };
 
     void collect_gc_containers(Ref type, uint64_t base, llvm::Type* storage,
@@ -2542,12 +2566,13 @@ private:
 
     void signal_gc_containers(const SignalSlot& s, uint64_t base, std::vector<GcContainer>& out);
 
-    llvm::Constant* gc_roots_global(llvm::Constant* base, const std::vector<uint32_t>& offsets,
-                                    uint32_t index);
-
-    llvm::Constant* gc_containers_global(llvm::Constant* base,
-                                         const std::vector<GcContainer>& entries,
-                                         uint32_t                        index);
+    llvm::Constant* gc_roots_global(llvm::Constant*                 base,
+                                    const std::vector<uint32_t>&    offsets,
+                                    const std::vector<GcContainer>& containers,
+                                    uint32_t                        index,
+                                    llvm::StructType*               owner,
+                                    uint32_t                        cards_field,
+                                    uint32_t                        flags_field);
 
     llvm::Constant* gc_config_global();
 
@@ -3505,8 +3530,7 @@ private:
 
     llvm::StructType* gc_map_ty();
     llvm::StructType* gc_roots_ty();
-    llvm::StructType* gc_container_ty();
-    llvm::StructType* gc_container_table_ty();
+    llvm::StructType*    gc_container_ty();
     llvm::StructType* gc_frame_ty();
     llvm::StructType* gc_mutator_ty();
     llvm::StructType* gc_config_ty();
@@ -3520,12 +3544,12 @@ private:
     llvm::FunctionCallee gc_identity_object_fn();
     llvm::FunctionCallee gc_nba_words_add_fn();
     llvm::FunctionCallee gc_nba_container_add_fn();
-    llvm::FunctionCallee gc_containers_add_fn();
     llvm::FunctionCallee gc_container_add_fn();
     llvm::FunctionCallee gc_container_remove_fn();
     llvm::FunctionCallee gc_alloc_slow_fn();
     llvm::FunctionCallee gc_safepoint_slow_fn();
     llvm::FunctionCallee gc_remember_fn();
+    llvm::FunctionCallee gc_note_ref_store_fn();
 
     llvm::StructType* cover_range_ty();
     llvm::StructType* cover_bin_ty();
@@ -3587,12 +3611,46 @@ private:
 
     void emit_gc_barrier(llvm::Value* owner);
 
-    void emit_gc_barrier_for(const LValueInfo& lv);
+    // What a store through a place may add a handle to: a slot of the place (the default), or
+    // a container, whose handle the place is or whose payload it lies in.
+    enum class GcWrite : uint8_t { Slot, Container };
 
-    void note_gc_container_root(LValueInfo& lv, const LValueInfo& parent, llvm::Value* handle,
-                                Ref container_type);
+    void emit_gc_barrier_for(const Guarded& lv, uint64_t bytes = sizeof(void*), GcWrite what = GcWrite::Slot);
 
-    llvm::Value* emit_gc_ref_container_add(const LValueInfo& lv);
+    // The barrier of a mutation that adds a handle to the container `lv` designates.
+    void emit_gc_container_barrier(const Guarded& lv);
+
+    // How much design state a store through `lv` writes: the whole signal for a whole-signal
+    // place (a whole-aggregate nonblocking store), else one word.
+    uint64_t gc_store_bytes(const LValueInfo& lv) const;
+
+    void emit_gc_note_ref_store(llvm::Value* slot, llvm::Value* chain, uint64_t bytes);
+
+    llvm::FunctionCallee gc_note_state_store_fn();
+
+    void emit_gc_state_barrier(const LValue& v, uint64_t bytes, GcWrite what);
+
+    // The field of the state struct that holds the container flag bytes of a signal's region.
+    uint32_t gc_flags_field(const SignalSlot& s) const;
+
+    // Append the container flag bytes after the card bytes; returns the field index or
+    // Anchor::no_flags when `nflags` is zero.
+    uint32_t add_gc_flags(std::vector<llvm::Type*>& fields, uint32_t nflags);
+
+    // The flag bytes a signal's storage needs (0 unless it holds a container of handles), and
+    // sets its cflag_base to `first`.
+    uint32_t assign_gc_flags(SignalSlot& s, uint32_t first);
+
+    // The field of the state struct that holds the card bytes of a signal's region.
+    uint32_t gc_cards_field(const SignalSlot& s) const;
+
+    // Append the card bytes to the fields of a state struct whose signals include one that can
+    // reach a class handle; returns the field index or Anchor::no_cards.
+    uint32_t add_gc_cards(std::vector<llvm::Type*>& fields, bool any_handle);
+
+    void carry_gc_place(LValueInfo& to, const LValueInfo& from);
+
+    void set_gc_ref_place(LValueInfo& lv, uint32_t index);
 
     uint32_t intra_idx(Signal sig) const;
     bool              is_intra_target(Signal sig) const;
@@ -3618,7 +3676,11 @@ private:
 
     void init_state();
 
-    void emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path, llvm::Type* root_ty);
+    void emit_agg_init(Ref                        type,
+                       llvm::Value*               base,
+                       std::vector<llvm::Value*>& path,
+                       llvm::Type*                root_ty,
+                       bool                       object_body = false);
 
     void emit_agg_deinit(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path,
                          llvm::Type* root_ty);
@@ -5248,6 +5310,8 @@ private:
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
     llvm::StructType*       state_ty_ = nullptr;
+    uint32_t                root_cards_field_ = Anchor::no_cards;
+    uint32_t                root_flags_field_ = Anchor::no_flags;
     // The NBA shadow struct (valid iff non-null) and its standalone global.
     llvm::StructType*       shadow_ty_     = nullptr;
     llvm::GlobalVariable*   shadow_global_ = nullptr;
@@ -6187,9 +6251,8 @@ private:
     llvm::StructType* cover_point_ty_  = nullptr;
     llvm::StructType* cover_type_ty_   = nullptr;
     llvm::StructType* cover_config_ty_ = nullptr;
-    // rt_gc_container / rt_gc_container_table (Gc.h:249-261), the container-root ABI.
-    llvm::StructType* gc_container_ty_       = nullptr;
-    llvm::StructType* gc_container_table_ty_ = nullptr;
+    // rt_gc_container (Gc.h), the container-root ABI.
+    llvm::StructType* gc_container_ty_ = nullptr;
     llvm::StructType* gc_config_ty_  = nullptr;
     llvm::StructType* gc_mutator_ty_ = nullptr;
 };

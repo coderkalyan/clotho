@@ -2066,6 +2066,13 @@ void Backend::emit_copyout(const Function& f) {
         // plain (flat-stored) array it is the caller's canonical temp, which the
         // frontend then copies into the actual (emit_call_copyouts).
         if (is_agg_abi(f.param_types[k])) {
+            // The actual may be a class property or design state, which the caller
+            // cannot have remembered for a store that happens now.
+            if (reaches_class_handle(f.param_types[k])) {
+                emit_gc_note_ref_store(fn_->getArg(base),
+                                       nullptr,
+                                       env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(f.param_types[k])));
+            }
             emit_agg_storage_copy(fn_->getArg(base),
                                   b_.CreateStructGEP(frame_ty_, frame_, k), f.param_types[k]);
             continue;
@@ -2073,6 +2080,11 @@ void Backend::emit_copyout(const Function& f) {
         // A dynamic-array / queue output / inout formal deep-copies its frame
         // handle back into the caller's handle (the single passed pointer).
         if (is_handle_type(f.param_types[k])) {
+            if (reaches_class_handle(f.param_types[k])) {
+                emit_gc_note_ref_store(fn_->getArg(base),
+                                       nullptr,
+                                       env_->llmod.getDataLayout().getTypeAllocSize(handle_slot_ty(f.param_types[k])));
+            }
             emit_handle_assign(fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k),
                                f.param_types[k]);
             continue;
@@ -2089,6 +2101,11 @@ void Backend::emit_copyout(const Function& f) {
             continue;
         }
         const Plane v = lower_load(local_lvalue(k));
+        // A class or event handle is one word stored through the caller's pointer, which in a
+        // process is a state signal, so the store is logged here (rt_gc_note_ref_store).
+        if (reaches_class_handle(f.param_types[k])) {
+            emit_gc_note_ref_store(fn_->getArg(base), nullptr, sizeof(void*));
+        }
         b_.CreateStore(v.mm, fn_->getArg(base));
         if (abi_four_state(f.param_types[k])) {
             b_.CreateStore(v.z, fn_->getArg(base + 1));
@@ -2267,10 +2284,6 @@ void Backend::lower_call_common(Index               i,
     // its wait queue must be serviced with the call's net old -> new transition.
     // Snapshot each before the (atomic, zero-time) function call; service after.
     std::vector<std::pair<Guarded, ServiceSnapshot>> ref_svc;
-    // Outer containers registered as roots for this call, as lower_task_call_inst does for a
-    // task: a function can now allocate -- and so collect -- between the barrier below and
-    // the callee's store (design §6.1), exactly the window a task's suspension always opened.
-    std::vector<llvm::Value*> ref_containers;
     size_t k = 0;
     for (Index a : ir_->region(arg_slice)) {
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
@@ -2282,26 +2295,10 @@ void Backend::lower_call_common(Index               i,
             // handle, an aggregate image — so `ref` has one shape.
             const Guarded&   lv = lvalue_of(a);
             // A `ref` formal is a raw interior pointer into the actual's storage that
-            // the CALLEE writes through, and the callee has no owner identity to
-            // remember: a `ref` bound to a class property is exactly the "reference
-            // the frame holds with no class-typed value anywhere in sight" that
-            // frame_may_hold_gc_ref's door 3 and design §8's prerequisite 2 are
-            // about. So the barrier goes HERE, at the one place the owner is known.
-            //
-            // A function cannot suspend, but it can allocate, and an allocation that has
-            // outrun its budget collects (design §6.1), so a collection can consume the
-            // remembered-set entry between this barrier and the callee's store, as it can
-            // across a task's suspension. What closes that is the same thing: the callee
-            // needs the actual after the allocation, so it holds it -- an interior pointer
-            // into the object, or the container epoch pointer that is -- the collection
-            // finds it on the stack and re-logs the owner (relog_conservative_roots). See
-            // lower_task_call_inst for the full argument.
-            emit_gc_barrier_for(lv);
-            // And the payload-interior case the stack cannot resolve, registered exactly
-            // as for a task.
-            if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
-                ref_containers.push_back(root);
-            }
+            // the CALLEE writes through. The callee's own barrier finds the owner from
+            // that address at each store (emit_gc_note_ref_store), so nothing is
+            // recorded here: a record made at the call is consumed by any collection
+            // that runs before the store.
             const RefActual rb = ref_actual_arg(lv, f.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
@@ -2328,11 +2325,11 @@ void Backend::lower_call_common(Index               i,
             const Guarded& alv = lvalue_of(a);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             // An out / inout container actual is filled BY THE CALLEE through this
-            // handle pointer, so the owner acquires whatever references the callee's
-            // elements hold. An `In` container is only read. Same reasoning as the
-            // ref case above.
+            // handle pointer, which finds the owner from the address when it copies
+            // out (emit_copyout). The frontend never hands it a place inside another
+            // container's payload, which has no owner the address can name.
             if (dir == ArgDir::Out || dir == ArgDir::Inout) {
-                emit_gc_barrier_for(alv);
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
                 if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
@@ -2355,16 +2352,14 @@ void Backend::lower_call_common(Index               i,
         } else if (is_agg_abi(f.param_types[k])) {
             // An aggregate actual passes its storage pointer, one per formal in
             // every direction (the frontend emitted it as an lvalue): In copies
-            // it in, a struct-bearing out / inout copies the frame Local back
-            // out through the same pointer.
+            // it in, an out / inout copies the frame Local back out through the
+            // same pointer (emit_copyout). An out / inout actual is always a caller
+            // temp, which the frontend assigns to the actual after the call
+            // (Lowerer::build_call_args), so the pointer is never into a
+            // container's payload and the copy-out needs no barrier of the call's.
             argv.push_back(agg_arg_ptr(lvalue_of(a), f.param_types[k], dir));
-            // A struct-bearing out / inout formal is copied back out through THIS
-            // pointer by the callee itself (emit_copyout, :5706-5708), so if the
-            // actual is a class property the callee writes handles into an object it
-            // cannot name. Same reasoning as the ref case above.
-            if (dir == ArgDir::Out || dir == ArgDir::Inout) {
-                emit_gc_barrier_for(lvalue_of(a));
-            }
+            assert((dir == ArgDir::In || lvalue_of(a).epoch_chain.empty()) &&
+                   "an aggregate output actual is a caller temp, not a place in a container's payload");
         } else {
             push_scalar_arg(argv, value_of(a), abi_four_state(f.param_types[k]));
         }
@@ -2387,9 +2382,6 @@ void Backend::lower_call_common(Index               i,
         }
         argv.push_back(tmp);
         b_.CreateCall(fnty, callee, argv);
-        for (llvm::Value* root : ref_containers) {
-            b_.CreateCall(gc_container_remove_fn(), { root });
-        }
         LValue lv{};
         lv.base    = tmp;
         lv.root_ty = st;
@@ -2402,9 +2394,6 @@ void Backend::lower_call_common(Index               i,
         // trailing out-param); str_of(i) was pre-set by build_str_temps.
         argv.push_back(str_of(i));
         b_.CreateCall(fnty, callee, argv);
-        for (llvm::Value* root : ref_containers) {
-            b_.CreateCall(gc_container_remove_fn(), { root });
-        }
         for (auto& [lv, snap] : ref_svc) {
             service_after_write(lv, snap);
         }
@@ -2422,18 +2411,12 @@ void Backend::lower_call_common(Index               i,
         set_lvalue(i, lv);
         argv.push_back(temp);
         b_.CreateCall(fnty, callee, argv);
-        for (llvm::Value* root : ref_containers) {
-            b_.CreateCall(gc_container_remove_fn(), { root });
-        }
         for (auto& [lv2, snap] : ref_svc) {
             service_after_write(lv2, snap);
         }
         return;
     }
     llvm::Value* r = b_.CreateCall(fnty, callee, argv);
-    for (llvm::Value* root : ref_containers) {
-        b_.CreateCall(gc_container_remove_fn(), { root });
-    }
     for (auto& [lv, snap] : ref_svc) {
         service_after_write(lv, snap);
     }
@@ -2509,10 +2492,6 @@ void Backend::lower_task_call_inst(Index i) {
     // Per-write mid-suspend waking needs callee-side servicing (a generic
     // runtime wake keyed by signal id); TODO once that exists.
     std::vector<std::pair<Guarded, ServiceSnapshot>> ref_svc;
-    // Outer containers registered as dynamically-scoped roots for this call, removed
-    // at cont_bb. Empty unless a ref actual aims inside a container a class object
-    // owns, which is the one shape neither the barrier nor the frame scan covers.
-    std::vector<llvm::Value*> ref_containers;
     for (uint32_t k = 0; k < args.size(); ++k) {
         if (tf.arg_dirs[k] == ArgDir::Ref) {
             // The ref, as at a function call: aliased storage and the chain of
@@ -2520,44 +2499,12 @@ void Backend::lower_task_call_inst(Index i) {
             // where the epoch earns its keep — it can suspend, and the container
             // can be restructured by another process while the ref stays live.
             const Guarded&   lv = lvalue_of(args[k]);
-            // The same barrier lower_call_common emits, for the same reason: the
-            // callee writes through a raw interior pointer and cannot name the owner.
-            //
-            // REQUIRED, not belt-and-braces. Here the dominance argument that makes
-            // it airtight for a function does not hold -- a task can suspend, so a
-            // collection can run between this barrier and the callee's store and
-            // consume the remembered-set entry. Two separate windows result, and this
-            // barrier is the only thing covering the first:
-            //
-            //   no collection intervenes (a task that never suspends before storing)
-            //     -- nothing else logs the object at all, so this call is load-bearing;
-            //   a collection intervenes
-            //     -- the collector re-enters every conservatively-reached object into
-            //        the remembered set for the next collection
-            //        (relog_conservative_roots in Gc.cpp, for young AND full, since a
-            //        full collection also clears LOGGED and drops the set). To perform
-            //        the store after resuming, the activation must hold the interior
-            //        pointer across the suspend that PRECEDES the store, so CoroSplit
-            //        keeps it in the frame, the frame scan resolves it
-            //        (rt_gc_find_object resolves interior pointers, Gc.h:433-439) and
-            //        it is re-logged there.
-            //
-            // What does NOT close it, and was an earlier draft of this comment: a
-            // conservatively-reached OLD object is not traced in a young collection --
-            // mark_and_push refuses OLD uniformly, so the frame scan pins and stops.
-            // Tracing it would not have sufficed anyway, since the pointer need not
-            // still be live at the first safepoint AFTER the store.
-            emit_gc_barrier_for(lv);
-            // A ref aiming INSIDE a container this object owns hands the callee a
-            // payload-interior pointer, which the frame scan cannot resolve, so the
-            // re-log above cannot carry the owner across the suspend. Register the
-            // OUTER container for the call's duration instead; see
-            // emit_gc_ref_container_add for why it is the outer one and how it both
-            // reaches the elements and keeps the owner alive. Paired at cont_bb,
-            // which every completion and resume path below reaches.
-            if (llvm::Value* root = emit_gc_ref_container_add(lv); root != nullptr) {
-                ref_containers.push_back(root);
-            }
+            // Nothing is recorded for the owner here. The callee writes through a raw
+            // interior pointer, and a record made at the call is consumed by any
+            // collection that runs while the task is suspended, before its store. The
+            // callee's own barrier finds the owner from the address at each store
+            // (emit_gc_note_ref_store), and the owner of an element of a container
+            // from the witness chain, so the store is logged whenever it happens.
             const RefActual rb = ref_actual_arg(lv, tf.param_types[k]);
             argv.push_back(rb.slot);
             argv.push_back(ref_witness_chain(rb));
@@ -2581,7 +2528,7 @@ void Backend::lower_task_call_inst(Index i) {
             const Guarded& alv = lvalue_of(args[k]);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
-                emit_gc_barrier_for(alv);
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
                 if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
@@ -2589,15 +2536,15 @@ void Backend::lower_task_call_inst(Index i) {
         } else if (is_agg_abi(tf.param_types[k])) {
             // An unpacked struct / whole unpacked array actual: one storage
             // pointer for every direction (the frontend emitted it as an lvalue —
-            // the actual itself for a struct-bearing formal, a canonical temp for
-            // a flat array). The callee copies in at its body start and copies an
+            // the actual itself for a struct-bearing input, a canonical temp
+            // otherwise). The callee copies in at its body start and copies an
             // output / inout back at completion, so the caller must keep the
-            // storage alive across the task's suspends: both shapes are frame
-            // Locals / signals, never a short-lived alloca.
+            // storage alive across the task's suspends: an output / inout actual
+            // is a frame Local or a signal, never a short-lived alloca and never a
+            // place in a container's payload.
             argv.push_back(agg_arg_ptr(lvalue_of(args[k]), tf.param_types[k], tf.arg_dirs[k]));
-            if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
-                emit_gc_barrier_for(lvalue_of(args[k]));
-            }
+            assert((tf.arg_dirs[k] == ArgDir::In || lvalue_of(args[k]).epoch_chain.empty()) &&
+                   "an aggregate output actual is a caller temp, not a place in a container's payload");
         } else if (is_string_type(tf.param_types[k])) {
             // One rt_string handle pointer in every direction: In passes the
             // actual's handle (deep-copied into the frame slot at body start),
@@ -2656,9 +2603,6 @@ void Backend::lower_task_call_inst(Index i) {
     b_.SetInsertPoint(cont_bb);
     for (auto& [lv, snap] : ref_svc) {
         service_after_write(lv, snap);
-    }
-    for (llvm::Value* root : ref_containers) {
-        b_.CreateCall(gc_container_remove_fn(), { root });
     }
     emit_finish_check(virt ? virtual_call_may_finish() : callee_may_finish(fid));
 }

@@ -334,6 +334,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // The write barrier's out-of-line half (§7): generated code tests the owner's
     // OLD/LOGGED bits inline and names this on the taken edge only.
     expose("rt_gc_remember", &rt_gc_remember);
+    expose("rt_gc_note_ref_store", &rt_gc_note_ref_store);
+    expose("rt_gc_note_state_store", &rt_gc_note_state_store);
     expose("rt_gc_roots_add", &rt_gc_roots_add);
     expose("rt_gc_range_add", &rt_gc_range_add);
     expose("rt_gc_identity", &rt_gc_identity);
@@ -351,7 +353,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // Handle-bearing containers (§3.3): a container's payload is malloc'd, so
     // neither root path finds the handles inside it and the container itself has
     // to be a root when its storage is one.
-    expose("rt_gc_containers_add", &rt_gc_containers_add);
     expose("rt_gc_container_add", &rt_gc_container_add);
     expose("rt_gc_container_remove", &rt_gc_container_remove);
     // Functional coverage (LRM 19; docs/design/functional-coverage.md). Exposed

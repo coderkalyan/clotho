@@ -562,9 +562,9 @@ Large objects follow the same rule. A dead one's mapping is kept, by object size
 and the next object of that size is put in it with nothing mapped; a full
 collection returns, of each size, the mappings beyond the number of objects of
 that size allocated since the last collection. A kept mapping still counts as
-heap, toward the growth that brings a full collection on and against
-`--gc-heap-max`, and the heap gives all of them back before it reports that the
-ceiling or the system has no room.
+heap against `--gc-heap-max`, and the heap gives all of them back before it reports that the
+ceiling or the system has no room. It is not in the old generation, so it does not
+bring a full collection on.
 
 ### 4.3 The allocation fast path
 
@@ -672,7 +672,7 @@ are those of one cycle.
 
 | Roots | Mechanism | Precision |
 |---|---|---|
-| Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table of `{ ptr base, u32 nhandles, u32 offsets[] }`, emitted where `emit_main` already walks `slots_` (`ir/llvm/Scheduler.cpp`); statics from `declare_static_prop` (`lower/Types.cpp`) | precise |
+| Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table per region of `{ ptr base, u32 nhandles, u32 bytes, u32 offsets[], u32 cards }`, emitted where `emit_main` already walks `slots_` (`ir/llvm/Scheduler.cpp`); statics from `declare_static_prop` (`lower/Types.cpp`). A young collection reads the cards stored to since the last one (§7) | precise |
 | Live coroutine frames (processes, blocking tasks, fork children) | Intrusive `{ prev, next, u64 size }` node in the frame, linked at the ramp, unlinked at frame free | conservative, validated, **pinning** |
 | Managed containers reachable from the above | `rt_elem_ops` walkers (§3.3) | precise |
 | Intra-assignment staging records carrying a class handle (`rt_intra_alloc_rooted`, `intra-assignment-timing.md`) | `rt_gc_range_add` from alloc to release, scanned as a conservative range | conservative, validated, pinning |
@@ -819,15 +819,14 @@ into a frame above the one whose address starts the scan; the scan runs to the b
    call, hence in a callee-saved register or a stack slot, hence found. Every word is
    validated by `rt_gc_find_object` like a frame word, interior pointers included, and
    pinned; the heap is non-moving, so a pin is retention and nothing else.
-2. *The barrier-exempt fresh object.* A store into a handle straight out of `new`
-   carries no barrier because the object is young. An emergency collection may now
-   intervene (a property initializer or constructor argument that is itself a `new`),
-   but the fresh handle is live across it, so it is found, promoted, and re-logged by
-   `relog_conservative_roots`: it is in the remembered set when the store lands, which
-   is all the barrier would have done. The same re-logging covers a `ref`/`out` callee
-   in a *function*, which the call-site barrier used to cover only because a function
-   could not suspend; function calls now register a `ref` into a class-owned container
-   exactly as task calls do.
+2. *The fresh object.* A store into a handle straight out of `new` carries the barrier
+   like any other. An emergency collection may intervene (a property initializer or
+   constructor argument that is itself a `new`, the binding of an event property in the
+   body), and the fresh handle is live across it, so it is found and promoted, and the
+   store that follows lands in an old object. The same holds of a store through a `ref`
+   or into an `out` actual: the callee logs the owner from the address
+   (`rt_gc_note_ref_store`), at each store, so a collection between the call and the
+   store, in a task or in a function that allocates, changes nothing.
 3. *Pointers into owned buffers.* A pointer into a malloc'd payload (a container
    element computed before the allocation) cannot be resolved to its owner. A finalizer
    run by an emergency collection therefore does not free a buffer that a word of the
@@ -867,9 +866,9 @@ said so, and what now holds:
 |---|---|
 | NBA shadow needs no root (`StoreNb` barrier comment) | item 4: shadow registered as a range |
 | array-element, aggregate-leaf, whole-container and virtual-interface NBA records are roots | they were not: item 4, the record queues are registered and scanned |
-| fresh `new` needs no barrier (`HandleDeref`) | item 2: found, promoted, re-logged |
+| fresh `new` needs no barrier (`HandleDeref`) | item 2: it has one, and so does the event binding of a class body |
 | barrier then store, nothing between (`Store`) | still true: nothing between them allocates |
-| call-site barrier is airtight for a function (`lower_call_common`) | item 2: callee holds the actual, re-logged; `ref` into a class-owned container registered |
+| call-site barrier is airtight for a function (`lower_call_common`) | item 2: there is no call-site barrier; the callee logs the owner from the address at each store (`rt_gc_note_ref_store`) |
 | frame unlink with no safepoint after it | still true: the cleanup path allocates nothing |
 | vptr stored before any collection sees the object | still true: nothing allocates between `rt_gc_alloc` and the vptr store |
 | deferred (`<= #d`) targets are design state | unchanged: asserted, and the records are roots |
@@ -887,8 +886,10 @@ buffer, every free site credits the size it allocated (so the count is exact: it
 zero after a run that frees what it allocates, asserted in `gc_test`), and growth of
 the count by a budget since the last collection raises the request flag, by
 `kEmergencyFactor` budgets makes the next `new` take the slow path where the emergency
-collection runs. The kind policy applies its heap-growth rule to owned bytes too,
-otherwise a young collection never frees an old dead object's strings. An associative
+collection runs. The kind policy compares the old generation, the objects a collection
+has marked and the buffers owned as the last collection left them, with its size at the
+last full collection; otherwise a young collection never frees an old dead object's
+strings. An associative
 array's key strings and hash buckets use `std::allocator` and are not counted.
 
 ### 6.2 Under MT: a rendezvous the scheduler already needs
@@ -1013,10 +1014,40 @@ collection is the cost to avoid.
   needs no instrumenting either, for a better reason than a range mark: the owner is
   remembered, and tracing the owner walks the container wherever its elements have
   moved to.
-- **No barrier for design state, statics or frame locals.** All scanned in full at
-  every collection. In the implementation this is structural rather than
-  enumerated: the barrier is emitted from an lvalue field set only by `HandleDeref`,
-  so an lvalue rooted in a signal or a frame slot cannot carry an owner to remember.
+- **Design state is logged by cards, and its containers by flags.** Every state region ends in one byte
+  of dirty flag for each `RT_GC_CARD_BYTES` (512) of the region. A store of a class or event handle
+  into state -- a scalar, an array element, a struct member, the staging of a nonblocking assignment,
+  an aggregate copy -- tests the card byte of the place inline (a load, a compare and a not-taken
+  branch; the byte is at a constant offset from the signal's storage, so shared code names nothing of
+  an instance) and calls `rt_gc_note_state_store` when it is clear. That sets the byte and appends the
+  card to a bounded log. A young collection reads the handle slots of the logged cards (the table's
+  offsets ascend, so a card's slots are a binary search) and no others; a full collection reads every
+  slot; every collection clears the cards it read and empties the log. Past `kLoggedCardsMax` cards,
+  and after a table is registered (its initializer is no store's), the next collection reads every
+  slot instead. This is sound because every slot a collection read names a marked, old object: a slot
+  nothing has stored to since still does. Stores through a `ref` or an output formal reach the same
+  entry from the callee (`rt_gc_note_ref_store` finds the region by address). A frame local needs no
+  barrier; it is scanned in full at every collection.
+
+  A container of design state (a queue, dynamic array or associative array whose elements or keys can
+  hold a handle) is an entry of its region's root table and has flag bytes of its own after the cards,
+  one for each word of every signal that holds one. A card would not do: what a container costs a
+  collection is its whole payload, so a queue of a million handles must not be walked because a slot a
+  few bytes from its handle was stored to. A mutation that adds a handle to the container -- a push or
+  insert, an element store, a whole assignment or move, `new[n](old)`, `new[n]` of events, an
+  associative entry (its key or its constructed value), at any depth inside it -- tests the flag byte
+  of the word of the outermost container's handle it has the address of (the handle itself, or its
+  epoch word for a place inside the payload) and calls `rt_gc_note_state_store`, which logs the cards
+  and every container whose handle the range touches. A young collection walks the logged containers
+  and no others, a full collection every one, with the same bounded log and fallback as the cards.
+  Moving handles within a container (a sort, a ring growth) and removing them add none, so they log
+  nothing. A `ref` bound into a container reaches the same entry through its witness chain, and a
+  container formal is never bound to a place inside another container (the frontend passes a temp).
+
+  The extra-assertion build checks both: `verify_cards` that a card byte, and a container's flag bytes
+  together, are set exactly when the log holds them, and, before a young collection marks anything,
+  that no slot outside the logged cards and no element or key of an unlogged container names an
+  unmarked (young) object.
 - **The mark is the generation.** A young collection never frees a marked object
   and sweeps only blocks allocated from since the last collection, which is what
   lets it skip the stable population without freeing it. Old garbage accumulates

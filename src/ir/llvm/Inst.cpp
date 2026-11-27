@@ -484,15 +484,13 @@ void Backend::lower_inst(Index i) {
                     LValue sel      = dyn_agg_elem_lvalue(lv, e, dataptr, idx64);
                     sel.epoch_chain = lv.epoch_chain;
                     sel.epoch_chain.push_back(epoch);
-                    note_gc_container_root(sel, lv, handle, es.array_type);
                     set_lvalue(i, element_select(sel, lv, i, es.index, inrange, unknown, len));
                     return;
                 }
                 LValue       el;
                 el.epoch_chain   = lv.epoch_chain;
                 el.epoch_chain.push_back(epoch);
-                el.gc_owner      = lv.gc_owner;
-                note_gc_container_root(el, lv, handle, es.array_type);
+                carry_gc_place(el, lv);
                 el.base          = dataptr;
                 el.slot_ty       = e.slot_ty;
                 el.has_z         = e.has_z;
@@ -557,7 +555,6 @@ void Backend::lower_inst(Index i) {
                     LValue sel      = dyn_agg_elem_lvalue(lv, e, baseptr, phys);
                     sel.epoch_chain = lv.epoch_chain;
                     sel.epoch_chain.push_back(epoch);
-                    note_gc_container_root(sel, lv, handle, es.array_type);
                     set_lvalue(i, element_select(sel, lv, i, es.index, inrange, unknown, len));
                     return;
                 }
@@ -576,8 +573,7 @@ void Backend::lower_inst(Index i) {
                 el.bounds_checks = lv.bounds_checks;
                 el.epoch_chain   = lv.epoch_chain;
                 el.epoch_chain.push_back(epoch);
-                el.gc_owner      = lv.gc_owner;
-                note_gc_container_root(el, lv, handle, es.array_type);
+                carry_gc_place(el, lv);
                 set_lvalue(i, element_select(el, lv, i, es.index, inrange, unknown, len));
                 return;
             }
@@ -673,15 +669,16 @@ void Backend::lower_inst(Index i) {
             el.assoc_elem_type   = std::get<Type>(mod_.pool.get(aa.assoc_type)).element;
             el.assoc_val_string  = e.is_string;
             el.assoc_val_handle  = e.is_handle;
-            el.gc_owner          = hlv.gc_owner;
-            note_gc_container_root(el, hlv, el.assoc_handle, aa.assoc_type);
+            carry_gc_place(el, hlv);
             // A class-handle KEY is a reference the owner acquires when an entry is
             // created, even when the value is an int (`int m[Cell]`), and no
             // further member selection is party to it -- so it cannot ride the
             // value path's owner. assoc_elem_lvalue emits the barrier beside the
             // put_ptr that writes the key.
-            el.assoc_key_handle  = el.gc_owner != nullptr &&
-                                   assoc_key_is_class_handle(aa.assoc_type);
+            el.assoc_put_handle =
+              (el.gc_owner != nullptr || el.gc_ref_slot != nullptr || el.gc_state_base != nullptr) &&
+              (assoc_key_is_class_handle(aa.assoc_type) ||
+               reaches_class_handle(std::get<Type>(mod_.pool.get(aa.assoc_type)).element));
             if (e.is_agg) {
                 // Aggregate value: a deferred is_agg lvalue. A following
                 // MemberSelect / ElemSelect rides along (agg_member / agg_elem
@@ -739,8 +736,7 @@ void Backend::lower_inst(Index i) {
             el.assoc_val_handle = e.is_handle;
             // No key span, so no key handle can be stored: the `'{default: v}`
             // slot is reached through rt_assoc_default_ptr (LRM 7.9.11).
-            el.gc_owner         = dlv.gc_owner;
-            note_gc_container_root(el, dlv, el.assoc_handle, pt.type);
+            carry_gc_place(el, dlv);
             if (e.is_agg) {
                 el.is_agg  = true;
                 el.root_ty = e.agg_ty;
@@ -881,24 +877,13 @@ void Backend::lower_inst(Index i) {
             // class property descends from here, and nothing else in this file
             // produces an object-rooted lvalue, so "no barrier for design state,
             // statics or frame locals" holds by construction (§7).
-            //
-            // The one exemption is the same fact the null check just used: a handle
-            // straight out of ClassNew names an object the allocator returned a few
-            // instructions ago, which no collection has marked and which is therefore not
-            // old (Gc.cpp, alloc_object), so the barrier's test would not fire and the
-            // store needs none.
-            //
-            // That used to hold because nothing could collect between the `new` and the
-            // store. An allocation can now (design §6.1): a property initializer or a
-            // constructor argument in the same statement is itself a `new`, and may run an
-            // emergency collection with this object live. It still holds, for a different
-            // reason. The fresh handle is used after that allocation, so it is live across
-            // it, the collection finds it on the stack, promotes it, and
-            // relog_conservative_roots() puts it in the remembered set -- so the object is
-            // already logged when the store lands, which is all the barrier would have done.
-            if (!fresh) {
-                lv.gc_owner = lv.base;
-            }
+            // A handle straight out of ClassNew gets the owner too, though the object
+            // is young when the allocator returns it. An allocation can run a collection
+            // (design §6.1), and a property initializer or a constructor argument in the
+            // same statement is itself a `new`: the collection finds this object in a
+            // register or on the stack, promotes it, and the store that follows lands in
+            // an old object nothing has logged.
+            lv.gc_owner = lv.base;
             set_lvalue(i, lv);
             return;
         }
@@ -1111,7 +1096,7 @@ void Backend::lower_inst(Index i) {
             // the record queues of an array element, a virtual-interface member, an
             // aggregate leaf and a whole container are registered (emit_gc_nba_queues), and
             // a delayed record is rooted (intra_rec_rooted).
-            emit_gc_barrier_for(lv);
+            emit_gc_barrier_for(lv, gc_store_bytes(lv));
             // Deferral splits three ways: an unpacked-array element defers a
             // typed record; an aggregate leaf reached through a runtime array
             // index defers a memcpy record; everything else (a plain signal,
@@ -1189,7 +1174,10 @@ void Backend::lower_inst(Index i) {
             // guard so the guarded path is covered too. gc_owner is
             // non-null only when the destination's type can reach a handle, so a
             // handle-free record copy emits nothing (§7).
-            emit_gc_barrier_for(dlv);
+            emit_gc_barrier_for(
+              dlv,
+              std::max<uint64_t>(env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(info.type)),
+                                 2 * sizeof(void*)));
             // A variable element index on either side (`dst = arr[i]`,
             // `arr[i] = src`) can miss the array. LRM 7.4.5: reading an
             // invalid element yields the Table 7-1 image of its type, and
@@ -1209,19 +1197,16 @@ void Backend::lower_inst(Index i) {
             const auto    info  = ir_->extra_data<StoreNbDelayInfo>(p.op_extra.extra);
             const Guarded& lv   = lvalue_of(p.op_extra.op);
             emit_bounds_reports(lv, /*is_write=*/true);
-            // No write barrier here, and the reason is structural rather than a
-            // judgement: all three deferred stores take a whole-SIGNAL lvalue
-            // (Ir.h:1147-1160) and their record subsystem is keyed by Signal
-            // (intra_nba_sigs_, emit_intra_commit), so the target is design state --
-            // scanned in full at every collection, young or not (Gc.h:105-107).
-            //
-            // That matters more here than at the other bare sites, because these
-            // three are the one family whose commit lands in a LATER instant, across
-            // safepoints, where an arm-site barrier could be consumed before the
-            // store happens. So the shape is asserted away rather than trusted: if
-            // the frontend ever widens these to a class property, this fails loudly
-            // instead of silently missing a remembered-set entry (PRINCIPLES.md).
+            // No object owner here, and the reason is structural: all three deferred stores take
+            // a whole-SIGNAL lvalue (Ir.h:1147-1160) and their record subsystem is keyed by Signal
+            // (intra_nba_sigs_, emit_intra_commit), so the target is design state. Its card is
+            // logged at the arm, not at the commit that lands in a LATER instant: a collection in
+            // between reads the card and clears it, but it also reaches the sampled handle through
+            // the record, which is a root, and marks it, so the commit stores an old handle. The
+            // shape is asserted rather than trusted: if the frontend ever widens these to a class
+            // property, this fails loudly instead of silently missing a remembered-set entry.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
+            emit_gc_barrier_for(lv, gc_store_bytes(lv));
             const Plane   rhs   = value_of(info.value);
             emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value*  ticks = cast(must_of(info.delay), 64, false);
@@ -1261,6 +1246,7 @@ void Backend::lower_inst(Index i) {
             emit_bounds_reports(lv, /*is_write=*/true);
             // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
             assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
+            emit_gc_barrier_for(lv, gc_store_bytes(lv));
             const Plane  rhs   = value_of(info.value);
             emit_encoding_check(rhs, type_of(info.value).four_state, i);
             llvm::Value* count = must_of(info.count);
@@ -2684,6 +2670,12 @@ LValue Backend::signal_lvalue(Signal sig) {
         lv.sig         = sig;
         lv.is_string   = s.is_string;
     }
+    // A class handle can land in this signal's storage, and a young collection reads only the
+    // state slots stored to since the last one: the stores into it are logged (§7).
+    if (reaches_class_handle(s.ir_type)) {
+        lv.gc_state_base = lv.base;
+        lv.gc_state_sig  = sig;
+    }
     return lv;
 }
 
@@ -2711,6 +2703,7 @@ LValue Backend::local_lvalue(uint32_t index) {
             lv.ref_wake_fn  = ref_ptr_[index].wake_fn;
             lv.ref_wake_ctx = ref_ptr_[index].wake_ctx;
         }
+        set_gc_ref_place(lv, index);
         return lv;
     }
     if (base == nullptr) {
@@ -2732,7 +2725,19 @@ LValue Backend::local_lvalue(uint32_t index) {
         lv.ref_wake_fn  = ref_ptr_[index].wake_fn;
         lv.ref_wake_ctx = ref_ptr_[index].wake_ctx;
     }
+    set_gc_ref_place(lv, index);
     return lv;
+}
+
+// A store through a `ref` formal whose type can hold a class handle needs the owner of what
+// the formal aliases remembered, and the callee is the one place that is known to run
+// after the call has reached the store (emit_gc_note_ref_store).
+void Backend::set_gc_ref_place(LValueInfo& lv, uint32_t index) {
+    const FrameSlot& s = frame_slots_[index];
+    if (s.is_ref && reaches_class_handle(s.ir_type)) {
+        lv.gc_ref_slot  = ref_ptr_[index].slot;
+        lv.gc_ref_chain = ref_ptr_[index].chain;
+    }
 }
 
 Plane Backend::lower_load(const LValue& lv) {

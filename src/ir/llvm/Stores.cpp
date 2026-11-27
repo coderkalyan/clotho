@@ -1564,9 +1564,10 @@ void Backend::emit_handle_whole_nba(Index i) {
     const auto&       p    = ir_->payload(i).op_extra;
     const auto        qa   = ir_->extra_data<QueueArg>(p.extra);
     const Guarded&    dlv  = lvalue_of(p.op);
-    // Signal-keyed like the deferred store family (handle_buf_idx(dlv.sig)), so the
-    // destination is design state and needs no barrier. Asserted, not assumed.
+    // Signal-keyed like the deferred store family (handle_buf_idx(dlv.sig)), so the destination is
+    // design state, whose card is logged here, at the staging (see StoreNbDelay).
     assert(dlv.gc_owner == nullptr && "a whole-container NBA targets a signal");
+    emit_gc_container_barrier(dlv);
     auto*             rt   = handle_rec_ty(qa.queue_type);
     const auto        strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
     llvm::Value*      rec  = b_.CreateCall(nba_arr_slot_fn(),
