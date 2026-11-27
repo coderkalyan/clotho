@@ -566,41 +566,89 @@ TEST_CASE("a queue input formal bound to a dynamic array, and the reverse") {
     CHECK(run_capture(src) == "1064 92\n'{1, 2, 3} '{4, 5}\n");
 }
 
-// A fixed-size array and a dynamic array or queue are assignment compatible when
-// their sizes match at run time (LRM 7.6), which Clotho does not lower. As an
-// argument the pair used to write a handle's words over the fixed array (a
-// container output formal), crash the compiler (a fixed-size formal) or be refused
-// with a message about a conversion (a container input formal).
-TEST_CASE("a fixed-size array bound to a container formal, and the reverse, is refused") {
+// A fixed-size array bound to a dynamic array or queue formal copies in as the
+// assignment `formal = actual` (LRM 13.5 over 7.5.1 and 7.10.2), which has no size to
+// check; a fixed-size output formal bound to a dynamic array or queue assigns the
+// actual from it, which gives the actual the formal's size. Slices, struct elements
+// and an actual that is a frame local are the shapes that take other paths. iverilog
+// 13 asserts on these calls, so the LRM is the oracle.
+TEST_CASE("a fixed-size array bound to a container input formal, and a fixed-size output formal bound to one") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; int b; } pair_t;
+            int f[3];
+            int d[];
+            int q[$];
+            pair_t ps[2];
+            function automatic int sumq(input int o[$]);
+                sumq = 0;
+                o.push_back(100);
+                foreach (o[i]) sumq += o[i];
+                sumq = sumq * 10 + o.size();
+            endfunction
+            function automatic int sumd(input int o[]);
+                sumd = 0;
+                foreach (o[i]) sumd += o[i];
+                o[0] = 0;
+                sumd = sumd * 10 + o.size();
+            endfunction
+            function automatic int firstb(input pair_t o[$]); return o[0].b * 10 + o.size(); endfunction
+            task automatic fill3(output int o[3]); o = '{7, 8, 9}; endtask
+            task automatic fillp(output pair_t o[2]); o[0].a = 1; o[0].b = 2; o[1].a = 3; o[1].b = 4; endtask
+            task automatic local_test();
+                int lf[3];
+                int ld[];
+                lf = '{1, 1, 1};
+                $display("%0d", sumq(lf));
+                fill3(ld);
+                $display("%p", ld);
+            endtask
+            initial begin
+                int a[4:2];
+                f = '{1, 2, 3};
+                a = '{4, 5, 6};
+                q = '{9};
+                $display("%0d %0d %0d %0d", sumq(f), sumd(f), sumq(a), sumd(a));
+                $display("%p %p", f, a);
+                ps = '{'{5, 6}, '{7, 8}};
+                $display("%0d", firstb(ps));
+                fill3(d);
+                fill3(q);
+                $display("%p %p", d, q);
+                fillp(ps);
+                $display("%p", ps);
+                local_test();
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1064 63 1154 153\n'{1, 2, 3} '{4, 5, 6}\n62\n'{7, 8, 9} '{7, 8, 9}\n"
+                              "'{'{a:1, b:2}, '{a:3, b:4}}\n1034\n'{7, 8, 9}\n");
+}
+
+// The other directions copy into the fixed-size side, and LRM 7.6 compares the sizes at
+// run time, which Clotho does not lower (the statement `f = d;` is refused as well).
+// Each used to write a handle's words over the fixed array, crash the compiler, or be
+// refused with a message about a conversion.
+TEST_CASE(
+  "a dynamic array or queue bound to a fixed-size formal, and a fixed-size array to a container output, is refused") {
     constexpr std::string_view head = R"(
         module m;
             int f[3];
             int d[];
             int q[$];
             int n;
-            function automatic int sumq(input int o[$]); return o.size(); endfunction
-            function automatic int sumd(input int o[]); return o.size(); endfunction
             function automatic int sum3(input int o[3]); return o[0] + o[1] + o[2]; endfunction
             task automatic fq(output int o[$]); o = '{1, 2, 3}; endtask
             task automatic fd(inout int o[]); o = new[3]; endtask
-            task automatic fill3(output int o[3]); o = '{7, 8, 9}; endtask
             task automatic bump3(inout int o[3]); o[0] += 1; endtask
     )";
-    for (const std::string_view call : { "n = sumq(f);",
-                                         "n = sumd(f);",
-                                         "fq(f);",
-                                         "fd(f);",
-                                         "n = sum3(d);",
-                                         "n = sum3(q);",
-                                         "fill3(d);",
-                                         "fill3(q);",
-                                         "bump3(d);",
-                                         "bump3(q);" }) {
+    for (const std::string_view call :
+         { "fq(f);", "fd(f);", "n = sum3(d);", "n = sum3(q);", "bump3(d);", "bump3(q);" }) {
         CAPTURE(call);
         const LowerResult r =
           lower_text(std::string(head) + "initial begin " + std::string(call) + " end\nendmodule\n");
         CHECK_FALSE(r.ok);
-        CHECK_MESSAGE(r.diagnostic_text().find("binding a fixed-size array to a dynamic array or queue formal") !=
+        CHECK_MESSAGE(r.diagnostic_text().find("binding a dynamic array or queue to a fixed-size array formal") !=
                         std::string::npos,
                       r.diagnostic_text());
     }

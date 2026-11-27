@@ -338,8 +338,12 @@ before the call and to the actual after it (`build_call_args`,
   The copy-out is then an ordinary store, with the store's change notification and
   collector barrier.
 
-A fixed-size array for a container formal, or the reverse, is refused (LRM 7.6
-needs a size check at run time; `docs/TODO.md`).
+A fixed-size array for an input container formal goes through the same kind of temp,
+filled element by element (`emit_fixed_array_into_container`), and a fixed-size output
+formal bound to a dynamic array or queue assigns the actual from its temp after the call
+(`emit_fixed_place_into_container`): neither has a size to check. The other directions
+copy into the fixed-size side, which LRM 7.6 checks at run time; they are refused
+(`docs/TODO.md`).
 
 ## 6. Runtime surface
 

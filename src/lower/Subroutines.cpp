@@ -2126,13 +2126,13 @@ const slang::ast::ClassType* Lowerer::class_of_ref(ir::Ref ref) {
 
 namespace {
 
-// TODO: a fixed-size array bound to a dynamic array or queue formal, and a dynamic
-// array or queue bound to a fixed-size array formal (LRM 13.5 over 7.6). The copy
-// between the two is an assignment whose sizes are compared at run time, which is
-// not lowered as a statement either ("whole unpacked array assignment").
+// TODO: a dynamic array or queue bound to a fixed-size array formal (input or inout), and a
+// fixed-size array bound to an output or inout container formal (LRM 13.5 over 7.6). The
+// copy into the fixed-size side is an assignment whose sizes are compared at run time,
+// which is not lowered as a statement either ("whole unpacked array assignment").
 constexpr std::string_view kMixedArrayArgument =
-  "binding a fixed-size array to a dynamic array or queue formal, or a dynamic array or queue to a "
-  "fixed-size array formal, is not supported";
+  "binding a dynamic array or queue to a fixed-size array formal, or a fixed-size array to an output "
+  "or inout dynamic array or queue formal, is not supported";
 
 } // namespace
 
@@ -2209,7 +2209,23 @@ std::vector<ir::Index> Lowerer::build_call_args(std::span<const FormalArgumentSy
             }
             const Expression& src = unwrap_conversion(*actual);
             if (is_handle_expr(src)) {
-                throw LowerError{ std::string(kMixedArrayArgument), to_source_span(src.sourceRange) };
+                // A dynamic array or queue actual for a fixed-size formal: only an
+                // output has no size to check, the formal being what the actual is
+                // assigned from (LRM 7.5.1, 7.10.2). The temp is the canonical
+                // aggregate the callee copies out through, and the caller assigns
+                // the actual from it after the call.
+                if (dir != slang::ast::ArgumentDirection::Out) {
+                    throw LowerError{ std::string(kMixedArrayArgument), to_source_span(src.sourceRange) };
+                }
+                const ir::Index temp = make_canonical_agg_temp(pty, b, l);
+                args.push_back(temp);
+                outs.push_back(CopyOutArg{ temp,
+                                           &src,
+                                           lower_type(*src.type),
+                                           &formals[i]->getType(),
+                                           /*is_agg=*/true,
+                                           pty });
+                continue;
             }
             // A slice is a legal whole-array actual (LRM 7.4.5): same element
             // count, so it copies element-wise into the temp like any array.
@@ -2265,7 +2281,17 @@ std::vector<ir::Index> Lowerer::build_call_args(std::span<const FormalArgumentSy
             // puts on it; an output or inout actual is the bare lvalue.
             const Expression& src = unwrap_conversion(*actual);
             if (src.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
-                throw LowerError{ std::string(kMixedArrayArgument), to_source_span(src.sourceRange) };
+                // A fixed-size array for a dynamic array or queue formal: the copy
+                // in is the assignment `formal = actual` (LRM 7.5.1, 7.10.2), which
+                // has no size to check. An output or inout would assign the other
+                // way round.
+                if (dir != slang::ast::ArgumentDirection::In) {
+                    throw LowerError{ std::string(kMixedArrayArgument), to_source_span(src.sourceRange) };
+                }
+                const ir::Index temp = make_arg_temp(pty, b, l);
+                emit_fixed_array_into_container(temp, pty, src, b, l);
+                args.push_back(temp);
+                continue;
             }
             if (dir == slang::ast::ArgumentDirection::In) {
                 if (is_handle_expr(src)) {
@@ -2378,6 +2404,12 @@ ir::Index Lowerer::agg_input_actual(const Expression& src, ir::Ref pty, ir::Buil
 // complex actual lvalues (bit / part selects) work.
 void Lowerer::emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l) {
     for (const CopyOutArg& oc : outs) {
+        if (oc.is_agg && is_handle_expr(*oc.actual)) {
+            // A fixed-size output formal bound to a dynamic array or queue: the actual
+            // is assigned from the formal and takes its size (LRM 7.5.1, 7.10.2).
+            emit_fixed_place_into_container(lower_lvalue(*oc.actual, b), oc.actual_ty, oc.temp, oc.agg_ty, b, l);
+            continue;
+        }
         if (oc.is_agg && is_positional_array_slice(*oc.actual)) {
             // An indexed-slice output / inout actual: write the callee-written
             // temp back position-wise, since the actual has no anchored lvalue.
