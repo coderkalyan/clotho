@@ -46,8 +46,14 @@ Ir Builder::finish() {
     // Whatever remains in scratch_ is the root region.
     const ExtraSlice root = add_slice(scratch_);
 
-    return Ir(
-      pool_, std::move(tags_), std::move(payloads_), std::move(locs_), std::move(ends_), std::move(extra_), root);
+    return Ir(pool_,
+              std::move(tags_),
+              std::move(payloads_),
+              std::move(locs_),
+              std::move(ends_),
+              std::move(override_marks_),
+              std::move(extra_),
+              root);
 }
 
 void Builder::open_region() {
@@ -85,6 +91,8 @@ void Builder::rollback(Mark m) {
     // The abandoned run's extents would otherwise point at instructions the
     // next emission reuses those indices for.
     std::erase_if(ends_, [&](const auto& kv) { return kv.first >= m.insts; });
+    // Nor may a mark of the abandoned run name an instruction of the next one.
+    std::erase_if(override_marks_, [&](const auto& kv) { return kv.first >= m.insts; });
     extra_.resize(m.extra);
     scratch_.resize(m.scratch);
     // The memo covers instructions that no longer exist past the mark.

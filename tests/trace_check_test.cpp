@@ -10,6 +10,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -101,7 +102,8 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
                               "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once",
                               "rt_trace_fork", "rt_trace_child_done", "rt_trace_join", "rt_trace_members", "rt_trace_member", "rt_trace_inertial_arm", "rt_trace_inertial_decide",
-                              "rt_trace_inertial_fire", "rt_trace_inertial_applied", "rt_trace_nba_event" }) {
+                              "rt_trace_inertial_fire", "rt_trace_inertial_applied", "rt_trace_nba_event",
+                              "rt_trace_override_state", "rt_trace_override_apply", "rt_trace_override_resolve" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -3045,4 +3047,536 @@ TEST_CASE("trace check: a `<= @(a or b)` update counts an occurrence of either, 
     rt_trace_slot_end();
     CHECK(rule() == "R11.2");
 }
+
+// ---- Force, release, assign and deassign (R14) ----
+//
+// Each sequence is what the generated code reports of a `force`, a `release`, an `assign` or a `deassign`: the
+// store that changes an override's state, then the store that gives its target the value. Where the code ignores
+// an override, the sequence changes the target by hand, as the bug did (docs/design/scheduler-rules.md §4).
+
+namespace {
+
+// The stores a design's force statements report, by what they are (docs/design/scheduler-trace.md §2.4).
+const rt_trace_control kForceSt{ "design.sv:20:5", RT_TRACE_OVR_FORCE_STATE };
+const rt_trace_control kAssignSt{ "design.sv:21:5", RT_TRACE_OVR_ASSIGN_STATE };
+const rt_trace_control kSiteSt{ "design.sv:22:5", RT_TRACE_OVR_SITE_STATE };
+const rt_trace_control kForceAp{ "design.sv:20:17", RT_TRACE_OVR_FORCE_APPLY };
+const rt_trace_control kAssignAp{ "design.sv:21:17", RT_TRACE_OVR_ASSIGN_APPLY };
+const rt_trace_control kSiteAp{ "design.sv:22:17", RT_TRACE_OVR_SITE_APPLY };
+const rt_trace_control kResolve{ "design.sv:30:3", RT_TRACE_OVR_RESOLVE };
+
+// A 2-state 32-bit variable, an 8-bit 4-state net (its must|may word of 16 bits and its z word of 8) and the 4-bit
+// 4-state value signal of a force site of the net.
+struct Net8 {
+    uint16_t mm;
+    uint8_t  z;
+};
+struct Val4 {
+    uint8_t mm;
+    uint8_t z;
+};
+const rt_trace_shape kVarShape{ 32, 32, 0, 0, sizeof(uint32_t), 1 };
+const rt_trace_shape kNetShape{ 8, 16, 8, offsetof(Net8, z), sizeof(Net8), 1 };
+const rt_trace_shape kValShape{ 4, 8, 4, offsetof(Val4, z), sizeof(Val4), 1 };
+
+// The variable and the state of its force and assign layers; the net, a site's flag and value, and a second site's.
+uint32_t var, force_site, assign_site;
+Net8     net;
+uint32_t flag, flag2;
+Val4     val, val2;
+
+void reset_overrides() {
+    var = force_site = assign_site = 0;
+    net                            = Net8{ 0, 0 };
+    flag = flag2 = 0;
+    val          = Val4{ 0, 0 };
+    val2         = Val4{ 0, 0 };
+}
+
+// `force v = value`, `release v`, `assign v = value`, `deassign v`.
+void force_var(uint32_t id, uint32_t value) {
+    force_site = id;
+    rt_trace_override_state(&kForceSt, &force_site);
+    var = value;
+    rt_trace_override_apply(&kForceAp, &force_site, &var, "v", &kVarShape, 0, 32, nullptr, nullptr);
+}
+
+void release_var() {
+    force_site = 0;
+    rt_trace_override_state(&kForceSt, &force_site);
+}
+
+void assign_var(uint32_t id, uint32_t value) {
+    assign_site = id;
+    rt_trace_override_state(&kAssignSt, &assign_site);
+    var = value;
+    rt_trace_override_apply(&kAssignAp, &assign_site, &var, "v", &kVarShape, 0, 32, nullptr, nullptr);
+}
+
+void deassign_var() {
+    assign_site = 0;
+    rt_trace_override_state(&kAssignSt, &assign_site);
+}
+
+// A 4-bit 0/1 value into the bits [lo, lo + 4) of the net, in both planes of its must|may word, with no z.
+void put_bits(uint32_t lo, uint32_t v) {
+    const uint16_t m = static_cast<uint16_t>(0xfu << lo);
+    net.mm           = static_cast<uint16_t>((net.mm & ~(m | (m << 8))) | ((v << lo) | ((v << lo) << 8)));
+    net.z            = static_cast<uint8_t>(net.z & ~m);
+}
+
+void put_val(Val4& dst, uint32_t v) {
+    dst.mm = static_cast<uint8_t>(v | (v << 4));
+    dst.z  = 0;
+}
+
+// `force w[5:2] = v`: the flag, the value, and the store into the net that the statement itself makes. The second
+// site is the same on bits [7:4].
+void force_net(uint32_t v) {
+    flag = 1;
+    rt_trace_override_state(&kSiteSt, &flag);
+    put_val(val, v);
+    put_bits(2, v);
+    rt_trace_override_apply(&kSiteAp, &flag, &net, "w", &kNetShape, 2, 4, &val, &kValShape);
+}
+
+void force_net2(uint32_t v) {
+    flag2 = 1;
+    rt_trace_override_state(&kSiteSt, &flag2);
+    put_val(val2, v);
+    put_bits(4, v);
+    rt_trace_override_apply(&kSiteAp, &flag2, &net, "w", &kNetShape, 4, 4, &val2, &kValShape);
+}
+
+void release_net() {
+    flag = 0;
+    rt_trace_override_state(&kSiteSt, &flag);
+}
+
+// The resolver's store of the net: the fold of its drivers, with the active site over it.
+void resolve_net(uint8_t fold) {
+    net.mm = static_cast<uint16_t>(fold | (fold << 8));
+    net.z  = 0;
+    if (flag != 0) {
+        put_bits(2, val.mm & 0xfu);
+    }
+    if (flag2 != 0) {
+        put_bits(4, val2.mm & 0xfu);
+    }
+    rt_trace_override_resolve(&kResolve, &net, "w", &kNetShape);
+}
+
+// The statements a design's NBAs to the variable come from: one the force can drop, one it cannot.
+const rt_trace_nba_site kBlockV{ "design.sv:5:3", "v", RT_TRACE_NBA_BLOCK, 32, 0 };
+const rt_trace_nba_site kGatedV{ "design.sv:6:3", "v", RT_TRACE_NBA_BLOCK | RT_TRACE_NBA_GATED, 32, 0 };
+
+} // namespace
+
+TEST_CASE("trace check: a variable a force or an assign owns holds its value, and a release or a deassign changes nothing (R14.1)") {
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    var = 1;
+    force_var(1, 7);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    // `force` is last-wins: the second site takes over, and the first's value is gone.
+    force_var(2, 9);
+    release_var();
+    // After a release an ordinary write lands.
+    var = 11;
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    // The assign layer: its value holds, the force over it takes the variable, and a release hands it back, which the
+    // assign's own re-evaluation stores.
+    assign_var(1, 20);
+    force_var(3, 77);
+    release_var();
+    var = 30;
+    rt_trace_override_apply(&kAssignAp, &assign_site, &var, "v", &kVarShape, 0, 32, nullptr, nullptr);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    deassign_var();
+    var = 5;
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    CHECK(rule().empty());
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.override_states == before.override_states + 7);
+    CHECK(after.override_applies == before.override_applies + 5);
+}
+
+// B35: a port copy, a gate output or a delayed assign landed over an active force; B47: an NBA staged before the
+// force committed over it. Either way the variable changed with no store of the override.
+TEST_CASE("trace check: a write that ignores a force changes the variable and is found at the end of the slot (R14.1, B35)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_var(1, 7);
+    var = 9;
+    rt_trace_slot_end();
+    CHECK(rule() == "R14.1");
+    CHECK(has(rt_trace_report(), "a variable that a force owns changed with no store of the override"));
+    CHECK(has(rt_trace_report(), "v ("));
+    CHECK(has(rt_trace_report(), "store of a forced value into a variable at design.sv:20:17"));
+    CHECK(has(rt_trace_report(), "0x00000007"));
+    CHECK(has(rt_trace_report(), "0x00000009"));
+}
+
+TEST_CASE("trace check: a write that ignores an assign is found, and one that ignores it and is undone is not (R14.1)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    assign_var(1, 20);
+    var = 21;
+    rt_trace_slot_end();
+    CHECK(rule() == "R14.1");
+    CHECK(has(rt_trace_report(), "a variable that a procedural assign owns changed"));
+
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    assign_var(1, 20);
+    var = 21;
+    var = 20;
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a variable that changed under a force is found when the force is released (R14.1)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_var(1, 7);
+    var = 9;
+    release_var();
+    CHECK(rule() == "R14.1");
+    CHECK(has(rt_trace_report(), "when the override ended"));
+
+    // A release of a variable that is not forced, after ordinary writes, says nothing.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_var(1, 7);
+    release_var();
+    var = 9;
+    release_var();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+// B47: the force is checked when an NBA commits, not when it is staged. An update staged before a force that
+// commits over it breaks the force; the same update the commit drops, or one the force was released from, does not.
+TEST_CASE("trace check: an NBA commit that changes a forced variable is found at the end of its pass (R14.1, B47)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    nba_put(kBlockV, &var, 5);
+    force_var(1, 170);
+    nba_begin();
+    var = 5;
+    nba_end();
+    CHECK(rule() == "R14.1");
+    CHECK(has(rt_trace_report(), "when the NBA pass ends"));
+
+    // The commit drops the update while the force is in force.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    nba_put(kGatedV, &var, 5);
+    force_var(1, 170);
+    nba_begin();
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // Staged while forced, released before the NBA region: the update lands.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_var(1, 170);
+    nba_put(kGatedV, &var, 5);
+    release_var();
+    nba_begin();
+    var = 5;
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: an override stores only while it is in force, and a force is over an assign (R14.1)") {
+    // A force's store after the force was released.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_var(1, 7);
+    release_var();
+    var = 8;
+    rt_trace_override_apply(&kForceAp, &force_site, &var, "v", &kVarShape, 0, 32, nullptr, nullptr);
+    CHECK(rule() == "R14.1");
+    CHECK(has(rt_trace_report(), "not in force"));
+
+    // An assign's store into a variable a force owns.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    assign_var(1, 10);
+    force_var(1, 77);
+    var = 30;
+    rt_trace_override_apply(&kAssignAp, &assign_site, &var, "v", &kVarShape, 0, 32, nullptr, nullptr);
+    CHECK(rule() == "R14.1");
+    CHECK(has(rt_trace_report(), "force overrides assign"));
+}
+
+TEST_CASE("trace check: the bits a force lays over a net hold its value after the force and after each store of the resolver (R14.2)") {
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    resolve_net(0x00);
+    force_net(0xa);
+    // A driver changes under the force: the resolver stores the fold with the site over it, and nothing of the forced
+    // bits changes.
+    resolve_net(0x81);
+    resolve_net(0xc3);
+    release_net();
+    resolve_net(0xc3);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    CHECK(rule().empty());
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.override_resolves == before.override_resolves + 4);
+    CHECK(after.override_applies == before.override_applies + 1);
+}
+
+// B33: the resolver stored the fold into the net, and then the forced bits over it. The first store is the one a
+// reader of the net sees as an edge the force forbids.
+TEST_CASE("trace check: a resolver that stores the fold before it lays the force over it is found (R14.2, B33)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_net(0xa);
+    net.mm = 0x8181;
+    net.z  = 0;
+    rt_trace_override_resolve(&kResolve, &net, "w", &kNetShape);
+    CHECK(rule() == "R14.2");
+    CHECK(has(rt_trace_report(), "the bits of a forced net do not hold the value their force gives them: w[5:2]"));
+    CHECK(has(rt_trace_report(), "w[5:2] reads 0000 where its force holds 1010"));
+    CHECK(has(rt_trace_report(), "store of a forced net by its resolver at design.sv:30:3"));
+}
+
+// The force statement's own store into the net must leave the forced bits as its value says; a net that took the
+// value in another position, or not at all, is not forced.
+TEST_CASE("trace check: a force that stores the wrong bits of the net is found (R14.2)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    flag = 1;
+    rt_trace_override_state(&kSiteSt, &flag);
+    put_val(val, 0xa);
+    put_bits(4, 0xa);
+    rt_trace_override_apply(&kSiteAp, &flag, &net, "w", &kNetShape, 2, 4, &val, &kValShape);
+    CHECK(rule() == "R14.2");
+    CHECK(has(rt_trace_report(), "its force statement stored the net"));
+}
+
+// B36's landing of a delayed driver over a force, and any store of the net no mark reports: the forced bits are
+// checked at the end of the slot too.
+TEST_CASE("trace check: a forced net that changed with no store of the resolver is found at the end of the slot (R14.2)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_net(0xa);
+    put_bits(2, 0x5);
+    rt_trace_slot_end();
+    CHECK(rule() == "R14.2");
+    CHECK(has(rt_trace_report(), "the slot ends"));
+
+    // A released site is not checked, and a bit that two active sites lay over is not either: the later site wins, and
+    // which is later is not in the trace.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_net(0xa);
+    force_net2(0x3);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    release_net();
+    resolve_net(0x00);
+    put_bits(0, 0x5);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+// B10: the net took the forced value when the resolver next ran, a delta later, so the next statement of the forcing
+// process read the old one.
+TEST_CASE("trace check: a force of a net that stores nothing into it at once is found (R14.3, B10)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    flag = 1;
+    rt_trace_override_state(&kSiteSt, &flag);
+    put_val(val, 0xa);
+    parked(&proc_a);
+    CHECK(rule() == "R14.3");
+    CHECK(has(rt_trace_report(), "a force took no effect at once"));
+    CHECK(has(rt_trace_report(), "store of a net force site's flag at design.sv:22:5"));
+
+    // A variable's force is the same: the store of the state puts it in force, and the value follows in its statement.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    force_site = 1;
+    rt_trace_override_state(&kForceSt, &force_site);
+    rt_trace_region(RT_TRACE_REG_INACTIVE);
+    CHECK(rule() == "R14.3");
+}
+
+// B26: `release` left the net to its resolver process, so the next statement read the forced value.
+TEST_CASE("trace check: a release of a net that the resolver does not store at once is found (R14.3, B26)") {
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    resolve_net(0x00);
+    force_net(0xa);
+    release_net();
+    parked(&proc_a);
+    CHECK(rule() == "R14.3");
+    CHECK(has(rt_trace_report(), "a release of a net did not give it the value of its drivers at once"));
+    CHECK(has(rt_trace_report(), "w[5:2] was not resolved"));
+
+    // With the resolver's store in the statement, nothing is owed; and a release of a site that was never forced
+    // (nothing known of it) owes nothing.
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    resolve_net(0x00);
+    force_net(0xa);
+    release_net();
+    resolve_net(0xc3);
+    parked(&proc_b);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_begin();
+    reset_overrides();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    release_net();
+    parked(&proc_a);
+    CHECK(rt_trace_halted() == 0);
+}
+
+namespace {
+
+// A design that forces, releases, assigns and deasigns a variable, forces a net whole and by a part of it, and has a
+// net delay under a force.
+const char* const kOverrideDesign = R"(
+    module t;
+      logic [7:0] v, w, q;
+      logic [7:0] a = 8'd3, b = 8'd10;
+      wire  [7:0] n;
+      wire  [7:0] #2 d = a;
+      logic       clk = 0;
+      assign n = a + 8'd1;
+      always @(posedge clk) q <= q + 8'd1;
+      initial begin
+        v = 8'd1; q = 8'd0;
+        #1 force v = 8'd7;
+        v = 8'd9;
+        #1 $display("v=%0d", v);
+        release v;
+        #1 v = 8'd11;
+        assign w = b;
+        #1 b = 8'd20;
+        #1 force w = 8'd77;
+        b = 8'd30;
+        #1 release w;
+        #1 deassign w;
+        force n = 8'd100;
+        #1 a = 8'd4;
+        #1 release n;
+        force n[3:0] = 4'hf;
+        #1 release n[3:0];
+        force d = 8'd9;
+        #1 a = 8'd5;
+        #3 release d;
+        #1 clk = 1;
+        force q = 8'd200;
+        q <= 8'd5;
+        #1 $display("q=%0d n=%0d d=%0d", q, n, d);
+        release q;
+        #1 $finish;
+      end
+    endmodule)";
+
+} // namespace
+
+// The stores of each kind of force and release, as the generated code reports them: the design runs without a
+// violation, and each kind of store is counted.
+TEST_CASE("trace check: a design that forces, releases, assigns and deassigns runs clean and is counted") {
+    if (std::getenv("CLOTHO_NO_TRACE_CHECK") != nullptr) {
+        return;
+    }
+    const LowerResult r = lower_text(kOverrideDesign);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    ir::SimulationConfig config;
+    config.trace_check = true;
+    const std::string out = capture_stdout([&] { ir::run_jit(*r.module, nullptr, config); });
+    CHECK(has(out, "v=7"));
+    CHECK(has(out, "q=200"));
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.override_states > before.override_states + 10);
+    CHECK(after.override_applies > before.override_applies + 5);
+    CHECK(after.override_resolves > before.override_resolves);
+}
 #endif // CLOTHO_EXTRA_ASSERTS
+
+// A design that forces and releases a variable and a net: the override marks plant trace calls only in a build
+// with CLOTHO_EXTRA_ASSERTS and the config asking for it, and in no other build the code is the one the config
+// that turns the check off gives.
+TEST_CASE("the override events are generated only in a CLOTHO_EXTRA_ASSERTS build, and the force sites' code is the same without them") {
+    const auto text = [](const ir::SimulationConfig& config) {
+        const LowerResult r = lower_text(R"(
+            module t;
+              logic [7:0] v, a = 1;
+              wire  [7:0] n = a;
+              initial begin
+                #1 force v = 8'd7; force n = 8'd3; assign v = a;
+                #1 release n; deassign v; release v;
+              end
+            endmodule)");
+        REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+        auto host = ir::host_target();
+        REQUIRE(static_cast<bool>(host));
+        auto tm = host->createTargetMachine();
+        REQUIRE(static_cast<bool>(tm));
+        llvm::LLVMContext ctx;
+        const auto        built = ir::build_modules_unoptimized(*r.module, ctx, **tm, config);
+        std::string              out;
+        llvm::raw_string_ostream os(out);
+        for (const auto& m : built.modules) {
+            m->print(os, nullptr);
+        }
+        return out;
+    };
+    ir::SimulationConfig off;
+    off.trace_check = false;
+    ir::SimulationConfig asked;
+    asked.trace_check = true;
+    const std::string without = text(off);
+    CHECK(without.find("rt_trace_") == std::string::npos);
+    const std::string with = text(asked);
+#ifdef CLOTHO_EXTRA_ASSERTS
+    for (const char* fn : { "rt_trace_override_state", "rt_trace_override_apply", "rt_trace_override_resolve" }) {
+        CHECK_MESSAGE(with.find(fn) != std::string::npos, fn);
+    }
+#else
+    CHECK(with == without);
+#endif
+}

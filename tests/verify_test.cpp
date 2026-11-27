@@ -432,3 +432,36 @@ TEST_CASE("verify: lowered designs satisfy the typing rules") {
         CHECK(found.empty());
     }
 }
+
+TEST_CASE("verify: an override mark names a Store and lvalues of signals before it") {
+    Body        t;
+    const Ref   u32   = t.bits(32);
+    const Index state = t.signal(u32);
+    const Index k     = t.konst(u32);
+    const Index st    = t.b.binary(Inst::Tag::Store, state, k, kLoc);
+    t.b.mark_override(st, { .kind = OverrideKind::ForceState });
+    const Index dst = t.signal(u32);
+    const Index ap  = t.b.binary(Inst::Tag::Store, dst, k, kLoc);
+    t.b.mark_override(ap, { .kind = OverrideKind::ForceApply, .state = state });
+    const Index val = t.signal(u32);
+    const Index sa  = t.b.binary(Inst::Tag::Store, dst, k, kLoc);
+    t.b.mark_override(sa, { .kind = OverrideKind::SiteApply, .state = state, .shadow = val });
+    const Index rs = t.b.binary(Inst::Tag::Store, dst, k, kLoc);
+    t.b.mark_override(rs, { .kind = OverrideKind::Resolve });
+    CHECK(t.verified().empty());
+}
+
+TEST_CASE("verify: an override mark of a non-store, or naming a later or missing lvalue, is reported") {
+    Body        t;
+    const Ref   u32 = t.bits(32);
+    const Index s   = t.signal(u32);
+    const Index k   = t.konst(u32);
+    const Index ld  = t.b.unary(Inst::Tag::Load, s, kLoc);
+    t.b.mark_override(ld, { .kind = OverrideKind::ForceState });
+    const Index st = t.b.binary(Inst::Tag::Store, s, k, kLoc);
+    t.b.mark_override(st, { .kind = OverrideKind::ForceApply });
+    const Index st2 = t.b.binary(Inst::Tag::Store, s, k, kLoc);
+    t.b.mark_override(st2, { .kind = OverrideKind::ForceApply, .state = static_cast<Index>(static_cast<uint32_t>(st2) + 1) });
+    const auto v = t.verified();
+    CHECK(count(v, Rule::OverrideMark) == 3);
+}

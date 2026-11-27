@@ -69,6 +69,7 @@ enum class Ev : uint8_t {
     ChildDone,
     Join,
     Member,
+    Override,
 };
 
 struct Entry {
@@ -389,6 +390,50 @@ struct InertSite {
     uint64_t  expect = 0;
 };
 
+// -- Force, release, assign and deassign (R14) --
+
+// One `force` statement of a net: the bits [lo, lo + n) of the net that its value signal holds while its flag is
+// set.
+struct OvSite {
+    uintptr_t             flag      = 0;
+    uintptr_t             val       = 0;
+    const rt_trace_shape* val_shape = nullptr;
+    uint32_t              lo        = 0;
+    uint32_t              n         = 0;
+};
+
+// A variable or a net that an override owns or has owned, by the storage of the target.
+struct Own {
+    uintptr_t               x     = 0;
+    const rt_trace_shape*   shape = nullptr;
+    bool                    net   = false;
+    // The control of the last store that applied an override to it, for a report.
+    const rt_trace_control* by    = nullptr;
+    // A variable: the storage of the state of its force layer and of its assign layer (zero until seen), whether each is
+    // in force, and the bytes the last store of the override left.
+    uintptr_t               fstate = 0;
+    uintptr_t               astate = 0;
+    bool                    fon    = false;
+    bool                    aon    = false;
+    std::vector<uint8_t>    held;
+    // A net: its force sites.
+    std::vector<OvSite>     sites;
+};
+
+// A store that put a force in force, whose own store of the value has not come yet (R14.3).
+struct ApplyOwed {
+    uintptr_t               state;
+    const rt_trace_control* by;
+};
+
+// A release of the bits [lo, lo + n) of a net, which its resolver has not stored since (R14.3).
+struct ResolveOwed {
+    uintptr_t               x;
+    uint32_t                lo;
+    uint32_t                n;
+    const rt_trace_control* by;
+};
+
 struct Checker {
     AddrMap<Act>         acts;
     AddrMap<const char*> names;
@@ -464,6 +509,13 @@ struct Checker {
     int32_t                         inert_live          = 0;
     int32_t                         inert_waiting       = 0;
     int32_t                         inert_wheel_waiting = 0;
+    // R14: the targets an override has owned, by the storage of the target and by the storage of each state signal
+    // (both index + 1 into `owns`), and the stores that owe an apply or a resolution.
+    std::vector<Own>                owns;
+    AddrMap<uint32_t>               own_at;
+    AddrMap<uint32_t>               own_of_state;
+    std::vector<ApplyOwed>          apply_owed;
+    std::vector<ResolveOwed>        resolve_owed;
 };
 
 Checker g;
@@ -535,6 +587,13 @@ const char* control_name(uint32_t kind) {
         case RT_TRACE_ORG_OBSERVED: return "Observed body";
         case RT_TRACE_ORG_RE_NBA: return "Re-NBA body";
         case RT_TRACE_ORG_FINAL: return "final block";
+        case RT_TRACE_OVR_FORCE_STATE: return "store of a variable's force state";
+        case RT_TRACE_OVR_ASSIGN_STATE: return "store of a variable's assign state";
+        case RT_TRACE_OVR_SITE_STATE: return "store of a net force site's flag";
+        case RT_TRACE_OVR_FORCE_APPLY: return "store of a forced value into a variable";
+        case RT_TRACE_OVR_ASSIGN_APPLY: return "store of an assigned value into a variable";
+        case RT_TRACE_OVR_SITE_APPLY: return "store of a forced value into a net";
+        case RT_TRACE_OVR_RESOLVE: return "store of a forced net by its resolver";
     }
     return "?";
 }
@@ -598,6 +657,7 @@ const char* ev_name(Ev ev) {
         case Ev::ChildDone: return "child done";
         case Ev::Join: return "join";
         case Ev::Member: return "member";
+        case Ev::Override: return "override";
     }
     return "?";
 }
@@ -713,6 +773,9 @@ const char* rule_title(const char* rule) {
         { "R16.5", "inertial apply" },
         { "R11.1", "timed update" },
         { "R11.2", "event update" },
+        { "R14.1", "override holds" },
+        { "R14.2", "forced net" },
+        { "R14.3", "override at once" },
     };
     for (const auto& t : titles) {
         if (std::strcmp(rule, t.id) == 0) {
@@ -858,6 +921,14 @@ std::string rec_text(const Rec& r) {
         case Ev::ChildDone: out += " into the record at " + address_text(r.x); break;
         case Ev::Join: out += " past the join of the record at " + address_text(r.x); break;
         case Ev::Member: appendf(out, ": member %llu starts", static_cast<unsigned long long>(r.x)); break;
+        case Ev::Override:
+            out += ": " + control_text(r.c);
+            if (r.cause == RT_TRACE_OVR_FORCE_STATE || r.cause == RT_TRACE_OVR_ASSIGN_STATE || r.cause == RT_TRACE_OVR_SITE_STATE) {
+                appendf(out, ", the state at 0x%llx now %llu", static_cast<unsigned long long>(r.a), static_cast<unsigned long long>(r.x));
+            } else {
+                out += ", target " + signal_text(reinterpret_cast<const void*>(r.a));
+            }
+            break;
         default: break;
     }
     return out;
@@ -1792,9 +1863,206 @@ void settle_releases() {
     g.rel_owed.clear();
 }
 
+// -- Force, release, assign and deassign (R14) --
+
+uint32_t load_u32(uintptr_t at) {
+    uint32_t v;
+    std::memcpy(&v, reinterpret_cast<const void*>(at), sizeof(v));
+    return v;
+}
+
+// The record of the target at `x` (an index + 1 into g.owns), made when it has none; `net` and `shape` are what the
+// last event said of it.
+uint32_t own_index(uintptr_t x, const rt_trace_shape* shape, bool net) {
+    uint32_t& at = g.own_at.at(x);
+    if (at == 0) {
+        g.owns.emplace_back();
+        g.owns.back().x = x;
+        at              = static_cast<uint32_t>(g.owns.size());
+    }
+    Own& o  = g.owns[at - 1];
+    o.shape = shape;
+    o.net   = net;
+    return at;
+}
+
+// A bit of a value read_value took: `plane` 0 is the must plane, 1 the may plane and 2 the z word. A plane the shape
+// does not have reads zero.
+uint32_t value_bit(const rt_trace_shape* s, const std::vector<uint8_t>& v, int plane, uint32_t pos) {
+    uint32_t at = pos;
+    if (plane == 1) {
+        if (s->bits0 <= s->width) {
+            return 0;
+        }
+        at = s->width + pos;
+    } else if (plane == 2) {
+        if (s->bits1 == 0) {
+            return 0;
+        }
+        at = 8 * ((s->bits0 + 7) / 8) + pos;
+    }
+    return at / 8 < v.size() ? (v[at / 8] >> (at % 8)) & 1u : 0u;
+}
+
+// "0", "1", "x" or "z", for a report.
+char bit_char(const rt_trace_shape* s, const std::vector<uint8_t>& v, uint32_t pos) {
+    const bool must = value_bit(s, v, 0, pos) != 0;
+    const bool may  = s->bits0 > s->width ? value_bit(s, v, 1, pos) != 0 : must;
+    if (!may) {
+        return '0';
+    }
+    if (must) {
+        return '1';
+    }
+    return value_bit(s, v, 2, pos) != 0 ? 'z' : 'x';
+}
+
+// The bits [lo, lo + n) of a value, most significant first.
+std::string bits_text(const rt_trace_shape* s, const std::vector<uint8_t>& v, uint32_t lo, uint32_t n) {
+    std::string out;
+    for (uint32_t i = n; i-- > 0 && out.size() < 64;) {
+        out += bit_char(s, v, lo + i);
+    }
+    return n > 64 ? out + "..." : out;
+}
+
+// Whether an active site of the net other than `self` also lays a value over bit `pos`: the later one wins, and which
+// one is later is not in the trace.
+bool overlapped(const Own& o, const OvSite* self, uint32_t pos) {
+    for (const OvSite& s : o.sites) {
+        if (&s != self && load_u32(s.flag) != 0 && pos >= s.lo && pos - s.lo < s.n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// "w[5:2]": the bits of the net at `x`, by its declared name when the trace has it, else by its address.
+std::string net_bits_text(uintptr_t x, uint32_t lo, uint32_t n) {
+    std::string out;
+    if (const char* const* name = g.names.find(x); name != nullptr && *name != nullptr) {
+        out = *name;
+    } else {
+        out = address_text(x);
+    }
+    appendf(out, "[%u:%u]", lo + n - 1, lo);
+    return out;
+}
+
+// R14.2: the bits of a net that an active force site lays over hold the site's forced value, as of `when`; `by` is
+// the store being checked, or null at a poll. True when that fails.
+bool check_site(const Own& o, const OvSite& s, const char* when, const rt_trace_control* by) {
+    if (load_u32(s.flag) == 0 || o.shape == nullptr || s.val_shape == nullptr) {
+        return false;
+    }
+    std::vector<uint8_t> cur;
+    std::vector<uint8_t> want;
+    read_value(reinterpret_cast<const void*>(o.x), o.shape, cur);
+    read_value(reinterpret_cast<const void*>(s.val), s.val_shape, want);
+    for (uint32_t i = 0; i < s.n; ++i) {
+        const uint32_t pos = s.lo + i;
+        if (overlapped(o, &s, pos)) {
+            continue;
+        }
+        for (int plane = 0; plane < 3; ++plane) {
+            if (value_bit(o.shape, cur, plane, pos) == value_bit(s.val_shape, want, plane, i)) {
+                continue;
+            }
+            std::string what = "the bits of a forced net do not hold the value their force gives them: ";
+            what += net_bits_text(o.x, s.lo, s.n);
+            appendf(what, " reads %s where its force holds %s", bits_text(o.shape, cur, s.lo, s.n).c_str(),
+                    bits_text(s.val_shape, want, 0, s.n).c_str());
+            std::string cause = std::string("checked when ") + when + "; the force is active (its flag is nonzero)";
+            if (by != nullptr) {
+                cause += ", and the store that left the net so is " + control_text(by);
+            }
+            fail("R14.2", what, 0, cause);
+            return true;
+        }
+    }
+    return false;
+}
+
+// R14.1: a variable an override owns holds the bytes the last store of the override left, as of `when`. True when that
+// fails.
+bool check_held(const Own& o, const char* when) {
+    if (o.net || o.shape == nullptr || o.held.empty() || !(o.fon || o.aon)) {
+        return false;
+    }
+    std::vector<uint8_t> cur;
+    read_value(reinterpret_cast<const void*>(o.x), o.shape, cur);
+    if (cur == o.held) {
+        return false;
+    }
+    std::string what = "a variable that a ";
+    what += o.fon ? "force" : "procedural assign";
+    what += " owns changed with no store of the override: a write path ignored it (";
+    what += signal_text(reinterpret_cast<const void*>(o.x)) + ")";
+    fail("R14.1", what, 0,
+         "its bytes were " + bytes_text(o.held) + " after " +
+           (o.by != nullptr ? control_text(o.by) : std::string("the last store of the override")) + " and are " +
+           bytes_text(cur) + " when " + when);
+    return true;
+}
+
+// The variables and the nets an override owns hold what it gave them; true when one does not. A net is asked at the end
+// of a slot (its resolver ran for every change of a forced value), a variable also after an NBA pass, whose commit may
+// not touch it. Nothing is asked after a `$finish`, which leaves what its slot queued unrun.
+bool check_owned(const char* when, bool nets) {
+    if (g.owns.empty() || g.finished) {
+        return false;
+    }
+    for (const Own& o : g.owns) {
+        if (o.net) {
+            if (nets) {
+                for (const OvSite& s : o.sites) {
+                    if (check_site(o, s, when, nullptr)) {
+                        return true;
+                    }
+                }
+            }
+        } else if (check_held(o, when)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// What a store that put a force in force, or released a net, owes by the next dispatch, park or region (R14.3): the
+// store of the value, and the net's resolution.
+void settle_overrides() {
+    if (g.apply_owed.empty() && g.resolve_owed.empty()) {
+        return;
+    }
+    const std::vector<ApplyOwed>   apply   = std::move(g.apply_owed);
+    const std::vector<ResolveOwed> resolve = std::move(g.resolve_owed);
+    g.apply_owed.clear();
+    g.resolve_owed.clear();
+    if (g.finished) {
+        return;
+    }
+    if (!apply.empty()) {
+        fail("R14.3", "a force took no effect at once: the store of its value did not follow the store that put it in force",
+             0,
+             "put in force by " + control_text(apply.front().by) +
+               ", and the next dispatch, park or region came with no store of the value");
+        return;
+    }
+    const ResolveOwed& r    = resolve.front();
+    std::string        what = "a release of a net did not give it the value of its drivers at once: ";
+    what += net_bits_text(r.x, r.lo, r.n) + " was not resolved";
+    fail("R14.3", what, 0,
+         "released by " + control_text(r.by) +
+           ", and the next dispatch, park or region came with no store of the net by its resolver");
+}
+
 // The point a write's wakes must have been made by: every activation still parked as it was is a
 // violation.
 void settle_owed() {
+    settle_overrides();
+    if (g.halted) {
+        return;
+    }
     settle_aborts();
     if (g.halted) {
         return;
@@ -2030,6 +2298,11 @@ extern "C" void rt_trace_begin(void) {
     g.inert_live          = 0;
     g.inert_waiting       = 0;
     g.inert_wheel_waiting = 0;
+    g.owns.clear();
+    g.own_at.clear();
+    g.own_of_state.clear();
+    g.apply_owed.clear();
+    g.resolve_owed.clear();
 }
 
 extern "C" void rt_trace_spawn(void* a_, const rt_trace_control* origin, void* parent) {
@@ -2992,6 +3265,9 @@ extern "C" void rt_trace_slot_end(void) {
             return;
         }
     }
+    if (check_owned("the slot ends", true)) {
+        return;
+    }
     poll_waiters();
 }
 
@@ -3305,6 +3581,9 @@ extern "C" void rt_trace_nba_pass(uint32_t begin, uint32_t region) {
         }
         g.in_pass = false;
         settle_pass();
+        if (!g.halted) {
+            check_owned("the NBA pass ends", false);
+        }
         return;
     }
     ++g.run.nba_passes;
@@ -3471,6 +3750,161 @@ extern "C" void rt_trace_change(const rt_trace_change_site* site, const void* x,
         g.chg.at(reinterpret_cast<uintptr_t>(x)) = ChgFacts{ g.step, pos, neg, any };
         count_occurrence(reinterpret_cast<uintptr_t>(x), pos, neg, any, false);
         owe(x, pos, neg, any, false);
+    }
+}
+
+extern "C" void rt_trace_override_state(const rt_trace_control* site, const void* state_) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.override_states;
+    ++g.total.override_states;
+    const uintptr_t state = reinterpret_cast<uintptr_t>(state_);
+    const uint32_t  now   = load_u32(state);
+    record(Ev::Override, state, now, site, static_cast<uint8_t>(site->kind), 0);
+    if (g.finished) {
+        return;
+    }
+    const uint32_t  kind = site->kind;
+    const uint32_t* at   = g.own_of_state.find(state);
+    if (kind == RT_TRACE_OVR_SITE_STATE) {
+        // A force of a net is followed by the net's own store of its value; a release owes the net a resolution.
+        if (now != 0) {
+            g.apply_owed.push_back(ApplyOwed{ state, site });
+        } else if (at != nullptr) {
+            const Own& o = g.owns[*at - 1];
+            for (const OvSite& s : o.sites) {
+                if (s.flag == state) {
+                    g.resolve_owed.push_back(ResolveOwed{ o.x, s.lo, s.n, site });
+                }
+            }
+        }
+        return;
+    }
+    const bool force = kind == RT_TRACE_OVR_FORCE_STATE;
+    if (now != 0) {
+        // A force is followed by its store of the value, and an assign by one too unless a force owns the variable.
+        if (force) {
+            g.apply_owed.push_back(ApplyOwed{ state, site });
+        } else if (at != nullptr) {
+            g.owns[*at - 1].aon = true;
+        }
+        return;
+    }
+    // The layer ends: a release or a deassign leaves the variable as the override had it.
+    if (at != nullptr) {
+        Own& o = g.owns[*at - 1];
+        if ((force ? o.fon : o.aon) && check_held(o, "the override ended")) {
+            return;
+        }
+        (force ? o.fon : o.aon) = false;
+    }
+}
+
+extern "C" void rt_trace_override_apply(const rt_trace_control* site, const void* state_, const void* x_, const char* name,
+                                        const rt_trace_shape* shape, uint32_t lo, uint32_t n, const void* val_,
+                                        const rt_trace_shape* val_shape) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.override_applies;
+    ++g.total.override_applies;
+    const uintptr_t state = reinterpret_cast<uintptr_t>(state_);
+    const uintptr_t x     = reinterpret_cast<uintptr_t>(x_);
+    record(Ev::Override, x, 0, site, static_cast<uint8_t>(site->kind), 0);
+    if (name != nullptr && x != 0) {
+        g.names.at(x) = name;
+    }
+    if (g.finished) {
+        return;
+    }
+    // The store that put the layer in force owed this one; it has come, whether or not the target can be read.
+    for (size_t i = 0; i < g.apply_owed.size(); ++i) {
+        if (g.apply_owed[i].state == state) {
+            g.apply_owed.erase(g.apply_owed.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    if (x == 0) {
+        return;
+    }
+    const uint32_t kind      = site->kind;
+    const uint32_t idx       = own_index(x, shape, kind == RT_TRACE_OVR_SITE_APPLY);
+    g.own_of_state.at(state) = idx;
+    Own& o                   = g.owns[idx - 1];
+    o.by                     = site;
+    if (load_u32(state) == 0) {
+        fail("R14.1", "a store applied an override that is not in force: its state is zero", 0,
+             "the store is " + control_text(site) + " into " + signal_text(x_));
+        return;
+    }
+    if (kind == RT_TRACE_OVR_SITE_APPLY) {
+        OvSite* of = nullptr;
+        for (OvSite& s : o.sites) {
+            if (s.flag == state) {
+                of = &s;
+            }
+        }
+        if (of == nullptr) {
+            o.sites.emplace_back();
+            of       = &o.sites.back();
+            of->flag = state;
+        }
+        of->val       = reinterpret_cast<uintptr_t>(val_);
+        of->val_shape = val_shape;
+        of->lo        = lo;
+        of->n         = n;
+        check_site(o, *of, "its force statement stored the net", site);
+        return;
+    }
+    if (kind == RT_TRACE_OVR_FORCE_APPLY) {
+        o.fstate = state;
+        o.fon    = true;
+    } else {
+        if (o.fon) {
+            fail("R14.1", "a procedural assign stored a variable that a force owns: force overrides assign", 0,
+                 "the store is " + control_text(site) + " into " + signal_text(x_));
+            return;
+        }
+        o.astate = state;
+        o.aon    = true;
+    }
+    if (shape != nullptr) {
+        read_value(x_, shape, o.held);
+    } else {
+        o.held.clear();
+    }
+}
+
+extern "C" void rt_trace_override_resolve(const rt_trace_control* site, const void* x_, const char* name,
+                                          const rt_trace_shape* shape) {
+    if (g.halted) {
+        return;
+    }
+    touch_run();
+    ++g.run.override_resolves;
+    ++g.total.override_resolves;
+    const uintptr_t x = reinterpret_cast<uintptr_t>(x_);
+    record(Ev::Override, x, 0, site, static_cast<uint8_t>(site->kind), 0);
+    if (name != nullptr && x != 0) {
+        g.names.at(x) = name;
+    }
+    if (g.finished || x == 0) {
+        return;
+    }
+    // The resolution a release owes the net has come.
+    for (size_t i = g.resolve_owed.size(); i-- > 0;) {
+        if (g.resolve_owed[i].x == x) {
+            g.resolve_owed.erase(g.resolve_owed.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+    }
+    const Own& o = g.owns[own_index(x, shape, true) - 1];
+    for (const OvSite& s : o.sites) {
+        if (check_site(o, s, "its resolver stored the net", site)) {
+            return;
+        }
     }
 }
 

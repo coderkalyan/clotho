@@ -2431,7 +2431,10 @@ private:
 
     ir::Index site_const(uint32_t id, ir::Builder& b, ir::SourceLoc l);
 
-    ir::Index site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l, ir::Index handle = ir::kNoIndex);
+    // `state_lv`, when given, receives the lvalue of the state signal the predicate reads, for
+    // the override mark of a store the predicate guards.
+    ir::Index site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l, ir::Index handle = ir::kNoIndex,
+                      ir::Index* state_lv = nullptr);
 
     ir::Index not_forced(const ForceInfo& fi, bool also_assign, ir::Builder& b, ir::SourceLoc l,
                          ir::Index handle = ir::kNoIndex);
@@ -2453,19 +2456,27 @@ private:
     const ValueSymbol* pca_target_var(const Expression& lhs, const char* verb);
 
     // Build a continuous re-eval process that stores `a.right()` into `v` while
-    // `pred_fn(rb)` holds, sensitive to the RHS reads plus `extra` wait events.
+    // `pred_fn(rb)` holds, sensitive to the RHS reads plus `extra` wait events. A store that
+    // applies an override to a variable (`apply` ForceApply or AssignApply) is marked with the
+    // state lvalue `state_lv` names, which `pred_fn` sets (site_is) when it reads the layer's
+    // state; a store into a net site's value signal is no apply and takes no mark.
     template<typename PredFn>
-    void add_pca_reeval(const AssignmentExpression& a,
-                        ir::Signal                  v,
-                        ir::SourceLoc               l,
-                        std::vector<ir::WaitEvent>  extra,
-                        PredFn                      pred_fn) {
+    void add_pca_reeval(const AssignmentExpression&       a,
+                        ir::Signal                        v,
+                        ir::SourceLoc                     l,
+                        std::vector<ir::WaitEvent>        extra,
+                        std::optional<ir::OverrideKind>   apply,
+                        const ir::Index&                  state_lv,
+                        PredFn                            pred_fn) {
         ir::Builder     rb(module_);
         const ir::Index pred = pred_fn(rb);
         rb.open_region();
-        const ir::Index dst = rb.signal(v, l);
-        const ir::Index rhs = lower_expr(a.right(), rb);
-        rb.binary(ir::Inst::Tag::Store, dst, rhs, l);
+        const ir::Index dst   = rb.signal(v, l);
+        const ir::Index rhs   = lower_expr(a.right(), rb);
+        const ir::Index store = rb.binary(ir::Inst::Tag::Store, dst, rhs, l);
+        if (apply) {
+            rb.mark_override(store, ir::OverrideMark{ .kind = *apply, .state = state_lv });
+        }
         const ir::ExtraSlice then_r = rb.close_region();
         rb.open_region();
         const ir::ExtraSlice else_r = rb.close_region();

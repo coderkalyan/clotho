@@ -1278,7 +1278,8 @@ void Lowerer::emit_wire_resolvers() {
                 b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
             }
             const ir::Index result = b.unary(ir::Inst::Tag::Load, cell(), l);
-            b.binary(ir::Inst::Tag::Store, b.signal(net, l), result, l);
+            b.mark_override(b.binary(ir::Inst::Tag::Store, b.signal(net, l), result, l),
+                            ir::OverrideMark{ .kind = ir::OverrideKind::Resolve });
         } else if (!delayed) {
             // An unpacked array net reaches here only when nothing drives it (a
             // driver's slot is refused for one), and the pull, or the z, of a
@@ -1867,9 +1868,15 @@ ir::Index Lowerer::pca_state_lv(ir::Signal state, ir::Index handle, ir::Builder&
     return handle == ir::kNoIndex ? b.signal(state, l) : b.iface_signal(handle, state, l);
 }
 
-// `force_site === id` (CaseEq never yields x; the site is 2-state anyway).
-ir::Index Lowerer::site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l, ir::Index handle) {
-    const ir::Index cur  = b.unary(ir::Inst::Tag::Load, pca_state_lv(site, handle, b, l), l);
+// `force_site === id` (CaseEq never yields x; the site is 2-state anyway). `state_lv`, when
+// given, gets the lvalue of the state signal it reads.
+ir::Index Lowerer::site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l, ir::Index handle,
+                           ir::Index* state_lv) {
+    const ir::Index lv = pca_state_lv(site, handle, b, l);
+    if (state_lv != nullptr) {
+        *state_lv = lv;
+    }
+    const ir::Index cur  = b.unary(ir::Inst::Tag::Load, lv, l);
     const ir::Index want = site_const(id, b, l);
     return b.binary(ir::Inst::Tag::CaseEq, cur, want, l);
 }
@@ -2109,16 +2116,21 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
             const ir::Index     rhs   = lower_expr(a.right(), b);
             const ir::Index     flag  = b.signal(site.active, l);
             const ir::Index     on    = site_const(1, b, l);
-            b.binary(ir::Inst::Tag::Store, flag, on, l);
-            b.binary(ir::Inst::Tag::Store, b.signal(site.val, l), rhs, l);
+            b.mark_override(b.binary(ir::Inst::Tag::Store, flag, on, l),
+                            ir::OverrideMark{ .kind = ir::OverrideKind::SiteState });
+            const ir::Index val_lv = b.signal(site.val, l);
+            b.binary(ir::Inst::Tag::Store, val_lv, rhs, l);
             // Eager positioned apply so a same-instant read (`force n=v; if
             // (n===v)`) sees it — the resolver would otherwise update n one delta
             // later. The resolver re-affirms the same value when it runs.
             const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)
                                        ? b.signal(net, l)
                                        : b.part_select(b.signal(net, l), site.hi, site.lo, l);
-            b.binary(ir::Inst::Tag::Store, net_lv, rhs, l);
-            add_pca_reeval(a, site.val, l, {}, [&](ir::Builder& rb) { return site_is(site.active, 1, rb, l); });
+            b.mark_override(b.binary(ir::Inst::Tag::Store, net_lv, rhs, l),
+                            ir::OverrideMark{ .kind = ir::OverrideKind::SiteApply, .state = flag, .shadow = val_lv });
+            // The value signal's store is no apply: the resolver lays it over the net.
+            add_pca_reeval(a, site.val, l, {}, std::nullopt, ir::kNoIndex,
+                           [&](ir::Builder& rb) { return site_is(site.active, 1, rb, l); });
             return;
         }
         ForceInfo* fip = force_info_of(*sym);
@@ -2137,11 +2149,16 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
         const ir::Signal v       = signal_of(*sym);
         const ir::Index  site_lv = b.signal(fi.site, l);
         const ir::Index  id_val  = site_const(id, b, l);
-        b.binary(ir::Inst::Tag::Store, site_lv, id_val, l);
+        b.mark_override(b.binary(ir::Inst::Tag::Store, site_lv, id_val, l),
+                        ir::OverrideMark{ .kind = ir::OverrideKind::ForceState });
         const ir::Index dst = b.signal(v, l);
         const ir::Index rhs = lower_expr(a.right(), b);
-        b.binary(ir::Inst::Tag::Store, dst, rhs, l);
-        add_pca_reeval(a, v, l, {}, [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
+        b.mark_override(b.binary(ir::Inst::Tag::Store, dst, rhs, l),
+                        ir::OverrideMark{ .kind = ir::OverrideKind::ForceApply, .state = site_lv });
+        ir::Index reeval_state = ir::kNoIndex;
+        add_pca_reeval(a, v, l, {}, ir::OverrideKind::ForceApply, reeval_state, [&](ir::Builder& rb) {
+            return site_is(fi.site, id, rb, l, ir::kNoIndex, &reeval_state);
+        });
         return;
     }
 
@@ -2162,20 +2179,24 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
     const uint32_t  id      = ++fi.next_assign;
     const ir::Index site_lv = b.signal(fi.assign_site, l);
     const ir::Index id_val  = site_const(id, b, l);
-    b.binary(ir::Inst::Tag::Store, site_lv, id_val, l);
+    b.mark_override(b.binary(ir::Inst::Tag::Store, site_lv, id_val, l),
+                    ir::OverrideMark{ .kind = ir::OverrideKind::AssignState });
     {
         const ir::Index pred = not_forced(fi, /*also_assign=*/false, b, l);
         b.open_region();
         const ir::Index dst = b.signal(v, l);
         const ir::Index rhs = lower_expr(a.right(), b);
-        b.binary(ir::Inst::Tag::Store, dst, rhs, l);
+        b.mark_override(b.binary(ir::Inst::Tag::Store, dst, rhs, l),
+                        ir::OverrideMark{ .kind = ir::OverrideKind::AssignApply, .state = site_lv });
         const ir::ExtraSlice then_r = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_r = b.close_region();
         b.cond(pred, then_r, else_r, l);
     }
-    add_pca_reeval(a, v, l, { ir::WaitEvent{ .signal = fi.site, .edge = ir::Edge::Any } }, [&](ir::Builder& rb) {
-        const ir::Index assigned = site_is(fi.assign_site, id, rb, l);
+    ir::Index reeval_state = ir::kNoIndex;
+    add_pca_reeval(a, v, l, { ir::WaitEvent{ .signal = fi.site, .edge = ir::Edge::Any } },
+                   ir::OverrideKind::AssignApply, reeval_state, [&](ir::Builder& rb) {
+        const ir::Index assigned = site_is(fi.assign_site, id, rb, l, ir::kNoIndex, &reeval_state);
         const ir::Index unforced = not_forced(fi, /*also_assign=*/false, rb, l);
         return rb.binary(ir::Inst::Tag::Land, assigned, unforced, l);
     });
@@ -2215,13 +2236,15 @@ void Lowerer::lower_proc_deassign(const ProceduralDeassignStatement& s, ir::Buil
         // reestablishes, otherwise the value holds (LRM 10.6.2).
         const ir::Index site_lv = b.signal(fi->site, l);
         const ir::Index none    = site_const(0, b, l);
-        b.binary(ir::Inst::Tag::Store, site_lv, none, l);
+        b.mark_override(b.binary(ir::Inst::Tag::Store, site_lv, none, l),
+                        ir::OverrideMark{ .kind = ir::OverrideKind::ForceState });
     } else if (fi->has_assign) {
         // deassign (LRM 10.6.1): end the procedural continuous assign; the value
         // holds. A never-assigned variable is a no-op (no assign_site).
         const ir::Index site_lv = b.signal(fi->assign_site, l);
         const ir::Index none    = site_const(0, b, l);
-        b.binary(ir::Inst::Tag::Store, site_lv, none, l);
+        b.mark_override(b.binary(ir::Inst::Tag::Store, site_lv, none, l),
+                        ir::OverrideMark{ .kind = ir::OverrideKind::AssignState });
     }
 }
 
@@ -2308,7 +2331,8 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
         if (site.lo >= rlo && site.hi <= rhi) {
             const ir::Index flag = b.signal(site.active, l);
             const ir::Index off  = site_const(0, b, l);
-            b.binary(ir::Inst::Tag::Store, flag, off, l);
+            b.mark_override(b.binary(ir::Inst::Tag::Store, flag, off, l),
+                            ir::OverrideMark{ .kind = ir::OverrideKind::SiteState });
             released = true;
         }
     }

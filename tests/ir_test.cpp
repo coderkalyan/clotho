@@ -907,3 +907,16 @@ TEST_CASE("a format-family op carries one sign flag per argument") {
     CHECK(signs[0] == 1);
     CHECK(signs[1] == 0);
 }
+
+TEST_CASE("printer: an override mark prints on a line after its store") {
+    using namespace clotho::ir;
+    Module  m;
+    Builder b(m);
+    const Ref t   = m.pool.put(Type{ .kind = Type::Kind::PackedArray, .element = m.pool.bit_type, .left = 31, .right = 0 });
+    const Index s = b.signal(m.add_signal({ .name = "s", .type = t }), SourceLoc{ 1 });
+    const Index k = b.constant(m.pool.put_int(t, 1), SourceLoc{ 1 });
+    const Index st = b.binary(Inst::Tag::Store, s, k, SourceLoc{ 1 });
+    b.mark_override(st, { .kind = OverrideKind::ForceApply, .state = s });
+    const std::string text = toString(b.finish());
+    CHECK(text.find("; override force_apply state=%0") != std::string::npos);
+}

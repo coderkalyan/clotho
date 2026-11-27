@@ -15,6 +15,14 @@ static_assert(RT_TRACE_POS == static_cast<uint32_t>(Edge::Positive));
 static_assert(RT_TRACE_NEG == static_cast<uint32_t>(Edge::Negative));
 static_assert(RT_TRACE_ANY == static_cast<uint32_t>(Edge::Any));
 
+// The runtime's override kinds are ir::OverrideKind's, in order, so a mark names the kind of its site by it.
+static_assert(RT_TRACE_OVR_ASSIGN_STATE == RT_TRACE_OVR_FORCE_STATE + static_cast<uint32_t>(OverrideKind::AssignState));
+static_assert(RT_TRACE_OVR_SITE_STATE == RT_TRACE_OVR_FORCE_STATE + static_cast<uint32_t>(OverrideKind::SiteState));
+static_assert(RT_TRACE_OVR_FORCE_APPLY == RT_TRACE_OVR_FORCE_STATE + static_cast<uint32_t>(OverrideKind::ForceApply));
+static_assert(RT_TRACE_OVR_ASSIGN_APPLY == RT_TRACE_OVR_FORCE_STATE + static_cast<uint32_t>(OverrideKind::AssignApply));
+static_assert(RT_TRACE_OVR_SITE_APPLY == RT_TRACE_OVR_FORCE_STATE + static_cast<uint32_t>(OverrideKind::SiteApply));
+static_assert(RT_TRACE_OVR_RESOLVE == RT_TRACE_OVR_FORCE_STATE + static_cast<uint32_t>(OverrideKind::Resolve));
+
 bool Backend::trace_on() const {
 #ifdef CLOTHO_EXTRA_ASSERTS
     return config_.trace_check;
@@ -791,6 +799,71 @@ void Backend::emit_trace_trigger(llvm::Value* obj, uint32_t kind) {
 #else
     (void)obj;
     (void)kind;
+#endif
+}
+
+// A store of a force or a procedural `assign` (its mark says so), reported after it. A state store reports the
+// storage of the state signal it wrote, an apply the target, its range and the state of the layer that owns it
+// (and, for a net's force statement, the signal that holds the forced value), and the resolver's store the net.
+// Only a plain signal is read: a place that can be invalid, an aggregate or a string is not one a force targets,
+// and an apply to one reports no target, which still settles what its statement owes.
+void Backend::emit_trace_override(Index store, const OverrideMark& mark, const Guarded& g) {
+#ifdef CLOTHO_EXTRA_ASSERTS
+    (void)store;
+    const bool apply = mark.kind == OverrideKind::ForceApply || mark.kind == OverrideKind::AssignApply ||
+                       mark.kind == OverrideKind::SiteApply;
+    const bool plain = g.valid() == nullptr && !g.never_valid() && g.is_signal && !g.is_agg && !g.is_string &&
+                       g.array_ty == nullptr;
+    if (!trace_on() || (!plain && !apply)) {
+        return;
+    }
+    auto* const           ptr  = llvm::PointerType::getUnqual(ctx_);
+    auto* const           i32  = b_.getInt32Ty();
+    auto* const           none = llvm::ConstantPointerNull::get(ptr);
+    llvm::Module&         m    = *b_.GetInsertBlock()->getModule();
+    llvm::Constant* const site = trace_control(m, RT_TRACE_OVR_FORCE_STATE + static_cast<uint32_t>(mark.kind), trace_here());
+    const auto            apply_fn = [&] {
+        return rt_fn("rt_trace_override_apply", b_.getVoidTy(), { ptr, ptr, ptr, ptr, ptr, i32, i32, ptr, ptr });
+    };
+    if (apply) {
+        const LValue state = lvalue_of(mark.state).unguarded();
+        if (!plain) {
+            b_.CreateCall(apply_fn(), { site, slot_ptr(state), none, none, none, b_.getInt32(0), b_.getInt32(0), none, none });
+            return;
+        }
+    }
+    const LValue lv = g.unguarded();
+    switch (mark.kind) {
+        case OverrideKind::ForceState:
+        case OverrideKind::AssignState:
+        case OverrideKind::SiteState:
+            b_.CreateCall(rt_fn("rt_trace_override_state", b_.getVoidTy(), { ptr, ptr }), { site, slot_ptr(lv) });
+            return;
+        case OverrideKind::ForceApply:
+        case OverrideKind::AssignApply:
+        case OverrideKind::SiteApply: {
+            const LValue    state  = lvalue_of(mark.state).unguarded();
+            llvm::Value*    val    = none;
+            llvm::Constant* vshape = none;
+            if (mark.kind == OverrideKind::SiteApply) {
+                const LValue forced = lvalue_of(mark.shadow).unguarded();
+                val                 = slot_ptr(forced);
+                vshape              = trace_shape(m, forced.sig);
+            }
+            b_.CreateCall(apply_fn(), { site, slot_ptr(state), slot_ptr(lv), trace_signal_name(lv.sig),
+                                        trace_shape(m, lv.sig), b_.CreateTrunc(lv.bit_off, i32), b_.getInt32(lv.width),
+                                        val, vshape });
+            return;
+        }
+        case OverrideKind::Resolve:
+            b_.CreateCall(rt_fn("rt_trace_override_resolve", b_.getVoidTy(), { ptr, ptr, ptr, ptr }),
+                          { site, slot_ptr(lv), trace_signal_name(lv.sig), trace_shape(m, lv.sig) });
+            return;
+    }
+#else
+    (void)store;
+    (void)mark;
+    (void)g;
 #endif
 }
 

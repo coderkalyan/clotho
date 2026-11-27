@@ -71,6 +71,11 @@ enum class Rule : uint8_t {
     // A Ret's value width / domain differs from the function's return type.
     RetWidth,
     RetDomain,
+    // -- Override marks --
+    // A mark of a store of a force or a procedural `assign` (Ir::override_mark) is not of a
+    // Store, or names an lvalue that is not a Signal an earlier instruction made, or lacks or
+    // carries one its kind does not use. The trace reads the marks without checking them.
+    OverrideMark,
 };
 
 // Rules that record where the backend decides something implicitly, rather than

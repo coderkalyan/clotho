@@ -1,5 +1,6 @@
 #include "ir/Verify.h"
 
+#include <algorithm>
 #include <cassert>
 #include <format>
 #include <optional>
@@ -30,6 +31,15 @@ public:
     void run() {
         for (size_t k = 0; k < ir_.inst_count(); ++k) {
             check_inst(static_cast<Index>(k));
+        }
+        // In instruction order, so that a report does not depend on the table's.
+        std::vector<uint32_t> marked;
+        for (const auto& [at, mark] : ir_.override_marks()) {
+            marked.push_back(at);
+        }
+        std::sort(marked.begin(), marked.end());
+        for (const uint32_t at : marked) {
+            check_override(static_cast<Index>(at), *ir_.override_mark(static_cast<Index>(at)));
         }
     }
 
@@ -460,6 +470,44 @@ private:
             report(Rule::RetDomain, i, v, r);
         }
     }
+
+    // -- Override marks --
+
+    // The mark of a store of a force or a procedural `assign`: the store is a Store, and the
+    // lvalues the mark's kind names are signals an earlier instruction made.
+    void check_override(Index at, const OverrideMark& mark) {
+        if (static_cast<uint32_t>(at) >= ir_.inst_count()) {
+            if (ir_.inst_count() != 0) {
+                report(Rule::OverrideMark, static_cast<Index>(0));
+            }
+            return;
+        }
+        const auto signal_before = [&](Index x) {
+            return x != kNoIndex && static_cast<uint32_t>(x) < static_cast<uint32_t>(at) && ir_.tag(x) == Tag::Signal;
+        };
+        bool ok = ir_.tag(at) == Tag::Store;
+        switch (mark.kind) {
+            case OverrideKind::ForceState:
+            case OverrideKind::AssignState:
+            case OverrideKind::SiteState:
+                ok = ok && ir_.tag(ir_.payload(at).binary.l) == Tag::Signal && mark.state == kNoIndex &&
+                     mark.shadow == kNoIndex;
+                break;
+            case OverrideKind::ForceApply:
+            case OverrideKind::AssignApply:
+                ok = ok && signal_before(mark.state) && mark.shadow == kNoIndex;
+                break;
+            case OverrideKind::SiteApply:
+                ok = ok && signal_before(mark.state) && signal_before(mark.shadow);
+                break;
+            case OverrideKind::Resolve:
+                ok = ok && mark.state == kNoIndex && mark.shadow == kNoIndex;
+                break;
+        }
+        if (!ok) {
+            report(Rule::OverrideMark, at);
+        }
+    }
 };
 
 std::string describe(ValueType t) {
@@ -508,6 +556,8 @@ const char* rule_name(Rule rule) {
             return "ret-width";
         case Rule::RetDomain:
             return "ret-domain";
+        case Rule::OverrideMark:
+            return "override-mark";
     }
     return "unknown";
 }
@@ -544,6 +594,8 @@ std::string format(const Module& m, const Violation& v, const LocResolver& resol
     std::string       types;
     if (v.rule == Rule::CallArity) {
         types = std::format("{} actuals, {} formals", v.types[0].width, v.types[1].width);
+    } else if (v.rule == Rule::OverrideMark) {
+        types = "a mark of a force or an assign that does not fit its store and lvalues";
     } else {
         types = describe(v.types[0]);
         if (v.types[1] != ValueType{}) {

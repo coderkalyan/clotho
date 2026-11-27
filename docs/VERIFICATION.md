@@ -110,7 +110,7 @@ VCD, not only what a test prints.
   at the end of a slot without a wake), R7 (the edge and change facts of each write are
   Table 9-2's), and the region, time-zero, timer, program-region and disable/kill rules
   of phase 4 (R1, R2, R4, R15, R17, R23, R25), and the fork and join (R22), fused-group member
-  run (S9: R5.5, R6.4), inertial update (R16) and timed nonblocking update (R11) rules. It is on by default in such a build, for the suite and for
+  run (S9: R5.5, R6.4), inertial update (R16), timed nonblocking update (R11) and force, release, assign and deassign (R14: an owned variable and a forced net hold the override's value, a force and a release of a net take effect at once) rules. It is on by default in such a build, for the suite and for
   `clotho run`; `CLOTHO_NO_TRACE_CHECK=1` turns it off. A violation ends the run (status
   99, `clotho: scheduler trace violation:` and a report naming the rule, the time, the
   target or activation, and the cause) and fails the test that ran the design, unless

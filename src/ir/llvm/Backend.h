@@ -2403,6 +2403,10 @@ private:
     void emit_trace_pend(llvm::Value* obj);
     void emit_trace_trigger(llvm::Value* obj, uint32_t kind);
 
+    // Report the store `store` of a force or a procedural `assign` (docs/design/scheduler-trace.md §2.4), which
+    // its mark says is one (ir::OverrideMark), after it: `lv` is the lvalue it stored.
+    void emit_trace_override(Index store, const OverrideMark& mark, const Guarded& lv);
+
     // Every park of a coroutine goes through here, and says what it parks for.
     void emit_suspend(const char* label, const TracePark& park);
 
