@@ -500,6 +500,13 @@ struct GcState {
     // that keeps every referent (`weak_kept`), the pass that marks them.
     std::vector<void*> weak_reached;
     bool               weak_kept = false;
+    // Whether the collection now running interrupts an activation (RT_GC_REASON_EMERGENCY).
+    // Every other collection runs at a safepoint, where no coroutine is in the middle of
+    // anything, and is the only kind that retires the frames it read (push_frame_roots).
+    bool mid_activation = false;
+    // The open frames (rt_gc_frame::open) among those a collection read before the sentinel,
+    // which it puts back before the sentinel when it retires the rest.
+    std::vector<rt_gc_frame*> open_frames;
 
     // Containers of class handles (§3.3, Gc.h:226-268). Those of design state are in the root
     // tables, borrowed as `roots` is. `containers` is the dynamically-scoped registry, keyed by
@@ -527,6 +534,12 @@ struct GcState {
 
 GcState g;
 
+// The sentinel of the coroutine frame registry (rt_gc_frame, Gc.h): the collector's own node
+// in the list generated code links frames into. It is always linked, is never a frame (its
+// `base` is null and its `bytes` zero), and is never freed. A frame links at the head, so
+// before it; the frames behind it hold nothing young. reset_mutator() links it afresh.
+rt_gc_frame g_frame_sentinel{};
+
 // The single mutator. Reached only through rt_gc_mutator_current(); see the
 // comment there for why the indirection must not be folded away by hand.
 rt_gc_mutator g_mutator{ .cursor      = nullptr,
@@ -534,7 +547,7 @@ rt_gc_mutator g_mutator{ .cursor      = nullptr,
                          .budget_left = 0,
                          .reserved    = 0,
                          .request     = 0,
-                         .frames_head = nullptr };
+                         .frames_head = &g_frame_sentinel };
 
 // -- Loud failure -------------------------------------------------------------
 
@@ -2343,16 +2356,77 @@ void scan_conservative(const uint8_t* base, uint64_t bytes) {
     }
 }
 
+// Move a linked node to the head of the registry: the sentinel, when a collection retires the
+// frames it read, and a retired frame that resumes.
+void frame_to_head(rt_gc_frame* node) {
+    rt_gc_frame* const head = g_mutator.frames_head;
+    assert(head != nullptr && "the registry holds at least the sentinel");
+    if (head == node) {
+        return;
+    }
+    assert(node->prev != nullptr && "a node that is not the head has a predecessor");
+    node->prev->next = node->next;
+    if (node->next != nullptr) {
+        node->next->prev = node->prev;
+    }
+    node->prev            = nullptr;
+    node->next            = head;
+    head->prev            = node;
+    g_mutator.frames_head = node;
+}
+
 // A suspended process has no stack: its live handles are in a CoroSplit-laid-out
 // heap frame reached through the intrusive registry node (F2, Gc.h:107-118).
+//
+// A full collection reads every frame. A young collection reads the frames before the
+// sentinel and no others: those linked, or resumed, since a collection retired them, and
+// those a callee may be storing through (`open`). A frame behind the sentinel was read by a
+// collection that left every object it names marked, and it cannot have changed since
+// (Gc.h, rt_gc_frame).
+//
+// A collection at a safepoint then retires what it read: no coroutine is running, so the
+// frames it read go behind the sentinel, which is done by moving the sentinel to the head,
+// and the open ones come back before it. A collection inside an activation retires nothing:
+// the coroutine it interrupts goes on storing into its frame without passing the resume hook.
 void push_frame_roots() {
-    [[maybe_unused]] uint64_t seen = 0;
+    rt_gc_frame* const        sentinel = &g_frame_sentinel;
+    const bool                young    = g.kind == RT_GC_KIND_YOUNG;
+    const bool                retire   = !g.mid_activation;
+    bool                      before   = true;
+    bool                      found    = false;
+    [[maybe_unused]] uint64_t seen     = 0;
+    g.open_frames.clear();
     for (rt_gc_frame* n = g_mutator.frames_head; n != nullptr; n = n->next) {
+        if (n == sentinel) {
+            found  = true;
+            before = false;
+            if (young) {
+                break;
+            }
+            continue;
+        }
         ++seen;
         assert(seen <= kFrameScanMax && "the frame registry is cyclic or corrupt");
         assert(n->base != nullptr || n->bytes == 0);
         assert(n->next == nullptr || n->next->prev == n);
+        assert(n->ran == (before ? 1u : 0u) && "a frame's `ran` disagrees with its side of the sentinel");
         scan_conservative(static_cast<const uint8_t*>(n->base), n->bytes);
+        ++g.stats.frames_read;
+        if (retire && before) {
+            if (n->open != 0) {
+                g.open_frames.push_back(n);
+            } else {
+                n->ran = 0;
+            }
+        }
+    }
+    assert(found && "the sentinel is in the registry");
+    if (retire) {
+        frame_to_head(sentinel);
+        for (rt_gc_frame* f : g.open_frames) {
+            frame_to_head(f);
+        }
+        g.open_frames.clear();
     }
 }
 
@@ -3071,11 +3145,14 @@ void reset_mutator() {
     g_mutator.budget_left = g.cfg.nursery_bytes;
     g_mutator.request     = 0;
     // The coroutine frame registry lives in the mutator now (Gc.h:178-181), so
-    // resetting the mutator is what empties it. Nothing is freed: every node is an
-    // alloca inside a coroutine frame the JIT'd module owns.
-    g_mutator.frames_head = nullptr;
+    // resetting the mutator is what empties it, down to the sentinel. Nothing is freed: every
+    // node is an alloca inside a coroutine frame the JIT'd module owns.
+    g_frame_sentinel      = rt_gc_frame{};
+    g_mutator.frames_head = &g_frame_sentinel;
+    g.open_frames.clear();
     assert(g_mutator.cursor == nullptr && "a reset mutator owns no hole");
-    assert(g_mutator.frames_head == nullptr && "a reset mutator has an empty registry");
+    assert(g_mutator.frames_head == &g_frame_sentinel && g_frame_sentinel.next == nullptr &&
+           "a reset mutator has an empty registry");
 }
 
 // Saturating, because the budgets are configuration and the byte counts are whatever the
@@ -3326,6 +3403,7 @@ void print_stats(uint64_t swept_at_teardown) {
                  g.stats.conservative_pins);
     std::fprintf(stderr, "gc: %" PRIu64 " container roots at the last collection\n",
                  g.stats.container_roots);
+    std::fprintf(stderr, "gc: %" PRIu64 " frames read at the last collection\n", g.stats.frames_read);
     std::fprintf(
       stderr, "gc: %" PRIu64 " state containers walked at the last collection\n", g.stats.state_containers_read);
     std::fprintf(stderr,
@@ -3591,6 +3669,48 @@ void verify_unlogged_state_slots() {
                    "an unlogged state slot names a young object: a store to design state was not logged");
         }
     }
+}
+
+// The frame registry is in two parts (rt_gc_frame, Gc.h): the frames before the sentinel have
+// `ran` set and the frames behind it do not, and an open frame is before it. A young collection
+// reads only the frames before the sentinel, which is sound only if every frame behind it names
+// nothing young: a collection read it and left what it names marked, and a store since then is
+// either its own coroutine's, which passes the resume hook first, or a callee's through a
+// pointer it handed out, which keeps it open. Called before the collection marks anything, so a
+// mark still means old. A word that names an unmarked object in a frame behind the sentinel is
+// a store into a parked frame that neither accounts for.
+void verify_frame_registry(bool young) {
+    bool                      before = true;
+    bool                      found  = false;
+    [[maybe_unused]] uint64_t seen   = 0;
+    for (const rt_gc_frame* n = g_mutator.frames_head; n != nullptr; n = n->next) {
+        ++seen;
+        assert(seen <= kFrameScanMax && "the frame registry is cyclic or corrupt");
+        if (n == &g_frame_sentinel) {
+            assert(!found && "the sentinel is in the registry twice");
+            found  = true;
+            before = false;
+            continue;
+        }
+        assert(n->ran == (before ? 1u : 0u) && "a frame's `ran` disagrees with its side of the sentinel");
+        assert((before || n->open == 0) && "an open frame is behind the sentinel");
+        if (before || !young) {
+            continue;
+        }
+        constexpr uintptr_t step = sizeof(void*);
+        const uintptr_t     raw  = reinterpret_cast<uintptr_t>(n->base);
+        for (uintptr_t p = (raw + step - 1) & ~(step - 1); p + step <= raw + n->bytes; p += step) {
+            void* const cand = *reinterpret_cast<void* const*>(p);
+            if (cand == nullptr) {
+                continue;
+            }
+            void* const h = rt_gc_find_object(cand);
+            assert((h == nullptr || is_marked_now(h)) &&
+                   "a frame behind the sentinel names a young object: it was stored to without "
+                   "passing the resume hook and without being open");
+        }
+    }
+    assert(found && "the sentinel is in the registry");
 }
 
 // The same for containers: a young collection walks the logged ones, so a container of design
@@ -3930,6 +4050,8 @@ extern "C" void rt_gc_frame_link(rt_gc_frame* node, void* base, uint64_t bytes) 
     // nothing to assert about them; everything after this point is asserted.
     node->base  = base;
     node->bytes = bytes;
+    node->ran   = 1;
+    node->open  = 0;
     node->prev  = nullptr;
     node->next  = mut->frames_head;
     if (mut->frames_head != nullptr) {
@@ -3965,6 +4087,16 @@ extern "C" void rt_gc_frame_unlink(rt_gc_frame* node) {
     }
     node->prev = nullptr;
     node->next = nullptr;
+}
+
+// The cold half of the resume hook (Gc.h). The frame is behind the sentinel and its coroutine
+// is about to store into it, so it moves to the head, before the sentinel.
+extern "C" void rt_gc_frame_ran(rt_gc_frame* node) {
+    assert(node != nullptr && node != &g_frame_sentinel && "the hook names a frame");
+    assert(g.initialized != 0 && "a frame resumed outside a run");
+    assert(node->ran == 0 && "the hook calls only for a frame behind the sentinel");
+    node->ran = 1;
+    frame_to_head(node);
 }
 
 extern "C" void rt_gc_range_add(const void* base, uint64_t bytes) {
@@ -4082,6 +4214,11 @@ static_assert(offsetof(rt_gc_mutator, cursor) == 0 && offsetof(rt_gc_mutator, li
                 offsetof(rt_gc_mutator, request) == 28 &&
                 offsetof(rt_gc_mutator, frames_head) == 32 && sizeof(rt_gc_mutator) == 40,
               "the LP64 mutator layout the backend mirrors: 0/8/16/24/28/32, 40 bytes");
+// And the frame node's, which the backend mirrors as gc_frame_ty() and indexes by field.
+static_assert(offsetof(rt_gc_frame, prev) == 0 && offsetof(rt_gc_frame, next) == 8 &&
+                offsetof(rt_gc_frame, base) == 16 && offsetof(rt_gc_frame, bytes) == 24 &&
+                offsetof(rt_gc_frame, ran) == 32 && offsetof(rt_gc_frame, open) == 33 && sizeof(rt_gc_frame) == 40,
+              "the LP64 frame node layout the backend mirrors: 0/8/16/24/32/33, 40 bytes");
 
 extern "C" uint32_t rt_gc_mutator_request_offset(void) {
     // 28 on a 64-bit host: two pointers, one u64 budget, one reserved u32.
@@ -4148,6 +4285,7 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     // parameterised here.
     g.kind      = kind;
     g.weak_kept = reason == RT_GC_REASON_EMERGENCY;
+    g.mid_activation = reason == RT_GC_REASON_EMERGENCY;
     if (kind == RT_GC_KIND_FULL) {
         clear_marks();
     }
@@ -4161,6 +4299,7 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
     g.stats.container_roots = 0;
     g.stats.state_slots_read = 0;
     g.stats.state_cards_read = 0;
+    g.stats.frames_read      = 0;
     g.stats.state_containers_read = 0;
     g.worklist.clear();
     g.container_work.clear();
@@ -4178,6 +4317,7 @@ extern "C" void rt_gc_collect_kind(uint32_t reason, uint32_t kind) {
         verify_unlogged_state_slots();
         verify_unlogged_state_containers();
     }
+    verify_frame_registry(kind == RT_GC_KIND_YOUNG);
 #endif
     mark_from_roots();
     // The marks are complete and nothing is reclaimed yet, which is the one moment to
@@ -4255,7 +4395,8 @@ extern "C" void rt_gc_remember(void* obj) {
 // container's handle), else null. What holds the container is the owner of what the store
 // adds, and it is found from that handle; for a place that cannot move it is found from
 // `slot`. A heap object is logged if it is old. A place in design state is logged as an
-// emitted store to it would be. A place in neither -- a frame -- is read in full.
+// emitted store to it would be. A place in neither -- a frame -- needs nothing: the caller parked
+// in the call is open (rt_gc_frame::open), so every collection reads it.
 extern "C" void rt_gc_note_ref_store(void* slot, const rt_ref_witness* chain, uint64_t bytes) {
     if (g.initialized == 0) {
         return;

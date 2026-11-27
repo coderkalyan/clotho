@@ -2442,6 +2442,33 @@ void Backend::lower_call_common(Index               i,
     }
 }
 
+// Whether a task enable hands its callee a pointer into THIS coroutine's frame that the callee
+// can store a class handle through while this coroutine is parked in the call
+// (rt_gc_frame::open): a `ref` formal, or the copy-out of an output or inout formal
+// (emit_copyout), of a type that can hold a handle. A place known to be in an object or in
+// design state is not in the frame, and the callee's barrier logs it (emit_gc_note_ref_store).
+// A container formal moves the container's own words, which are not handles: its elements are
+// in a payload the container roots cover. Any other place may be in the frame. A `ref` this
+// coroutine forwards from one of its own formals is covered by the frame it is bound in, which
+// is open for the whole of the call that bound it.
+bool Backend::task_call_opens_frame(const Function& tf, std::span<const Index> args) {
+    for (uint32_t k = 0; k < args.size(); ++k) {
+        if (tf.arg_dirs[k] == ArgDir::In) {
+            continue;
+        }
+        const Ref type = tf.param_types[k];
+        if (!reaches_class_handle(type) || is_handle_type(type)) {
+            continue;
+        }
+        const Guarded& lv = lvalue_of(args[k]);
+        if (lv.gc_owner != nullptr || lv.gc_state_base != nullptr) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 // Lower a task enable (LRM 13.3). Create the task coroutine, copy inputs in /
 // pass output-inout temp pointers, drive it once, and either finish inline (the
 // task consumed no time) or park the caller until the task completes and resumes
@@ -2576,6 +2603,9 @@ void Backend::lower_task_call_inst(Index i) {
     }
     argv.push_back(record);
 
+    // The callee may store a handle into this frame while this coroutine is parked in the call.
+    const bool opens_frame = gc_frame_node_ != nullptr && task_call_opens_frame(tf, args);
+
     llvm::Value* task_hdl = b_.CreateCall(fnty, cf, argv);
     emit_trace_spawn(b_, task_hdl, RT_TRACE_ORG_TASK, trace_here(), in_coroutine_body() ? hdl_ : nullptr);
     // The callee runs INLINE, with this body on the stack and its scheduled flag clear. A
@@ -2608,7 +2638,13 @@ void Backend::lower_task_call_inst(Index i) {
     // completion (coro.done in the drain loop).
     b_.SetInsertPoint(async_bb);
     b_.CreateStore(parked_handle(b_, hdl_), record);
+    if (opens_frame) {
+        emit_gc_frame_open(true);
+    }
     emit_suspend("task.resume", { .kind = RT_TRACE_CTL_CALL, .rec = record });
+    if (opens_frame) {
+        emit_gc_frame_open(false);
+    }
     b_.CreateBr(cont_bb);
 
     b_.SetInsertPoint(cont_bb);

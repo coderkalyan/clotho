@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <vector>
 
 #include "runtime/Gc.h"
@@ -230,6 +231,16 @@ struct Model {
     }
     uint32_t below(uint32_t n) { return static_cast<uint32_t>(next() % n); }
 
+    // The frame's coroutine runs. Before it stores anything the resume hook generated code
+    // emits where a coroutine wakes puts a frame that a collection retired back among those a
+    // young collection reads (rt_gc_frame, Gc.h). Every collection of the model is a safepoint's,
+    // so the coroutine is parked at each one.
+    void touch_frame() {
+        if (frame_node.ran == 0) {
+            rt_gc_frame_ran(&frame_node);
+        }
+    }
+
     // What the model says a collection must keep, from both root sets.
     void compute_reach() {
         reach.assign(objs.size(), 0);
@@ -280,6 +291,7 @@ struct Model {
         const uint32_t where = below(4);
         if (where == 0) {
             const uint32_t k = below(kFrame);
+            touch_frame();
             frame_obj[k]     = i;
             // Half of the frame's references are addresses inside the object.
             uint64_t word = reinterpret_cast<uint64_t>(handle_of(i));
@@ -358,6 +370,7 @@ struct Model {
                 root_obj[k]      = kNone;
                 root_words[k]    = 0;
             } else {
+                touch_frame();
                 const uint32_t k = below(kFrame);
                 frame_obj[k]     = kNone;
                 frame_words[k]   = below(2) == 0 ? below(4096) : reinterpret_cast<uint64_t>(&op);
@@ -548,6 +561,7 @@ struct Model {
             root_obj[k]   = kNone;
             root_words[k] = 0;
         }
+        touch_frame();
         for (uint32_t k = 0; k < kFrame; ++k) {
             frame_obj[k]   = kNone;
             frame_words[k] = 0;
@@ -638,6 +652,56 @@ struct Heap {
         rt_gc_stats st{};
         rt_gc_get_stats(&st);
         return st;
+    }
+};
+
+// The frame registry (rt_gc_frame, Gc.h) as a coroutine drives it: a frame is a node and some
+// words, linked at the ramp, and where the coroutine resumes from a park the resume hook runs
+// before anything is stored into the frame. A collection here is a safepoint's unless the test
+// says otherwise, so every coroutine is parked at it.
+struct Frames {
+    static constexpr uint32_t kWords = 8;
+
+    struct Frame {
+        rt_gc_frame node{};
+        uint64_t    words[kWords]{};
+    };
+
+    Heap              heap{ 1 };
+    std::deque<Frame> frames;
+
+    Frame& ramp() {
+        Frame& f = frames.emplace_back();
+        rt_gc_frame_link(&f.node, f.words, sizeof f.words);
+        return f;
+    }
+
+    // The code generated where a coroutine resumes.
+    static void resume(Frame& f) {
+        if (f.node.ran == 0) {
+            rt_gc_frame_ran(&f.node);
+        }
+    }
+
+    // A fresh object held by word `w` of `f` and by nothing else.
+    static void* hold(Frame& f, uint32_t w, uint64_t stamp) {
+        Shape&      s = g_shapes[0];
+        void* const h = rt_gc_alloc(rt_gc_mutator_current(), s.map.size, &s.map, nullptr);
+        REQUIRE(h != nullptr);
+        store(h, 0, reinterpret_cast<uint64_t>(s.vptr));
+        store(h, kStampOffset, stamp);
+        f.words[w] = reinterpret_cast<uint64_t>(h);
+        return h;
+    }
+
+    static bool alive(void* h, uint64_t stamp) {
+        return rt_gc_find_object(h) == h && load(h, kStampOffset) == stamp;
+    }
+
+    // Collect, and say how many frames that collection read.
+    static uint64_t collect(uint32_t kind, uint32_t reason = RT_GC_REASON_BUDGET) {
+        rt_gc_collect_kind(reason, kind);
+        return Heap::stats().frames_read;
     }
 };
 
@@ -926,4 +990,129 @@ TEST_CASE("gc: the collector pends the notifier of a weak reference it clears") 
     CHECK(load(second, shape.referent_offset()) == 0);
     CHECK(rt_gc_find_object(referent2) == nullptr);
     drained();
+}
+
+// A young collection reads the frames linked, or resumed, since a collection at a safepoint
+// retired them, and a frame behind the sentinel holds nothing it would miss: a collection read
+// it and left what it names old. A full collection reads every frame.
+TEST_CASE("gc frames: a young collection reads the frames linked or resumed since the last collection") {
+    constexpr uint32_t kFrames = 64;
+    Frames             fx;
+    std::vector<void*> held(kFrames);
+    for (uint32_t k = 0; k < kFrames; ++k) {
+        held[k] = Frames::hold(fx.ramp(), 0, k);
+    }
+    // Every frame is new, so before the sentinel: the first collection reads and retires them all.
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == kFrames);
+    for (const Frames::Frame& f : fx.frames) {
+        CHECK(f.node.ran == 0);
+    }
+    // None has run since. A young collection reads none, and what it marked is old and stays.
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 0);
+    for (uint32_t k = 0; k < kFrames; ++k) {
+        CHECK(Frames::alive(held[k], k));
+    }
+    // One frame resumes and stores a new object, another resumes and stores nothing.
+    Frames::resume(fx.frames[10]);
+    void* const fresh = Frames::hold(fx.frames[10], 1, 1000);
+    Frames::resume(fx.frames[20]);
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 2);
+    CHECK(Frames::alive(fresh, 1000));
+    CHECK(fx.frames[10].node.ran == 0);
+    // A full collection reads every frame, those behind the sentinel included, and keeps what they hold.
+    CHECK(Frames::collect(RT_GC_KIND_FULL) == kFrames);
+    for (uint32_t k = 0; k < kFrames; ++k) {
+        CHECK(Frames::alive(held[k], k));
+    }
+    CHECK(Frames::alive(fresh, 1000));
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 0);
+}
+
+// A caller parked in a call that passed a pointer into its frame is open: the callee stores
+// through the pointer whenever it runs, and nothing resumes the caller in between, so every
+// collection reads the frame until the call returns.
+TEST_CASE("gc frames: a frame open in a call is read by every collection until the call returns") {
+    Frames         fx;
+    Frames::Frame& caller = fx.ramp();
+    Frames::Frame& idle   = fx.ramp();
+    Frames::hold(idle, 0, 1);
+    caller.node.open = 1;
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 2);
+    CHECK(caller.node.ran == 1);
+    CHECK(idle.node.ran == 0);
+    // The callee stores a new object into the caller's frame, and goes on running across collections.
+    void* const stored = Frames::hold(caller, 0, 2);
+    for (uint32_t k = 0; k < 3; ++k) {
+        CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 1);
+        CHECK(Frames::alive(stored, 2));
+    }
+    // The call returns: the caller resumes, finds `ran` set, and clears `open`.
+    Frames::resume(caller);
+    caller.node.open = 0;
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 1);
+    CHECK(caller.node.ran == 0);
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 0);
+    CHECK(Frames::alive(stored, 2));
+}
+
+// A collection inside an allocation interrupts a coroutine that goes on storing into its frame
+// without passing the resume hook, so it retires nothing.
+TEST_CASE("gc frames: a collection inside an activation retires no frame") {
+    Frames         fx;
+    Frames::Frame& a = fx.ramp();
+    Frames::Frame& b = fx.ramp();
+    Frames::hold(b, 0, 1);
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG, RT_GC_REASON_EMERGENCY) == 2);
+    CHECK(a.node.ran == 1);
+    CHECK(b.node.ran == 1);
+    // The running coroutine stores after the collection, and another collection interrupts it.
+    void* const later = Frames::hold(a, 0, 2);
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG, RT_GC_REASON_EMERGENCY) == 2);
+    CHECK(Frames::alive(later, 2));
+    // A collection at a safepoint retires them, and the frame that parked holds what it stored.
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 2);
+    CHECK(a.node.ran == 0);
+    CHECK(b.node.ran == 0);
+    CHECK(Frames::alive(later, 2));
+    // A full collection inside an activation reads the retired frame too, and moves nothing.
+    Frames::resume(a);
+    CHECK(Frames::collect(RT_GC_KIND_FULL, RT_GC_REASON_EMERGENCY) == 2);
+    CHECK(a.node.ran == 1);
+    CHECK(b.node.ran == 0);
+    CHECK(Frames::alive(later, 2));
+}
+
+// A frame is unlinked when its coroutine ends, wherever it is: before the sentinel or behind it,
+// at either end of the list or next to the sentinel.
+TEST_CASE("gc frames: a frame leaves the registry from either side of the sentinel") {
+    constexpr uint32_t kFrames = 9;
+    Frames             fx;
+    std::vector<void*> held(kFrames);
+    for (uint32_t k = 0; k < kFrames; ++k) {
+        held[k] = Frames::hold(fx.ramp(), 0, k);
+    }
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == kFrames);
+    // Registry: sentinel, 8 ... 0. Two resume: 5 and 3 are before it, in the order they ran.
+    Frames::resume(fx.frames[3]);
+    Frames::resume(fx.frames[5]);
+    // The head, the frame next to the sentinel, the tail, and one in the middle behind it.
+    for (const uint32_t k : { 5u, 8u, 0u, 4u }) {
+        rt_gc_frame_unlink(&fx.frames[k].node);
+    }
+    // What is left is 3 before the sentinel and 7, 6, 2, 1 behind it.
+    CHECK(Frames::collect(RT_GC_KIND_YOUNG) == 1);
+    CHECK(Frames::collect(RT_GC_KIND_FULL) == 5);
+    CHECK(Heap::stats().objects_live == 5);
+    for (const uint32_t k : { 3u, 7u, 6u, 2u, 1u }) {
+        CHECK(Frames::alive(held[k], k));
+    }
+    for (const uint32_t k : { 5u, 8u, 0u, 4u }) {
+        CHECK(rt_gc_find_object(held[k]) == nullptr);
+    }
+    // The rest leave as well, and the next collection reads no frame.
+    for (const uint32_t k : { 3u, 7u, 6u, 2u, 1u }) {
+        rt_gc_frame_unlink(&fx.frames[k].node);
+    }
+    CHECK(Frames::collect(RT_GC_KIND_FULL) == 0);
+    CHECK(Heap::stats().objects_live == 0);
 }

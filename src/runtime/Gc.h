@@ -113,7 +113,8 @@ struct rt_alloc_site;
 // Design state has its own barrier, rt_gc_note_state_store below: a young collection
 // reads only the state slots stored to since the last collection, as it traces only
 // the old objects the remembered set names. Statics are state; frame locals need
-// neither barrier, since a frame is scanned in full at every collection.
+// neither barrier, since a young collection reads every frame that ran since the last
+// collection at a safepoint and every frame a callee can store into (rt_gc_frame below).
 void rt_gc_remember(void* obj);
 
 // The barrier of a store through an address the code cannot attribute to an owner:
@@ -125,8 +126,9 @@ void rt_gc_remember(void* obj);
 // chain -- is logged if it is old, as above, and a place in design state is logged as
 // by rt_gc_note_state_store (for a container element, the outermost container's own
 // place, which the chain's first epoch pointer lies in). A place in neither is a
-// frame, which is read in full. Called at each store, because a task can suspend
-// across a collection between the call and its store.
+// frame and needs nothing: the frame of a caller parked in the call is open
+// (rt_gc_frame::open), so every collection reads it. Called at each store, because a
+// task can suspend across a collection between the call and its store.
 void rt_gc_note_ref_store(void* slot, const struct rt_ref_witness* chain, uint64_t bytes);
 
 // The write barrier of design state (docs/design/garbage-collection.md §7). A store of a
@@ -258,11 +260,38 @@ typedef struct rt_gc_roots {
 // dominates both. (An earlier draft of docs/design/garbage-collection.md claimed
 // two further raw-destroy paths that skip the epilogue. A census of every
 // free_fn() and coro_destroy call site found they do not exist.)
+//
+// WHICH FRAMES A YOUNG COLLECTION READS. A frame's words change only while its
+// coroutine runs, or through a pointer into it that the coroutine handed to a task
+// it is parked in: a `ref` actual, or the actual of an output or inout formal the
+// callee copies out through. So the registry is kept in two parts by a node of the
+// collector's own, the sentinel. The frames before it, towards the head, are read
+// by every collection; the frames after it hold nothing young and are read by a
+// full collection only.
+//
+//   `ran`   1 while the frame is before the sentinel. The link sets it. A
+//           collection at the scheduler's safepoint, where every coroutine is
+//           parked, has read the frame and left what it holds old, so it clears
+//           the byte and moves the frame behind the sentinel. Generated code tests
+//           the byte wherever a coroutine resumes -- a load, a compare and a branch
+//           that is not taken -- and calls rt_gc_frame_ran when it is clear.
+//           A first segment needs no test: a safepoint comes only after every ring
+//           has drained, so every frame linked since the last one has run.
+//   `open`  1 while the coroutine is parked in a task call that passed a pointer
+//           into this frame to a formal that can hold a class handle. The callee
+//           stores through it whenever it runs, so a collection leaves an open
+//           frame before the sentinel.
+//
+// A collection run from inside an allocation (RT_GC_REASON_EMERGENCY) reads the
+// same frames and moves none: the coroutine it interrupts goes on storing into its
+// frame without passing a resume.
 typedef struct rt_gc_frame {
     struct rt_gc_frame* prev;
     struct rt_gc_frame* next;
     void*               base;
     uint64_t            bytes;
+    uint8_t             ran;
+    uint8_t             open;
 } rt_gc_frame;
 
 // -- Mutator context ---------------------------------------------------------
@@ -398,6 +427,9 @@ void rt_gc_roots_add(const rt_gc_roots* table);
 
 void rt_gc_frame_link(rt_gc_frame* node, void* base, uint64_t bytes);
 void rt_gc_frame_unlink(rt_gc_frame* node);
+// The cold half of the resume hook: `node->ran` was clear where its coroutine resumed,
+// so the frame is behind the sentinel. Sets the byte and moves the node to the head.
+void rt_gc_frame_ran(rt_gc_frame* node);
 
 // A runtime-owned region scanned conservatively at every collection. Used for
 // the nonblocking-assignment and intra-assignment staging pools, which hold byte
@@ -459,7 +491,9 @@ void rt_gc_container_remove(void* handle);
 
 // -- Collection ---------------------------------------------------------------
 
-// Reasons, for the stats line.
+// Reasons, for the stats line. Every reason but EMERGENCY also says that no coroutine
+// is running, which is what lets the collection move the frames it read behind the
+// sentinel (rt_gc_frame).
 #define RT_GC_REASON_BUDGET    0u
 #define RT_GC_REASON_STRESS    1u
 #define RT_GC_REASON_EXPLICIT  2u
@@ -542,6 +576,10 @@ typedef struct rt_gc_stats {
     uint64_t blocks_free;
     uint64_t finalized;
     uint64_t conservative_pins;
+    // Coroutine frames the last collection read as roots: every registered frame when it
+    // was full; when it was young, those that ran since the last collection at a safepoint
+    // and the open ones. A test asserts it does not grow with the frames parked throughout.
+    uint64_t frames_read;
     // Handle-bearing containers consulted as roots in the last collection (§3.3):
     // a test asserting a frame-local queue kept its elements alive checks this to
     // prove the container-root path ran rather than a conservative frame word

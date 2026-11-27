@@ -344,6 +344,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_gc_nba_container_add", &rt_gc_nba_container_add);
     expose("rt_gc_frame_link", &rt_gc_frame_link);
     expose("rt_gc_frame_unlink", &rt_gc_frame_unlink);
+    // The cold half of the resume hook of a registered frame (rt_gc_frame, Gc.h).
+    expose("rt_gc_frame_ran", &rt_gc_frame_ran);
     // The safepoint's SLOW half only. Generated code polls rt_gc_mutator::request
     // inline and names this on the taken edge alone (ir/llvm/GcEmit.cpp
     // emit_gc_safepoint), so rt_gc_safepoint itself is no longer reachable from a
