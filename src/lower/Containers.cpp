@@ -52,17 +52,64 @@ void Lowerer::emit_fixed_array_into_dynarr(ir::Index         dst,
                                            uint32_t          n,
                                            ir::Builder&      b,
                                            ir::SourceLoc     l) {
-    const ir::Index src_lv = lower_array_operand(src, b);
-    const ir::Ref   src_ty = lower_type(*src.type);
-    const ir::Type  st     = std::get<ir::Type>(module_.pool.get(src_ty));
-    const ir::Type  dt     = std::get<ir::Type>(module_.pool.get(dst_ty));
-    const ir::Ref   i32    = make_int_type(32, false);
+    emit_fixed_place_into_dynarr(dst, lower_array_operand(src, b), lower_type(*src.type), dst_ty, n, b, l);
+}
+
+// The fill of emit_fixed_array_into_dynarr from an array place already lowered.
+void Lowerer::emit_fixed_place_into_dynarr(ir::Index     dst,
+                                           ir::Index     src_lv,
+                                           ir::Ref       src_ty,
+                                           ir::Ref       dst_ty,
+                                           uint32_t      n,
+                                           ir::Builder&  b,
+                                           ir::SourceLoc l) {
+    const ir::Type st  = std::get<ir::Type>(module_.pool.get(src_ty));
+    const ir::Type dt  = std::get<ir::Type>(module_.pool.get(dst_ty));
+    const ir::Ref  i32 = make_int_type(32, false);
     for (uint32_t k = 0; k < n; ++k) {
         const ir::Index dst_el =
           b.elem_select(dst, b.constant(module_.pool.put_int(i32, k), l), dst_ty, l, /*for_write=*/true);
         const ir::Index src_el = b.elem_select(src_lv, elem_coord_const(st, k, b, l), src_ty, l);
         emit_agg_copy(dst_el, src_el, dt.element, ir::Inst::Tag::Store, b, l);
     }
+}
+
+// `dst = src` for a dynamic array or queue `dst` of type `dst_ty` and a fixed-size array
+// place `src` of type `src_ty`: the whole assignment of LRM 7.5.1 and 7.10.2, which gives
+// `dst` the array's size. Place to place, for a formal's copy-out; the expression form
+// is lower_dyn_array_assign / emit_handle_member_copy.
+void Lowerer::emit_fixed_place_into_container(ir::Index     dst,
+                                              ir::Ref       dst_ty,
+                                              ir::Index     src_lv,
+                                              ir::Ref       src_ty,
+                                              ir::Builder&  b,
+                                              ir::SourceLoc l) {
+    const ir::Type st  = std::get<ir::Type>(module_.pool.get(src_ty));
+    const auto     n   = static_cast<uint32_t>((st.left <= st.right ? st.right - st.left : st.left - st.right) + 1);
+    const ir::Ref  i32 = make_int_type(32, false);
+    if (std::get<ir::Type>(module_.pool.get(dst_ty)).kind == ir::Type::Kind::Queue) {
+        ir::Type dat;
+        dat.kind             = ir::Type::Kind::DynArray;
+        dat.element          = std::get<ir::Type>(module_.pool.get(dst_ty)).element;
+        const ir::Ref   daty = module_.pool.put(ir::Item{ dat });
+        const ir::Index tmp  = make_arg_temp(daty, b, l);
+        b.dyn_array_new(tmp, b.constant(module_.pool.put_int(i32, n), l), tmp, /*has_init=*/false, daty, l);
+        emit_fixed_place_into_dynarr(tmp, src_lv, src_ty, daty, n, b, l);
+        b.queue_copy_dynarr(dst, tmp, dst_ty, l);
+        return;
+    }
+    b.dyn_array_new(dst, b.constant(module_.pool.put_int(i32, n), l), dst, /*has_init=*/false, dst_ty, l);
+    emit_fixed_place_into_dynarr(dst, src_lv, src_ty, dst_ty, n, b, l);
+}
+
+// The same for the expression `src`, a fixed-size array variable or slice, as the actual
+// of an input formal.
+void Lowerer::emit_fixed_array_into_container(ir::Index         dst,
+                                              ir::Ref           dst_ty,
+                                              const Expression& src,
+                                              ir::Builder&      b,
+                                              ir::SourceLoc     l) {
+    emit_fixed_place_into_container(dst, dst_ty, lower_array_operand(src, b), lower_type(*src.type), b, l);
 }
 
 // Copy a FIXED-size unpacked array's elements, in order, into a queue

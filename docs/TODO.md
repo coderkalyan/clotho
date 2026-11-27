@@ -337,8 +337,9 @@ Milestones, in order; lower ones unblock higher ones:
   subroutine argument or a raw rvalue; refused in the backend.
 - [ ] **Dynamic array or queue assigned to a fixed-size array** (7.6) — `f = d;` is refused; the
   sizes have to be compared at run time.
-- [ ] **Fixed-size array bound to a dynamic array or queue formal, and the reverse** (13.5, 7.6)
-  — refused in every direction; the copy-in and copy-out are that assignment.
+- [ ] **Dynamic array or queue bound to a fixed-size formal, and a fixed-size array bound to an
+  output or inout container formal** (13.5, 7.6) — refused; the copy into the fixed-size side
+  compares the sizes at run time.
 - [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
   over aggregate element storage.
   - [ ] **Struct-element array slice** — refused as an assignment source, as a subroutine
@@ -484,6 +485,9 @@ Milestones, in order; lower ones unblock higher ones:
     number that differs between runs; an instance is not a collected object, so it has no
     identity number.
   - [ ] **Evacuating collection (performance)** — the heap is non-moving.
+  - [ ] **Inline cache for the `ref` barrier (performance)** — a handle store through a `ref`
+    formal costs about 129 instructions (`rt_gc_note_ref_store` resolves the owner from the
+    address); cache the last slot and its owner in generated code.
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
   fails to lower aborts the whole compilation instead of stubbing that one method.

@@ -4551,6 +4551,27 @@ private:
                                       ir::Builder&  b,
                                       ir::SourceLoc l);
 
+    void emit_fixed_place_into_dynarr(ir::Index     dst,
+                                      ir::Index     src_lv,
+                                      ir::Ref       src_ty,
+                                      ir::Ref       dst_ty,
+                                      uint32_t      n,
+                                      ir::Builder&  b,
+                                      ir::SourceLoc l);
+
+    void emit_fixed_place_into_container(ir::Index     dst,
+                                         ir::Ref       dst_ty,
+                                         ir::Index     src_lv,
+                                         ir::Ref       src_ty,
+                                         ir::Builder&  b,
+                                         ir::SourceLoc l);
+
+    void emit_fixed_array_into_container(ir::Index         dst,
+                                         ir::Ref           dst_ty,
+                                         const Expression& src,
+                                         ir::Builder&      b,
+                                         ir::SourceLoc     l);
+
     void emit_fixed_array_into_queue(ir::Index         dst,
                                      const Expression& src,
                                      ir::Ref           queue_ty,
