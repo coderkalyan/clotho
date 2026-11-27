@@ -1554,7 +1554,7 @@ private:
     // long-lived objects and no churn should pay a not-taken branch per wheel advance
     // and nothing per activation (docs/design/garbage-collection.md §5.2).
 
-    // rt_gc_frame (Gc.h:137-142): { ptr prev, ptr next, ptr base, i64 bytes }.
+    // rt_gc_frame (Gc.h): { ptr prev, ptr next, ptr base, i64 bytes, i8 ran, i8 open }.
     //
     // Field indices, named for the same reason GcMutField's are: emit_gc_frame_link
     // and emit_gc_frame_unlink write these slots inline, so a reorder here has to be
@@ -1565,6 +1565,8 @@ private:
     static constexpr unsigned kGcFrameNext  = 1;
     static constexpr unsigned kGcFrameBase  = 2;
     static constexpr unsigned kGcFrameBytes = 3;
+    static constexpr unsigned kGcFrameRan   = 4;
+    static constexpr unsigned kGcFrameOpen  = 5;
 
     uint32_t gc_frame_off(unsigned field);
 
@@ -3543,6 +3545,7 @@ private:
     llvm::FunctionCallee gc_safepoint_slow_fn();
     llvm::FunctionCallee gc_remember_fn();
     llvm::FunctionCallee gc_note_ref_store_fn();
+    llvm::FunctionCallee gc_frame_ran_fn();
 
     llvm::StructType* cover_range_ty();
     llvm::StructType* cover_bin_ty();
@@ -3583,6 +3586,19 @@ private:
     void emit_gc_frame_link(llvm::Value* frame_bytes);
 
     void emit_gc_frame_unlink();
+
+    // The resume hook: where this coroutine resumes, put its frame back among those a
+    // young collection reads if a collection has retired it (rt_gc_frame::ran). Nothing
+    // for a frame that is not registered.
+    void emit_gc_frame_resumed();
+
+    // Set or clear rt_gc_frame::open around a park in a task call that can store through
+    // a pointer into this frame.
+    void emit_gc_frame_open(bool open);
+
+    // Whether a task enable passes a pointer into this coroutine's own frame that the
+    // callee can store a class handle through.
+    bool task_call_opens_frame(const Function& tf, std::span<const Index> args);
 
     // -- Allocation (docs/design/garbage-collection.md §4.3, F3) ------------------
 

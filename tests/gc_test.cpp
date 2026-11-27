@@ -6169,3 +6169,300 @@ TEST_CASE("gc: an event made by a class body's initializer survives in a body a 
     check_cadences(src, expected);
     CHECK(run_capture(src, gc_cfg(cadence_stress, nursery_bytes_small, full_every_never)) == expected);
 }
+
+// -- Frames that ran ----------------------------------------------------------------------
+//
+// A young collection reads the coroutine frames that ran since a collection at a safepoint retired
+// them, and the frames of callers parked in a call that handed out a pointer into them. Every other
+// parked frame was read by a collection that left what it holds old, and nothing stores into it
+// until its coroutine resumes (Gc.h, rt_gc_frame). The cases below hold an object ONLY in such a
+// frame, let young collections run beside it, and read the object back. They run young-only
+// (`full_every_never`) where they can: under stress a full collection reads every frame and would
+// mask a frame the young one missed.
+//
+// Oracle: LRM 8.4 gives an object no destructor, so a program cannot see reclamation. A frame the
+// collector wrongly skipped turns into a read of the junk that took the object's granule (the
+// filler writes 32'h5A5A5A5A into every object it makes) and a different line of output.
+
+// A module with the two classes and `churn`, which allocates 128 junk objects in each of `n` time
+// steps: a collection every few steps, all of them young after the first. `body` is the rest.
+static std::string frames_design(std::string_view body) {
+    std::string src = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            Junk sink;
+            task automatic churn(input int n);
+                for (int i = 0; i < n; i++) begin
+                    #1;
+                    for (int k = 0; k < 128; k++) begin
+                        sink     = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            endtask
+    )";
+    src += body;
+    src += "\n        endmodule\n";
+    return src;
+}
+
+// Two tasks each hold an object in a local across 1000 time steps, 120 of which churn. The first
+// collection reads their frames and retires them; the young ones after it never read them again,
+// and a full one must.
+TEST_CASE("gc frames: an object held only by a long-suspended frame survives young and full collections") {
+    const std::string src      = frames_design(R"(
+            int sum, lens;
+            task automatic hold(input int k);
+                Cell c;
+                c      = new;
+                c.v    = k;
+                c.tag  = "held";
+                #1000;
+                sum    = sum + c.v;
+                lens   = lens + c.tag.len();
+            endtask
+            initial begin fork hold(7); hold(9); join_none end
+            initial churn(120);
+            initial begin #2000; $display("%0d %0d", sum, lens); end
+    )");
+    const std::string expected = "16 8\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections >= 10u);
+    const rt_gc_stats fl = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, 3);
+    CHECK(fl.full_collections >= 4u);
+}
+
+// A task replaces the object its local holds, 30 times, and parks for four time steps after each,
+// while collections run. The object it holds at each park is new since the last collection, and
+// the frame has resumed since the one before: a young collection must read it again.
+TEST_CASE("gc frames: a frame that resumes, allocates and suspends is read again") {
+    const std::string src      = frames_design(R"(
+            int total;
+            task automatic walker();
+                Cell c;
+                for (int i = 0; i < 30; i++) begin
+                    c      = new;
+                    c.v    = i;
+                    c.tag  = "step";
+                    #4;
+                    total  = total + c.v + c.tag.len();
+                end
+            endtask
+            initial walker();
+            initial churn(130);
+            initial begin #200; $display("%0d", total); end
+    )");
+    const std::string expected = "555\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections >= 10u);
+    const rt_gc_stats ys = run_stats(src, expected, cadence_stress, nursery_bytes_small, full_every_never);
+    CHECK(ys.young_collections >= 100u);
+}
+
+// The caller parks in a call that handed its callee a pointer into its frame: a `ref` formal
+// bound to its automatic variable. The callee suspends across collections, which retire every
+// other frame, stores a fresh object through the pointer, and suspends across more of them
+// before it returns. The object is held only by the caller's frame throughout, and the caller does
+// not resume until the call has returned.
+TEST_CASE("gc frames: a fresh object stored through a ref into a parked caller's variable survives") {
+    std::string src;
+    SUBCASE("a task stores through its ref formal") {
+        src = frames_design(R"(
+            task automatic fill(ref Cell slot, input int v);
+                Cell f;
+                #20;
+                f       = new;
+                f.v     = v;
+                f.tag   = "through-ref";
+                slot    = f;
+                f       = null;
+                #20;
+            endtask
+            task automatic body();
+                Cell mine;
+                fill(mine, 4242);
+                $display("%0d %s", mine.v, mine.tag);
+            endtask
+            initial body();
+            initial churn(60);
+        )");
+    }
+    SUBCASE("a task forwards its ref formal to another task, which stores through it") {
+        src = frames_design(R"(
+            task automatic inner(ref Cell slot, input int v);
+                Cell f;
+                #20;
+                f       = new;
+                f.v     = v;
+                f.tag   = "through-ref";
+                slot    = f;
+                f       = null;
+                #20;
+            endtask
+            task automatic outer(ref Cell slot, input int v);
+                #5;
+                inner(slot, v);
+                #5;
+            endtask
+            task automatic body();
+                Cell mine;
+                outer(mine, 4242);
+                $display("%0d %s", mine.v, mine.tag);
+            endtask
+            initial body();
+            initial churn(70);
+        )");
+    }
+    const std::string expected = "4242 through-ref\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections >= 5u);
+}
+
+// The same for an output formal, which the callee copies out through a pointer into the caller's
+// frame at completion. The callee fires an event as its last statement, which queues a process that
+// allocates enough to collect from inside its activation; the callee's completion then copies the
+// object out and queues the caller behind that process. So the collection that must find the object
+// is one that runs after the copy-out and before the caller can run its resume hook.
+TEST_CASE("gc frames: a fresh object copied out into a parked caller's variable survives") {
+    const std::string src      = frames_design(R"(
+            event go;
+            task automatic get(output Cell c);
+                Cell f;
+                #20;
+                f       = new;
+                f.v     = 777;
+                f.tag   = "copied-out";
+                c       = f;
+                f       = null;
+                -> go;
+            endtask
+            task automatic body();
+                Cell mine;
+                get(mine);
+                $display("%0d %s", mine.v, mine.tag);
+            endtask
+            initial body();
+            initial churn(40);
+            initial begin
+                @(go);
+                for (int k = 0; k < 20000; k++) begin
+                    sink     = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+            end
+    )");
+    const std::string expected = "777 copied-out\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.emergency_collections > 0u);
+    const rt_gc_stats ys = run_stats(src, expected, cadence_stress, nursery_bytes_small, full_every_never);
+    CHECK(ys.emergency_collections > 0u);
+}
+
+// The shape testbenches have: a task blocks in `mailbox.get(msg)` and then works with the message
+// across time. The wait is expanded into the task's own coroutine (the mailbox's blocking methods
+// are not task calls), so the frame is retired by the collections that run while it waits, and
+// the message is popped into `msg` by the task itself after it resumes. The message is held only
+// by `msg` from then on, across twenty more steps of collections.
+TEST_CASE("gc frames: a message received by a task that waited for it is held by the task's frame") {
+    const std::string src      = frames_design(R"(
+            mailbox #(Cell) mb;
+            function automatic Cell make(input int v);
+                Cell c = new;
+                c.v    = v;
+                c.tag  = "mail";
+                return c;
+            endfunction
+            task automatic consumer();
+                Cell msg;
+                mb.get(msg);
+                #20;
+                $display("%0d %s", msg.v, msg.tag);
+            endtask
+            initial begin mb = new; consumer(); end
+            initial begin
+                #20;
+                mb.put(make(31));
+            end
+            initial churn(60);
+    )");
+    const std::string expected = "31 mail\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections >= 5u);
+}
+
+// A collection from inside an allocation interrupts a task that goes on storing into its frame
+// without passing the resume hook, so it must leave the frame among those a young collection
+// reads. The task allocates enough to be interrupted in each of four rounds, stores a fresh
+// object, and parks across collections.
+TEST_CASE("gc frames: a frame interrupted by a collection inside an allocation stays read") {
+    const std::string src      = frames_design(R"(
+            int total;
+            task automatic grind();
+                Cell c;
+                for (int round = 0; round < 4; round++) begin
+                    for (int k = 0; k < 5000; k++) begin
+                        sink     = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                    c      = new;
+                    c.v    = round;
+                    c.tag  = "grind";
+                    #16;
+                    total  = total + c.v + c.tag.len();
+                end
+            endtask
+            initial grind();
+            initial churn(70);
+            initial begin #200; $display("%0d", total); end
+    )");
+    const std::string expected = "26\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.emergency_collections >= 4u);
+    CHECK(yg.young_collections >= 8u);
+}
+
+// What the scheme is for: a young collection reads the frames that ran, not the frames parked. 300
+// tasks each hold an object and wait on an event that never fires, beside a task that churns; no
+// collection after the first reads a frame it did not need to. A full collection reads them all.
+TEST_CASE("gc frames: a young collection reads the frames that ran and not the frames parked") {
+    const std::string src      = frames_design(R"(
+            event never;
+            int   sum;
+            task automatic park(input int k);
+                Cell h;
+                h      = new;
+                h.v    = k;
+                @(never);
+                sum    = sum + h.v;
+            endtask
+            initial begin
+                for (int i = 0; i < 300; i++) begin fork park(i); join_none end
+                churn(200);
+                $display("done");
+            end
+    )");
+    const std::string expected = "done\n";
+    const rt_gc_stats yg       = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections >= 10u);
+    // The last collection was young: only the task that churns ran since the one before.
+    CHECK(yg.frames_read == 1u);
+    const rt_gc_stats fl = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, 1);
+    CHECK(fl.young_collections == 0u);
+    CHECK(fl.frames_read >= 300u);
+}

@@ -1125,7 +1125,8 @@ llvm::Constant* Backend::gc_config_global() {
 //
 // INLINED since P2 (design §6.4). `frames_head` lives in the mutator
 // (Gc.h:177-181) rather than in a runtime file-static, so the whole registration
-// is four stores into the node plus a head swap: pointer surgery, not a call.
+// is six stores into the node (`ran` and `open` among them) plus a head swap: pointer
+// surgery, not a call.
 // This was one of the two per-event costs the collector charged designs that
 // never allocate -- rt_gc_frame_link AND rt_gc_frame_unlink ran on every single
 // process activation, which is what cost wait_bench.v +10.3% simulate time.
@@ -1143,6 +1144,8 @@ void Backend::emit_gc_frame_link(llvm::Value* frame_bytes) {
     // the identity is asserted from the DataLayout and not merely trusted.
     assert(gc_frame_off(kGcFramePrev) == 0 &&
            "rt_gc_frame::prev is field 0, so a node's address is its prev slot");
+    assert(gc_frame_off(kGcFrameRan) == 32 && gc_frame_off(kGcFrameOpen) == 33 &&
+           "rt_gc_frame::ran and ::open are the two bytes after `bytes`, as Gc.h lays them out");
     llvm::StructType* nty  = gc_frame_ty();
     llvm::Constant*   null = llvm::Constant::getNullValue(raw_ptr_ty());
     gc_frame_node_         = b_.CreateAlloca(nty, nullptr, "gc_frame");
@@ -1153,6 +1156,10 @@ void Backend::emit_gc_frame_link(llvm::Value* frame_bytes) {
     b_.CreateStore(head, b_.CreateStructGEP(nty, node, kGcFrameNext));
     b_.CreateStore(hdl_, b_.CreateStructGEP(nty, node, kGcFrameBase));
     b_.CreateStore(frame_bytes, b_.CreateStructGEP(nty, node, kGcFrameBytes));
+    // Linked with `ran` set, as a frame that is about to run its first segment is read by
+    // every collection until a collection at a safepoint retires it.
+    b_.CreateStore(b_.getInt8(1), b_.CreateStructGEP(nty, node, kGcFrameRan));
+    b_.CreateStore(b_.getInt8(0), b_.CreateStructGEP(nty, node, kGcFrameOpen));
     llvm::Value* empty = b_.CreateICmpEQ(head, null, "gc.head.null");
     llvm::Value* oldp  = b_.CreateSelect(empty, headp, head, "gc.oldprevp");
     b_.CreateStore(node, oldp);
@@ -1204,6 +1211,46 @@ void Backend::emit_gc_frame_unlink() {
       b_.CreateConstGEP1_32(b_.getInt8Ty(), prev, gc_frame_off(kGcFrameNext), "gc.prevnextp");
     llvm::Value* was_head = b_.CreateICmpEQ(prev, null, "gc.washead");
     b_.CreateStore(next, b_.CreateSelect(was_head, headp, pnextp, "gc.prevnextp.sel"));
+}
+
+// The resume hook (rt_gc_frame, Gc.h). Emitted where a coroutine resumes from a park, before
+// anything of its own can store into its frame: if a collection at a safepoint retired the
+// frame while it was parked (`ran` is clear), the cold call puts it back among the frames a
+// young collection reads. For a frame that ran since the last collection it is a load, a
+// compare and a not-taken branch.
+//
+// A coroutine's first segment needs none. The frame is linked with `ran` set, and the only
+// collection that retires it is a safepoint's, which the scheduler polls at the wheel advance
+// after every ring has drained, so everything ramped since the last one has run its first
+// segment by then. Nor does a callee's store into the frame of a caller parked in a task call:
+// the caller keeps the frame open (emit_gc_frame_open).
+void Backend::emit_gc_frame_resumed() {
+    if (gc_frame_node_ == nullptr) {
+        return;
+    }
+    llvm::Function* fn = b_.GetInsertBlock()->getParent();
+    assert(llvm::cast<llvm::Instruction>(gc_frame_node_)->getFunction() == fn &&
+           "the frame node is the one of the coroutine being emitted");
+    llvm::StructType* nty = gc_frame_ty();
+    llvm::Value* ran = b_.CreateLoad(b_.getInt8Ty(), b_.CreateStructGEP(nty, gc_frame_node_, kGcFrameRan), "gc.ran");
+    auto*        retired = llvm::BasicBlock::Create(ctx_, "gc.frame.retired", fn);
+    auto*        done    = llvm::BasicBlock::Create(ctx_, "gc.frame.resumed", fn);
+    llvm::BranchInst* br = b_.CreateCondBr(b_.CreateICmpEQ(ran, b_.getInt8(0), "gc.retired"), retired, done);
+    br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+    b_.SetInsertPoint(retired);
+    auto* call = b_.CreateCall(gc_frame_ran_fn(), { gc_frame_node_ });
+    call->addFnAttr(llvm::Attribute::Cold);
+    b_.CreateBr(done);
+    b_.SetInsertPoint(done);
+}
+
+// Set or clear rt_gc_frame::open around a park in a task call that passes the callee a pointer
+// into this frame (task_call_opens_frame): a collection at a safepoint leaves an open frame
+// among those a young collection reads, since the callee stores through the pointer whenever
+// it runs and nothing resumes this coroutine in between.
+void Backend::emit_gc_frame_open(bool open) {
+    assert(gc_frame_node_ != nullptr && "only a registered frame is opened");
+    b_.CreateStore(b_.getInt8(open ? 1 : 0), b_.CreateStructGEP(gc_frame_ty(), gc_frame_node_, kGcFrameOpen));
 }
 
 // Whether `new` for this class allocates through the inlined bump sequence.
@@ -1497,9 +1544,10 @@ void Backend::emit_gc_safepoint(llvm::Value* wheel) {
 // collection treats an OLD object as live-and-opaque instead of tracing it, so a
 // handle written into an OLD object -- or into a container the OLD object owns --
 // is invisible, and the object it names would be reclaimed while still referenced.
-// Design state, statics and frame locals need nothing: they are scanned in full at
-// every collection, young or not (Gc.h:105-107). LValue::gc_owner is what decides
-// which stores those are, and it is non-null only for a place inside an object.
+// Design state and statics are logged by card instead (emit_gc_state_barrier), and a frame local
+// needs nothing: a young collection reads every frame that ran since the last collection and every
+// frame a callee can store into (Gc.h, rt_gc_frame). LValue::gc_owner is what decides which stores
+// those are, and it is non-null only for a place inside an object.
 //
 // One mask and one compare rather than two tests: MARK says the object is old, so
 // a young collection will not trace it, and LOGGED says the remembered set already

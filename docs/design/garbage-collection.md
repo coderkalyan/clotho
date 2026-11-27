@@ -673,7 +673,7 @@ are those of one cycle.
 | Roots | Mechanism | Precision |
 |---|---|---|
 | Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table per region of `{ ptr base, u32 nhandles, u32 bytes, u32 offsets[], u32 cards }`, emitted where `emit_main` already walks `slots_` (`ir/llvm/Scheduler.cpp`); statics from `declare_static_prop` (`lower/Types.cpp`). A young collection reads the cards stored to since the last one (§7) | precise |
-| Live coroutine frames (processes, blocking tasks, fork children) | Intrusive `{ prev, next, u64 size }` node in the frame, linked at the ramp, unlinked at frame free | conservative, validated, **pinning** |
+| Live coroutine frames (processes, blocking tasks, fork children) | Intrusive `{ prev, next, base, size, ran, open }` node in the frame, linked at the ramp, unlinked at frame free. A young collection reads the frames that ran since the last collection and the open ones (§5.5) | conservative, validated, **pinning** |
 | Managed containers reachable from the above | `rt_elem_ops` walkers (§3.3) | precise |
 | Intra-assignment staging records carrying a class handle (`rt_intra_alloc_rooted`, `intra-assignment-timing.md`) | `rt_gc_range_add` from alloc to release, scanned as a conservative range | conservative, validated, pinning |
 | NBA record queues (`rt_nba_arr_slot`: array element, virtual-interface member, aggregate leaf, whole container) | Registered by shape at start-up (`rt_gc_nba_words_add` / `rt_gc_nba_container_add`); the staged records are read at each collection | conservative words, or precise through the container's element descriptor |
@@ -727,8 +727,9 @@ chunk and in a granule some object occupies. The same lookup resolves
 an *interior* pointer to its object start, which is what makes
 `ref`-into-a-class-property (F6) work with no epoch machinery at all.
 
-Costs, both bounded and both measurable: scan time proportional to live-frame
-bytes once per collection, and retention of one object graph per stale frame slot
+Costs, both bounded and both measurable: scan time proportional to the bytes of the frames a
+collection reads (every live frame in a full collection, the frames that ran in a young one,
+§5.5), and retention of one object graph per stale frame slot
 until that slot is overwritten — in a UVM sequence loop, the next iteration. §13
 specifies a mode that scans both ways and reports the difference, so this number
 is measured rather than asserted.
@@ -772,6 +773,71 @@ the registry never consulted. That happened twice while writing
 committed suite — which is why the frame case now asserts
 `conservative_pins > 0` and why the `always` + `automatic` shape is spelled out
 in its comment.
+
+### 5.5 Which frames a young collection reads
+
+A frame's words change in two ways only: its own coroutine runs, or a callee it is parked in
+stores through a pointer into it. So the registry is kept in two parts, divided by a node of the
+collector's own, the **sentinel** (`g_frame_sentinel`, linked again by `reset_mutator`, never a
+frame). A frame links at the head, so before the sentinel. A young collection reads the frames
+before the sentinel and a full collection reads them all. A frame behind the sentinel was read by
+a collection that left every object it names marked, so old, and is unchanged since.
+
+Two bytes of the node keep the division:
+
+- `ran` is 1 while the frame is before the sentinel. The link sets it. Where a coroutine resumes
+  from a park (`emit_suspend`, which every park goes through) generated code loads it and, when it
+  is clear, calls `rt_gc_frame_ran`, which sets it and moves the node to the head: a load, a
+  compare and a not-taken branch for a frame that has run since the last collection.
+- `open` is 1 while the coroutine is parked in a task call that handed its callee a pointer it can
+  store a class handle through into this frame (`task_call_opens_frame`): a `ref` formal, or an
+  output or inout formal the callee copies out through, whose type reaches a class handle and whose
+  actual is not known to be in an object or in design state. A container formal is not one: its
+  elements are in a payload the container roots cover. The call site sets it before the park and
+  clears it after its own resume.
+
+A collection at a safepoint (every reason but an emergency) **retires** what it read. No coroutine
+is running and every object a read frame names is now marked, so it clears `ran` on each frame it
+read before the sentinel and moves the sentinel to the head, which is constant work; the open
+frames it found go back before it and keep `ran`. A collection inside an allocation
+(`RT_GC_REASON_EMERGENCY`, which is also what `--gc-stress` runs at every allocation) reads the
+same frames and retires none: the coroutine it interrupts has already passed its hook and goes on
+storing into its frame.
+
+**Why this is sound** is the list of everything that can write a word of a parked frame:
+
+| Writer | Covered by |
+|---|---|
+| The frame's own coroutine, after a park | The hook runs before its first store, so the frame is before the sentinel |
+| The frame's own first segment | The link sets `ran`. Only a safepoint's collection retires, and the scheduler polls the safepoint at the wheel advance, after every ring has drained, so every frame ramped since the last one has run its first segment |
+| A callee storing through a `ref` formal bound to a place in the frame | `open`, set around the caller's park in that call |
+| A callee copying an output or inout formal out into the frame | `open`, which the caller clears only after its own resume, so also between the copy-out and the caller's hook, where other processes run |
+| A `ref` forwarded down a chain of task calls | The frame that holds the place is parked in the outermost call, open for the whole chain |
+| A function storing through a `ref` or output formal | Not a coroutine: its caller is running, so before the sentinel |
+| A fork child | Writes the capture boxes, which are heap objects (fork-join.md V4), not its parent's frame |
+| A blocking mailbox or semaphore method | Expanded into the waiter's own coroutine (`SyncWait`), so it pops and stores in its own activation, after its hook; it is not a task call |
+| The runtime's wake-ups: event, semaphore, mailbox, `wait fork`, `kill`, `disable` | Flags and list links, which are addresses of frames and resolve to no object. A coroutine they wake runs its hook |
+| NBA targets, staging records | Design state and registered ranges, not frames |
+
+The extra-assertion build checks it. Before every collection it asserts that each frame before
+the sentinel has `ran` set and each frame behind it has it clear and is not open, and before a
+young collection marks anything it asserts that no word of a frame behind the sentinel resolves
+to an unmarked, young object (`verify_frame_registry`). A writer missing from the list therefore
+fails an assertion at the next young collection instead of freeing an object that a frame holds.
+
+**What it costs.** A young collection costs what ran. With N task frames parked on an event that
+never fires and one task that churns, the last young collection reads one frame at N = 1,000,
+100,000 and 1,000,000, and a churn step (1,000 allocations and the collection they cause) takes
+about 124 thousand instructions at each N, where reading every frame took 174 thousand, 5.9 million
+and 54 million (shipped build, 256 KiB nursery, user instructions). The hook is two instructions,
+a compare of a byte of the frame and a not-taken branch, at each resume of a registered frame and
+nothing for a frame that is not registered: 2.0 instructions on a resume path of 61 (`#0`) to 101
+(timer) in a design of 50 frames that do nothing else. A registered frame pays two byte stores at
+its link, and a task call that opens its caller's frame two more around the park.
+
+**What it does not remove.** Frame-local containers (`g.containers`), registered ranges and NBA
+queues are separate root sets that every collection reads, so a design with a queue local to each
+of a million parked tasks still pays for them.
 
 ---
 
@@ -1027,7 +1093,8 @@ collection is the cost to avoid.
   slot instead. This is sound because every slot a collection read names a marked, old object: a slot
   nothing has stored to since still does. Stores through a `ref` or an output formal reach the same
   entry from the callee (`rt_gc_note_ref_store` finds the region by address). A frame local needs no
-  barrier; it is scanned in full at every collection.
+  barrier: a young collection reads every frame that ran since the last one and every frame a callee can
+  store into (§5.5).
 
   A container of design state (a queue, dynamic array or associative array whose elements or keys can
   hold a handle) is an entry of its region's root table and has flag bytes of its own after the cards,

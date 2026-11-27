@@ -1444,10 +1444,13 @@ llvm::StructType* Backend::gc_container_ty() {
     return gc_container_ty_;
 }
 
+// rt_gc_frame (Gc.h): { ptr prev, ptr next, ptr base, i64 bytes, i8 ran, i8 open }. Gc.cpp
+// asserts the same offsets of the C struct, so a reordering fails in both.
 llvm::StructType* Backend::gc_frame_ty() {
     if (gc_frame_ty_ == nullptr) {
         gc_frame_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() },
+          ctx_,
+          { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt8Ty(), b_.getInt8Ty() },
           "clotho.gcframe");
     }
     return gc_frame_ty_;
@@ -1603,6 +1606,11 @@ llvm::FunctionCallee Backend::gc_remember_fn() {
 // (address, witness chain, bytes stored).
 llvm::FunctionCallee Backend::gc_note_ref_store_fn() {
     return rt_fn("rt_gc_note_ref_store", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+}
+
+// rt_gc_frame_ran (Gc.h): the cold half of the resume hook. (frame node)
+llvm::FunctionCallee Backend::gc_frame_ran_fn() {
+    return rt_fn("rt_gc_frame_ran", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
 // rt_gc_note_state_store (Gc.h): the cold half of the inline card test of a store into design
