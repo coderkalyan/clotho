@@ -119,8 +119,8 @@ is per *definition*, so twin instances present identical field constants:
 
 ```
   0             i32  first dump-var index   ctx_blk_base   i32  NBA block ids
-  1             ptr  NBA shadow base        ctx_wait_base  ptr  wait-bucket bases
-  2             ptr  state base             ctx_sched_base { i64, ptr } wake pairs
+  1             ptr  NBA shadow base        ctx_wake_base  i32  first wake slot
+  2             ptr  state base             ctx_port_base  ...  ports
 ```
 
 That is exactly the set of bases a member access needs, which is why the whole

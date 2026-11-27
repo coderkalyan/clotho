@@ -24,9 +24,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const auto first_block = static_cast<uint32_t>(block_commits_.size());
 
     // A group of an instance addresses everything of that instance through its
-    // record. A coroutine group's flag is its own wake word in the instance's
-    // record (ctx_sched_base plus the def-local ordinal, materialize_group_ctx)
-    // -- while a thunk row touches no flag but the wake word it is handed. An
+    // record. A coroutine group's flag is its own wake word, in the slot at the
+    // record's wake base plus the def-local ordinal (materialize_group_ctx) --
+    // while a thunk row touches no flag but the wake word it is handed. An
     // unscoped group has no record and keeps the folded constant.
     const uint32_t g_ = group_of_[proc_index];
     own_anchor_       = group_unit_anchor_[g_];
@@ -110,18 +110,24 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         runs_once_ = false;
     };
     // A trigger mask the code being lowered tests the wake word against. An
-    // instance's own code (own_anchor_ set) loads it from its record, where
-    // main stored it at startup with the design-global colours, so no colour
-    // reaches unit code; code that addresses absolutely (the dispatcher of a
-    // group spanning instances, an unscoped group) bakes it, which is root
-    // glue. `field` is the record's array (ctx_mmask_base / ctx_gmask_base)
-    // and `m` the process whose def-local ordinal indexes it.
-    const auto mask_value = [&](uint64_t baked, uint32_t Anchor::*field, uint32_t m) -> llvm::Value* {
+    // instance's own code (own_anchor_ set) loads it from clotho.wake.mask, at
+    // the wake slot its record names, where the compile put the design-global
+    // colours, so no colour reaches unit code; code that addresses absolutely
+    // (the dispatcher of a group spanning instances, an unscoped group) bakes it,
+    // which is root glue. `field` is 0 for a process's own bits and 1 for its
+    // group's, and `m` the process whose slot holds them. A thunk row finds its
+    // instance's masks once, at its entry (`mask_row`), since it tests one per
+    // member on every activation.
+    llvm::Value* mask_row   = nullptr;
+    const auto   mask_value = [&](uint64_t baked, uint32_t field, uint32_t m) -> llvm::Value* {
         if (own_anchor_ == SignalSlot::no_anchor) {
             return b_.getInt64(baked);
         }
-        Anchor& a = anchors_[own_anchor_];
-        return ctx_field(a, a.*field + proc_sched_ord_[m], b_.getInt64Ty());
+        llvm::Value* const at =
+          mask_row != nullptr && proc_sched_anchor_[m] == own_anchor_
+            ? b_.CreateInBoundsGEP(wake_mask_ty(), mask_row, { b_.getInt32(proc_sched_ord_[m]), b_.getInt32(field) })
+            : b_.CreateInBoundsGEP(wake_mask_ty(), sym(wake_mask_gv_), { wake_slot_value(m), b_.getInt32(field) });
+        return b_.CreateLoad(b_.getInt64Ty(), at);
     };
     // Open the guarded region of a coroutine group: returns true when its
     // members are guarded, having ensured the wake word carries at least one of
@@ -131,7 +137,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         if (!group_guarded_[g]) {
             return false;
         }
-        emit_trigger_failsafe(sched_ptr_, mask_value(group_trig_mask_[g], &Anchor::ctx_gmask_base, members.front()));
+        emit_trigger_failsafe(sched_ptr_, mask_value(group_trig_mask_[g], 1, members.front()));
         return true;
     };
     // Open member `i`'s guard: run it only if one of ITS OWN events has
@@ -158,7 +164,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         }
         auto* run  = llvm::BasicBlock::Create(ctx_, "mem.run", fn_);
         auto* join = llvm::BasicBlock::Create(ctx_, "mem.skip", fn_);
-        auto* mask = mask_value(member_mask(g, i), &Anchor::ctx_mmask_base, members[i]);
+        auto* mask = mask_value(member_mask(g, i), 0, members[i]);
         auto* bits = b_.CreateAnd(b_.CreateLoad(sched_word_ty(), sched_ptr_), mask);
         b_.CreateCondBr(b_.CreateICmpNE(bits, b_.getInt64(0)), run, join);
         b_.SetInsertPoint(run);
@@ -253,6 +259,11 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         own_ctx_   = own_anchor_ != SignalSlot::no_anchor ? fn_->getArg(0) : nullptr;
         sched_ptr_ = takes_flag ? fn_->getArg(2) : nullptr;
         begin_activation();
+        if (takes_flag && own_anchor_ != SignalSlot::no_anchor) {
+            Anchor& a = anchors_[own_anchor_];
+            mask_row  = b_.CreateInBoundsGEP(wake_mask_ty(), sym(wake_mask_gv_),
+                                             ctx_field(a, a.ctx_wake_base, b_.getInt32Ty()), "mask.row");
+        }
         // Run each member body per activation, freeing its string temporaries
         // afterward — a thunk has no frame to persist them in (a per-call cost
         // paid only by string-using bodies). frame_slots_ is empty for a
@@ -1649,7 +1660,7 @@ void Backend::lower_task(FunctionId id) {
     // Frame buffer and the task's own scheduled flag, placed just after
     // coro.begin so CoroSplit spills them into the coroutine frame (both live
     // across suspends; the frame's address escapes to callees). The flag backs
-    // intra-body @event waits, exactly like a process's proc_sched slot.
+    // intra-body @event waits, exactly like a process's wake slot.
     frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
     sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
     group_first_block_ = -1;

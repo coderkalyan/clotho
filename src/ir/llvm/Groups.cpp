@@ -754,9 +754,9 @@ void Backend::compute_fusion_groups() {
             // wait_events naming the edge its own body tests for, but it is run
             // explicitly and never woken; a process that waits at its head is woken
             // through the dynamic buckets (wait_counts). wait_counts sizes the
-            // static buckets from this list, and the scan walks every slot up to
-            // that capacity, so leaving those events here would reserve a slot
-            // nothing ever fills and the scan would read a null flag ptr.
+            // static lists from this list, and a list's scan walks every entry up
+            // to that count, so leaving those events here would reserve an entry
+            // nothing ever fills.
             if (subscribed_statically(groups_[g].front())) {
                 group_events_[g] = all[groups_[g].front()].wait_events;
             }
@@ -999,34 +999,35 @@ void Backend::emit_trigger_failsafe(llvm::Value* flag, llvm::Value* mask) {
 // The function the scheduler holds for each schedule group: the coroutine ramp
 // of a coroutine group, and for a thunk group the entry that runs its rows.
 //
-//   entry(wake, wheel):
+//   entry(wake, record, wheel):
 //     [guarded group: the fail-safe on its trigger bits]
 //     row_1(record_1, wheel [, wake]) ... row_n(record_n, wheel [, wake])
 //     wake word = 0                             re-arm: ready to be woken
 //
-// A thunk group's handle is the address of its wake pair (the wake word, then
-// the entry: StateLayout.cpp, build_sched_flags), which the drain hands the entry
-// it finds beside it, so the entry owns the group's scheduled flag, held across
+// A thunk group's handle is the address of its wake slot in clotho.wake (the wake
+// word, the handle itself, the entry and the record: StateLayout.cpp,
+// build_sched_flags), and the drain hands the entry that slot and the record it
+// finds there. So the entry owns the group's scheduled flag, held across
 // every row: a store of any row finds the group queued and cannot re-enqueue it;
 // that is the timeline a fused body has always had. A row is a group function
 // taking its instance's record, which addresses everything of its own instance
 // through it, and the wake word through the pointer it is passed.
 //
 // A group of one row is the unit's code: its entry sits in the row's unit
-// module, once per row function however many instances run it, and finds its
-// instance's record a constant below the pair it is handed. A row that only its
-// entry runs is moved into it once every entry exists (absorb_sole_callee), so the
-// tier-0 pipeline sees one function per group, not a body and a wrapper for its
-// inliner to merge. No code of root is per instance. Several rows span units: the
-// dispatcher is link glue in root, and its calls are the cost of having no code
-// of one unit inline in another.
+// module, once per row function however many instances run it, and runs the row
+// with the record it is handed. A row that only its entry runs is moved into it
+// once every entry exists (absorb_sole_callee), so the tier-0 pipeline sees one
+// function per group, not a body and a wrapper for its inliner to merge. No code
+// of root is per instance. Several rows span units: the dispatcher is link glue
+// in root, which names each row's record itself, and its calls are the cost of
+// having no code of one unit inline in another.
 //
-// No entry is noalias on its pair: wakers write the wake word through pointers
+// No entry is noalias on its slot: wakers write the wake word through pointers
 // of their own. A row's `ctx` is noalias all the same, because the word reaches
 // the row as a parameter of its own and never through `ctx`.
 std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm::Function*>& group_fns) {
     auto*                        ptr_ty = llvm::PointerType::getUnqual(ctx_);
-    auto*                        fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
+    auto*                        fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty, ptr_ty }, false);
     std::vector<llvm::Function*> fns(sched_.size(), nullptr);
     // The entry of each row function that has one.
     std::map<llvm::Function*, llvm::Function*> unit_entry;
@@ -1059,7 +1060,8 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
         fn_    = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
         state_ = sym(state_global_);
         fn_->getArg(0)->setName("wake");
-        wheel_ = fn_->getArg(1);
+        fn_->getArg(1)->setName("ctx");
+        wheel_ = fn_->getArg(2);
         wheel_->setName("wheel");
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
         own_anchor_ = SignalSlot::no_anchor;
@@ -1107,30 +1109,30 @@ std::vector<llvm::Function*> Backend::emit_sched_entries(const std::vector<llvm:
     return fns;
 }
 
-// The entry of a group of one row, in the row's unit module: `entry(wake, wheel)`
-// for the instance whose record holds the pair `wake` points into. The record is
-// a constant below it, so the entry is the same code for every instance of the
-// unit and names none.
+// The entry of a group of one row, in the row's unit module: `entry(wake, record,
+// wheel)` for the instance `record` names, whose wake slot `wake` is. The entry
+// is the same code for every instance of the unit and names none: its group
+// masks, like the row's member masks, are found through the record's wake base.
 llvm::Function* Backend::emit_unit_entry(llvm::Function* row, uint32_t g0) {
-    const uint32_t ua  = group_unit_anchor_[g0];
-    Anchor&        a   = anchors_[ua];
-    auto*          ptr = llvm::PointerType::getUnqual(ctx_);
-    auto*          fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+    const uint32_t ua   = group_unit_anchor_[g0];
+    auto*          ptr  = llvm::PointerType::getUnqual(ctx_);
+    auto*          fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, ptr }, false);
     env_   = home_env(ua);
     fn_    = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, row->getName() + ".entry", env_->llmod);
-    wheel_ = fn_->getArg(1);
+    wheel_ = fn_->getArg(2);
     wheel_->setName("wheel");
     llvm::Value* const flag = fn_->getArg(0);
     flag->setName("wake");
+    fn_->getArg(1)->setName("ctx");
     b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
     own_anchor_  = ua;
     own_ordinal_ = proc_sched_ord_[groups_[g0].front()];
-    own_ctx_     = b_.CreateInBoundsGEP(
-      b_.getInt8Ty(), flag, { b_.getInt64(static_cast<uint64_t>(-static_cast<int64_t>(wake_offset(a, own_ordinal_)))) },
-      "ctx");
-    sched_ptr_ = flag;
+    own_ctx_     = fn_->getArg(1);
+    sched_ptr_   = flag;
     if (group_guarded_[g0]) {
-        emit_trigger_failsafe(flag, ctx_field(a, a.ctx_gmask_base + own_ordinal_, b_.getInt64Ty()));
+        llvm::Value* const mask = b_.CreateInBoundsGEP(wake_mask_ty(), sym(wake_mask_gv_),
+                                                       { wake_slot_value(groups_[g0].front()), b_.getInt32(1) });
+        emit_trigger_failsafe(flag, b_.CreateLoad(b_.getInt64Ty(), mask));
     }
     std::vector<llvm::Value*> args{ own_ctx_, wheel_ };
     if (group_guarded_[g0]) {

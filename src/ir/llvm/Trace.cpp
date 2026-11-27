@@ -513,7 +513,7 @@ void Backend::emit_trace_once(uint32_t kind) {
 #endif
 }
 
-// A thunk group is an activation named by the address of its wake pair with bit 0 set, which
+// A thunk group is an activation named by the address of its wake slot with bit 0 set, which
 // is also what the seed hands out; its entry returns to its leading control.
 void Backend::emit_trace_thunk_park(llvm::Value* wake, const std::string& where) {
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -575,7 +575,7 @@ void Backend::emit_trace_member(uint32_t index) {
     }
     auto* const ptr = llvm::PointerType::getUnqual(ctx_);
     auto* const i64 = b_.getInt64Ty();
-    // A thunk row is no coroutine: its activation is the wake pair its flag points at, with bit 0 set
+    // A thunk row is no coroutine: its activation is the wake slot its flag points at, with bit 0 set
     // (emit_trace_thunk_park).
     llvm::Value* a = hdl_ != nullptr
                        ? static_cast<llvm::Value*>(hdl_)

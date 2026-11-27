@@ -269,14 +269,14 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // sequential always block. All three are suspension-free, so by default they
     // lower to plain per-activation thunks -- the entry of each process's schedule
     // group, in the module of its unit: void, taking the address of the process's
-    // wake pair plus the timing-wheel ptr, no coroutine. Under --no-thunk each is
-    // instead a switched-resume coroutine ramp returning the handle (CoroSplit
-    // then emits .resume/.destroy/.cleanup parts, which don't match "define ptr
-    // @alu.p").
+    // wake slot, the instance record and the timing-wheel ptr, no coroutine. Under
+    // --no-thunk each is instead a switched-resume coroutine ramp returning the
+    // handle (CoroSplit then emits .resume/.destroy/.cleanup parts, which don't
+    // match "define ptr @alu.p").
     // Definitions only: declarations print without argument names.
-    CHECK(count_defs(ir, "@alu.p0.entry(", "(ptr %wake, ptr %wheel)") == 1);
-    CHECK(count_defs(ir, "@alu.p1.entry(", "(ptr %wake, ptr %wheel)") == 1);
-    CHECK(count_defs(ir, "@alu.p2.entry(", "(ptr %wake, ptr %wheel)") == 1);
+    CHECK(count_defs(ir, "@alu.p0.entry(", "(ptr %wake, ptr %ctx, ptr %wheel)") == 1);
+    CHECK(count_defs(ir, "@alu.p1.entry(", "(ptr %wake, ptr %ctx, ptr %wheel)") == 1);
+    CHECK(count_defs(ir, "@alu.p2.entry(", "(ptr %wake, ptr %ctx, ptr %wheel)") == 1);
     const std::string co = emit(kAlu, { .thunk = false });
     CHECK(count_substr(co, "define ptr @alu.") == 3);
     CHECK(co.find("(ptr %ctx, ptr %wheel)") != std::string::npos);
@@ -1320,17 +1320,10 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     )";
     const std::string          ir  = emit(src);
 
-    // Per-edge split wait queues: @(posedge clk) -> clk's static positive bucket;
-    // @(d or q) -> d's and q's static any-change buckets; intra-body @(doubled) ->
-    // doubled's dynamic any-change bucket (with a length). Each queue is named for
-    // its edge and emitted only when used; the per-process scheduled-flag array
-    // backs the wake-once dedup.
-    CHECK(ir.find("@clotho.wait.clk.sta.pos = ") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.d.sta.any = ") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.q.sta.any = ") != std::string::npos);
+    // An intra-body @(doubled) waits in doubled's dynamic any-change bucket (with
+    // a length), named for its edge and emitted only when used.
     CHECK(ir.find("@clotho.wait.doubled.dyn.any = ") != std::string::npos);
     CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = ") != std::string::npos);
-    CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
     // Both always blocks are suspension-free, so by default they lower to plain
     // per-activation thunks (no forever wait loop); servicing still has a static
     // and a dynamic scan from the blocking stores. The always-loop coroutine
@@ -1358,10 +1351,8 @@ TEST_CASE("an always whose body parks at an event control waits at its head; a p
         endmodule
     )";
     const std::string ir = emit(src);
-    CHECK(ir.find("@clotho.wait.clk.sta.pos = internal global [1 x { ptr, ptr }]") != std::string::npos);
     CHECK(ir.find("@clotho.wait.clk.dyn.pos = internal global [1 x { ptr, ptr }]") != std::string::npos);
     CHECK(ir.find("@clotho.wait.done.dyn.pos = internal global [1 x { ptr, ptr }]") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.done.sta.pos") == std::string::npos);
     const std::string raw = emit_raw(src);
     CHECK(raw.find("always.head") != std::string::npos);
     CHECK(count_substr(raw, ".entry(ptr %wake") == 1);

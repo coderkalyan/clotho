@@ -427,9 +427,9 @@ unit, which is also what the no-IR-rewriting rule asks
   member-count caps. Merged cross-instance bodies can return in a flattening,
   LTO-style `-O` mode without changing units. A group of one row is run by its
   unit's entry directly: the scheduler's handle for it is the address of the
-  process's wake pair inside the instance's record, and the entry, which is
-  handed that address, finds the record a constant below it, so no code of root
-  is per instance (see "The instance record").
+  process's wake slot, and the drain hands the entry that slot and the instance's
+  record, which it finds beside the entry in a root table, so no code of root is
+  per instance (see "The instance record").
 - Function and task signatures are uniform: the process-control and home
   parameters are always present and `ref` epoch handling never depends on
   callers, so no other unit's code changes a unit's signatures.
@@ -442,9 +442,8 @@ Every instance of a unit, a static unit's single instance included, has a
 record the unit's code receives as its first argument. It holds what differs
 between instances:
 
-- bases of the instance's state and NBA shadow, and one wake pair per process it
-  owns -- the wake word (the scheduled flag and the trigger bits it carries) and
-  the entry a thunk handle runs;
+- bases of the instance's state and NBA shadow, and the index of its first wake
+  slot (below);
 - bases of its ids in design-wide spaces (VCD variables, NBA blocks and
   buffers, triggers, RNG seeds), so code adds a unit-local ordinal;
 - its hierarchical name (`%m`, banners, covergroup scope), held as a borrowed
@@ -470,24 +469,40 @@ between instances:
   record) and the address of the signal's **port** in that record, and the record
   of an imported function's instance (landed); the record of an instance an
   interface port or `inst_refs` entry names (not yet);
-- one **port** per signal that has anything for a writer: its wake buckets (base,
-  subscriber count and trigger bits of each static one; base, length cell and
-  capacity of each dynamic one), its ids in the design-wide id spaces, its
-  dump-var index, the address of each of its shadow fields and the heads of its
-  virtual-interface waiter lists. A port is a struct whose elements are a function
-  of the signal's facts alone, so code that writes a signal of another unit reads
-  the port through its binding and names no offset of the owner's record: what the
-  owner gains elsewhere (a process, an event, a covergroup, an assertion, another
-  signal) moves the port inside the record and changes no one else's code. The
-  ports of a state type are the same for every unit of it, which a virtual
-  interface relies on. What does still reach a parent's code is the set of
-  buckets a signal it writes has (a new waiter on an edge of a port): an inbound
-  fact, joined per unit until step 4;
-- the trigger masks of the guarded groups the instance runs;
+- one **port** per signal that has anything for a writer: the address of each static
+  waiter list and the base, length cell and capacity of each dynamic bucket, its
+  ids in the design-wide id spaces, its dump-var index, the address of each of its
+  shadow fields and the heads of its virtual-interface waiter lists. A port is a
+  struct whose elements are a function of the signal's facts alone, so code that
+  writes a signal of another unit reads the port through its binding and names no
+  offset of the owner's record: what the owner gains elsewhere (a process, an
+  event, a covergroup, an assertion, another signal) moves the port inside the
+  record and changes no one else's code. The ports of a state type are the same
+  for every unit of it, which a virtual interface relies on. What does still reach
+  a parent's code is the set of lists a signal it writes has (a new waiter on an
+  edge of a port): an inbound fact, joined per unit until step 4;
 - the waiter queue of each `expect` its unit declares (LRM 16.17), as the address
   of a root global `{ count, parked handles }`: the wait and the wake of the
   statement are both unit code and read it here, so neither names a monitor's
   design-wide number (and two instances of one unit do not share a queue).
+
+The scheduler's per-process data is not in the record but in root tables indexed
+by **wake slot**, so that what a wake touches is dense (measured on rocket: the
+records were 3.4 MiB, and their ports, wake pairs and masks took half of all L1d
+misses). An instance's processes take consecutive slots from the record's wake
+base, at their def-local ordinals:
+
+- `clotho.wake`: `{ wake word, handle, entry, record }` per process, the word
+  every waker tests and sets, the handle a static list pushes and, for the front
+  of a thunk group, the entry the drain calls and the record it hands it, in the
+  line the waker has just written;
+- `clotho.wake.mask`: the own and group trigger masks of a guarded group's
+  processes, in a design that has one;
+- `clotho.wait.static`: every static waiter list, `[count, trigger bits,
+  slot...]`, constant data in subscription order. A port holds a list's address.
+
+A slot index is a design-wide number, so unit code only ever adds an ordinal to
+the base its record holds, as it does for its other id spaces.
 
 Today's per-definition `@clotho.inst.<hier>.ctx` (StateLayout.cpp) is the
 seed of it; the `abs_id` / `idval` relocations (gone: ids are record fields) and constant anchors in unit
@@ -719,8 +734,8 @@ code go.
     only that unit's code under unit-key symbols; instance storage, records,
     dispatchers, the shared queues and the wheel's trampolines are defined in
     root whichever unit asked first; the entry of a one-row schedule group is
-    unit code handed the address of its process's wake pair (a field of the
-    instance's record) and finding the record at a constant offset from it; a
+    unit code handed the address of its process's wake slot and the instance's
+    record, both from root tables the drain indexes by the handle; a
     unit's declarations of root globals carry no size. Gate
     (tests/modular_gate_test.cpp, `ir::emit_llvm_modules`, `clotho build --emit
     llvm-units`): compiling a design of several modules with several instances
@@ -743,7 +758,7 @@ code go.
     The instance records are initializers of their globals
     (`fill_instance_records`, ir/llvm/RootTables.cpp): every field of one is a
     link-time constant (the addresses of the instance's storage, the ports' wake
-    buckets and ids, the bindings, the entry of each thunk group's wake pair), so
+    lists and ids, the bindings, the index of its first wake slot), so
     `clotho_main` holds no code per instance and a record costs data only.
     The rest of root's per-instance work is tables behind one loop each
     (ir/llvm/RootTables.cpp, Vcd.cpp). The groups that run once (PreInit,
@@ -788,9 +803,11 @@ code go.
     reloaded them per block made a thunk activation of `thunk_comb` 26
     instructions where the absolute-addressing thunk is 19 (+6.3% of the run,
     callgrind: the whole difference was in the 256 per-process thunks). Handing
-    the entry the wake pair removes the trampoline, putting the state base at a
-    fixed offset off the pair takes the record's own address out of every
-    access (the record leads with the fields a body reads least), and
+    the entry its record removes the trampoline (the record was at a fixed offset
+    below the wake pair the handle named while the pairs were record fields; the
+    drain now reads it from the group's slot in clotho.wake), putting the state base at a fixed
+    offset off the record takes the record's own address out of every access,
+    and
     RematAddressPass (backend, last in the tier-0 pipeline) gives each basic
     block its own copy of a constant-index GEP so FastISel folds it into the
     access instead of spilling the address across blocks. What is left over the
