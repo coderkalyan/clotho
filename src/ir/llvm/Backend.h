@@ -1003,6 +1003,16 @@ struct PortLayout {
     // Per edge, the element holding the address of the waiter-list head that
     // `@(edge vif.sig)` waiters through a virtual interface park on.
     std::array<uint32_t, 3> vif = { no_port_elem, no_port_elem, no_port_elem };
+    // A canonical port's (bound storage, build_ports) wake mask (i32): what this
+    // instance has there, so a writer calls bound_store_fn only for a change
+    // something can see. Bit e: the static bucket of Edge e has subscribers;
+    // 3 + e: the dynamic bucket exists; 6 + e: a `<= @` trigger; 9: the signal is
+    // dumped.
+    uint32_t mask = no_port_elem;
+    static constexpr uint32_t mask_sta  = 0;
+    static constexpr uint32_t mask_dyn  = 3;
+    static constexpr uint32_t mask_trig = 6;
+    static constexpr uint32_t mask_vcd  = 9;
 };
 
 // The force / procedural-assign state signals a StoreNbGated names (LRM 10.6):
@@ -2945,6 +2955,7 @@ private:
     void emit_trigger_fire(llvm::Value* trig_id);
 
     void emit_release_moment(Signal sig, const EdgeFacts& f, bool canon);
+    void emit_bound_notify(Signal sig, const EdgeFacts& f, llvm::Value* mask);
 
     // The pieces of a (signal, edge) dynamic wake bucket a writer addresses: the
     // waiters' base and their length cell.
@@ -3209,14 +3220,8 @@ private:
     }
 
     // The static wake scan, emitted once per LLVM module and shape and called from
-    // every store that wakes a static waiter list (service_static_queue), so a store
-    // site holds one call rather than the loop. It takes the address of the list's
-    // header. With `vcd` it also takes the store's dump-var index and touches it
-    // after the scan. `edge` only shapes the function when the trace checker is on,
-    // whose report names the list's edge; the traced form also takes the storage
-    // the writer reaches.
-    llvm::Function* static_scan_fn(bool vcd, uint32_t edge);
-    void            emit_static_scan_rt(llvm::Value* list, const TraceCause& why);
+    // The shared static scans (static_scan_fn) per LLVM module and shape.
+    std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*> static_scan_fns_;
 
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why);
 
@@ -5563,6 +5568,10 @@ private:
     std::vector<uint8_t> vcd_hidden_;
     // The shared static scans (static_scan_fn) per LLVM module and shape.
     std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*> static_scan_fns_;
+    // bound_notify_fn per LLVM module and port layout.
+    std::map<std::pair<llvm::Module*, llvm::StructType*>, llvm::Function*> bound_notify_fns_;
+    // bound_store_fn per LLVM module, port layout and plane count.
+    std::map<std::tuple<llvm::Module*, llvm::StructType*, bool>, llvm::Function*> bound_store_fns_;
     // The dump-var touch of the store being serviced, while service_wait_queue
     // offers it to the Any bucket's scan; `taken` once a scan carries it.
     struct VcdFold {

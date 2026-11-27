@@ -201,6 +201,18 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
             } else if (pl->vcd != no_port_elem && canon) {
                 put(pl->vcd, b_.getInt32(~0u));
             }
+            if (pl->mask != no_port_elem) {
+                uint32_t mask = 0;
+                for (uint32_t e = 0; e < 3; ++e) {
+                    const uint32_t trig = static_cast<uint32_t>(IdFamily::TrigPos) + e;
+                    mask |= (sta_list_[si][e] != 0 ? 1u : 0u)
+                            << (PortLayout::mask_sta + e);
+                    mask |= (wait_dyn_gv_[si][e] != nullptr ? 1u : 0u) << (PortLayout::mask_dyn + e);
+                    mask |= (id_val_[si][trig] != no_id ? 1u : 0u) << (PortLayout::mask_trig + e);
+                }
+                mask |= (pl->vcd != no_port_elem && vcd_index_[si] >= 0 ? 1u : 0u) << PortLayout::mask_vcd;
+                put(pl->mask, b_.getInt32(mask));
+            }
             for (uint32_t k = 0; k < s.sh_count && k < pl->n_shadow; ++k) {
                 put(pl->shadow + k, gep(a.shadow_ty, sym(a.shadow_gv), { 0, s.sh_first + k }));
             }

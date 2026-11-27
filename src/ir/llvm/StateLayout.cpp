@@ -1522,6 +1522,7 @@ void Backend::build_ports() {
         std::array<bool, 3>           vif{};
         std::array<bool, kIdFamilies> id{};
         bool                          vcd      = false;
+        bool                          canon    = false;
         uint32_t                      n_shadow = 0;
     };
     ankerl::unordered_dense::map<llvm::StructType*, std::vector<Facts>> joined;
@@ -1548,11 +1549,12 @@ void Backend::build_ports() {
             f.vcd      = f.vcd || (design_uses_vcd_ && vcd_index_[si] >= 0);
             f.n_shadow = std::max(f.n_shadow, slots_[si].sh_count);
             if (uniform(sigs[pos])) {
-                // The canonical port of bound storage: every bucket, every id, the
-                // dump-var index whenever the design dumps, and a shadow address
-                // for each field the slot can stage (mm, z, dirty mask), so a
-                // child's code finds one layout whichever signal it is bound to.
-                // What this instance lacks the record leaves null or no_id.
+                // The canonical port of bound storage: a wake mask, every bucket,
+                // every id, the dump-var index whenever the design dumps, and a
+                // shadow address for each field the slot can stage (mm, z, dirty
+                // mask), so a child's code finds one layout whichever signal it is
+                // bound to. What this instance lacks the record leaves null or no_id.
+                f.canon = true;
                 f.sta.fill(true);
                 f.dyn.fill(true);
                 f.id.fill(true);
@@ -1573,6 +1575,9 @@ void Backend::build_ports() {
             el.push_back(t);
             return static_cast<uint32_t>(el.size() - 1);
         };
+        if (f.canon) {
+            pl.mask = add(i32);
+        }
         for (uint32_t e = 0; e < 3; ++e) {
             if (f.sta[e]) {
                 pl.sta[e] = add(ptr);

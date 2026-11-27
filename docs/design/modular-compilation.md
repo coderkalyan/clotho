@@ -132,18 +132,27 @@ its place:
   make the instances' code differ, so that a new instance or a parent's edit
   changed the child's module. A signal a port is bound to (`Module::port_bound`,
   the backend's `uniform`) therefore has one shape and one port layout whatever
-  it is: the z word its type allows (as a `ref` actual has), every wake bucket,
-  every id and the dump-var index in its port, and `code_key` names the binding
-  alone. What a given instance lacks there (a bucket nobody subscribed to, a
-  `<= @` trigger, a dump) is null, no_id or -1 in the record, tested at run time.
+  it is: the z word its type allows (as a `ref` actual has), a wake mask, every
+  wake bucket, every id and the dump-var index in its port, and `code_key`
+  names the binding alone. What a given instance lacks there (a bucket nobody
+  subscribed to, a `<= @` trigger, a dump) is null, no_id or -1 in the record,
+  tested at run time.
 - Which edges anything waits on, for a signal a child port binds: the child's
   waiters subscribe to the parent's signal, so the parent's wake code would
   depend on its children's waits, and through a chain of ports on its
   grandchildren's. Every writer of a bound signal, the owner's code and the
-  child's alike, classifies all three edges (any, posedge, negedge) and scans
-  each bucket its port does not mark empty, an edge nobody waits on costing one
-  load and one branch; the code then depends on "bound to a port", a fact of
-  the units themselves.
+  child's alike, serves all three edges (any, posedge, negedge) and whatever
+  else a port may name: a store tests whether its value changed and whether
+  the port's wake mask (the buckets, `<= @` triggers and dump this instance
+  has) is nonzero, and only then calls one shared function per module
+  (`bound_store_fn`) with the LSB planes, which classifies the edges and wakes
+  what the mask names. The code then depends on "bound to a port", a fact of
+  the units themselves. Against serving only what each instance's waiters need
+  (which shares no code between instances bound to different signals), the
+  rule and the canonical z words cost 1–2% of run time on rocket-chip, 10–13%
+  on Hazard3 and about 25% on cv32e40p, both tiers; on cv32e40p the z words
+  are about 5 points of it, the rest the change test every store to bound
+  storage makes and the shared wake function.
 - Whether a port is forced or procedurally assigned (LRM 10.6) from anywhere:
   a forced input variable keeps its storage. The frontend joins it over every
   instance of a definition (`forceable_`, see "Known leaks"), and it becomes a
