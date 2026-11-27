@@ -1539,9 +1539,10 @@ void Backend::emit_gc_safepoint(llvm::Value* wheel) {
 // collection treats an OLD object as live-and-opaque instead of tracing it, so a
 // handle written into an OLD object -- or into a container the OLD object owns --
 // is invisible, and the object it names would be reclaimed while still referenced.
-// Design state, statics and frame locals need nothing: they are scanned in full at
-// every collection, young or not (Gc.h:105-107). LValue::gc_owner is what decides
-// which stores those are, and it is non-null only for a place inside an object.
+// Design state and statics are logged by card instead (emit_gc_state_barrier), and a frame local
+// needs nothing: a young collection reads every frame that ran since the last collection and every
+// frame a callee can store into (Gc.h, rt_gc_frame). LValue::gc_owner is what decides which stores
+// those are, and it is non-null only for a place inside an object.
 //
 // One mask and one compare rather than two tests: MARK says the object is old, so
 // a young collection will not trace it, and LOGGED says the remembered set already

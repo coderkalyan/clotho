@@ -4250,7 +4250,8 @@ extern "C" void rt_gc_remember(void* obj) {
 // container's handle), else null. What holds the container is the owner of what the store
 // adds, and it is found from that handle; for a place that cannot move it is found from
 // `slot`. A heap object is logged if it is old. A place in design state is logged as an
-// emitted store to it would be. A place in neither -- a frame -- is read in full.
+// emitted store to it would be. A place in neither -- a frame -- needs nothing: the caller parked
+// in the call is open (rt_gc_frame::open), so every collection reads it.
 extern "C" void rt_gc_note_ref_store(void* slot, const rt_ref_witness* chain, uint64_t bytes) {
     if (g.initialized == 0) {
         return;

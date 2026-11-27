@@ -727,8 +727,9 @@ chunk and in a granule some object occupies. The same lookup resolves
 an *interior* pointer to its object start, which is what makes
 `ref`-into-a-class-property (F6) work with no epoch machinery at all.
 
-Costs, both bounded and both measurable: scan time proportional to live-frame
-bytes once per collection, and retention of one object graph per stale frame slot
+Costs, both bounded and both measurable: scan time proportional to the bytes of the frames a
+collection reads (every live frame in a full collection, the frames that ran in a young one,
+§5.5), and retention of one object graph per stale frame slot
 until that slot is overwritten — in a UVM sequence loop, the next iteration. §13
 specifies a mode that scans both ways and reports the difference, so this number
 is measured rather than asserted.
