@@ -229,8 +229,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         }
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), params, false);
         // Internal: its callers are the entry of its schedule group, in this
-        // module when the group has no other row (where the inliner may fold the
-        // body in), or a dispatcher in root, which promotes it through sym().
+        // module when the group has no other row (where the body is moved into
+        // the entry, emit_sched_entries), or a dispatcher in root, which promotes
+        // it through sym().
         fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
         fn_->getArg(0)->setName("ctx");
         wheel_ = fn_->getArg(1);
@@ -263,6 +264,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_dynarr_temps();
             build_agg_elem_temps();
             llvm::BasicBlock* join = open_guard(takes_flag, g_, i);
+            if (takes_flag) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
@@ -545,6 +549,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
             llvm::BasicBlock* join = open_guard(guarded, g_, i);
+            if (guarded) {
+                emit_trace_member(static_cast<uint32_t>(i));
+            }
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }
@@ -1902,6 +1909,9 @@ void Backend::lower_task(FunctionId id) {
         auto*        rty    = fork_record_ty(heap);
         auto*        cntp   = b_.CreateStructGEP(rty, rec, 0);
         llvm::Value* cnt    = b_.CreateSub(b_.CreateLoad(b_.getInt32Ty(), cntp), b_.getInt32(1));
+        // The completion is reported to the record before it is counted, so before the wake it may
+        // make (R22).
+        emit_trace_child_done(hdl_, rec);
         b_.CreateStore(cnt, cntp);
         llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(rty, rec, 1));
         llvm::Value* due    = heap
@@ -2316,12 +2326,10 @@ void Backend::lower_call_common(Index               i,
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             // An out / inout container actual is filled BY THE CALLEE through this
             // handle pointer, which finds the owner from the address when it copies
-            // out (emit_copyout), except for a place inside a container's payload,
-            // which has none the address can name: the barrier stays here for that.
+            // out (emit_copyout). The frontend never hands it a place inside another
+            // container's payload, which has no owner the address can name.
             if (dir == ArgDir::Out || dir == ArgDir::Inout) {
-                if (!alv.epoch_chain.empty()) {
-                    emit_gc_barrier_for(alv);
-                }
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
                 if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
@@ -2344,17 +2352,14 @@ void Backend::lower_call_common(Index               i,
         } else if (is_agg_abi(f.param_types[k])) {
             // An aggregate actual passes its storage pointer, one per formal in
             // every direction (the frontend emitted it as an lvalue): In copies
-            // it in, a struct-bearing out / inout copies the frame Local back
-            // out through the same pointer.
+            // it in, an out / inout copies the frame Local back out through the
+            // same pointer (emit_copyout). An out / inout actual is always a caller
+            // temp, which the frontend assigns to the actual after the call
+            // (Lowerer::build_call_args), so the pointer is never into a
+            // container's payload and the copy-out needs no barrier of the call's.
             argv.push_back(agg_arg_ptr(lvalue_of(a), f.param_types[k], dir));
-            // A struct-bearing out / inout formal is copied back out through THIS
-            // pointer by the callee itself (emit_copyout), which finds the owner of
-            // an actual that is a class property from the address. The exception is a
-            // place inside a container's payload, which has no owner the address can
-            // name: the barrier stays here for that shape.
-            if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !lvalue_of(a).epoch_chain.empty()) {
-                emit_gc_barrier_for(lvalue_of(a));
-            }
+            assert((dir == ArgDir::In || lvalue_of(a).epoch_chain.empty()) &&
+                   "an aggregate output actual is a caller temp, not a place in a container's payload");
         } else {
             push_scalar_arg(argv, value_of(a), abi_four_state(f.param_types[k]));
         }
@@ -2550,9 +2555,7 @@ void Backend::lower_task_call_inst(Index i) {
             const Guarded& alv = lvalue_of(args[k]);
             argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
             if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
-                if (!alv.epoch_chain.empty()) {
-                    emit_gc_barrier_for(alv);
-                }
+                assert(alv.epoch_chain.empty() && "a container output actual is not inside a container's payload");
                 if (alv.chg != nullptr || alv.is_signal || alv.mut_sig_valid) {
                     ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                 }
@@ -2560,16 +2563,15 @@ void Backend::lower_task_call_inst(Index i) {
         } else if (is_agg_abi(tf.param_types[k])) {
             // An unpacked struct / whole unpacked array actual: one storage
             // pointer for every direction (the frontend emitted it as an lvalue —
-            // the actual itself for a struct-bearing formal, a canonical temp for
-            // a flat array). The callee copies in at its body start and copies an
+            // the actual itself for a struct-bearing input, a canonical temp
+            // otherwise). The callee copies in at its body start and copies an
             // output / inout back at completion, so the caller must keep the
-            // storage alive across the task's suspends: both shapes are frame
-            // Locals / signals, never a short-lived alloca.
+            // storage alive across the task's suspends: an output / inout actual
+            // is a frame Local or a signal, never a short-lived alloca and never a
+            // place in a container's payload.
             argv.push_back(agg_arg_ptr(lvalue_of(args[k]), tf.param_types[k], tf.arg_dirs[k]));
-            if ((tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) &&
-                !lvalue_of(args[k]).epoch_chain.empty()) {
-                emit_gc_barrier_for(lvalue_of(args[k]));
-            }
+            assert((tf.arg_dirs[k] == ArgDir::In || lvalue_of(args[k]).epoch_chain.empty()) &&
+                   "an aggregate output actual is a caller temp, not a place in a container's payload");
         } else if (is_string_type(tf.param_types[k])) {
             // One rt_string handle pointer in every direction: In passes the
             // actual's handle (deep-copied into the frame slot at body start),

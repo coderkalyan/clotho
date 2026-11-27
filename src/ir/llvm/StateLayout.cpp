@@ -282,12 +282,16 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
     for (const InstanceScope& child : scope.children) {
         scope_type(child, claimed, hier + "." + child.name);
     }
-    bool any_handle = false;
+    bool     any_handle = false;
+    uint32_t nflags     = 0;
     for (const Signal sig : defined) {
-        any_handle = any_handle || reaches_class_handle(slots_[static_cast<uint32_t>(sig)].ir_type);
+        SignalSlot& s = slots_[static_cast<uint32_t>(sig)];
+        any_handle    = any_handle || reaches_class_handle(s.ir_type);
+        nflags += assign_gc_flags(s, nflags);
     }
     const uint32_t cards_field = add_gc_cards(fields, any_handle);
     anchors_[aid].cards_field  = cards_field;
+    anchors_[aid].flags_field  = add_gc_flags(fields, nflags);
 
     for (const auto& [def, flds, ty] : def_types_) {
         if (def == scope.def_name && flds == fields) {
@@ -397,6 +401,7 @@ void Backend::build_state_types() {
     const std::vector<bool>& undriven = facts_.undriven;
     compute_vif_reachable();
     collect_vif_waits();
+    uniform_.assign(sigs.size(), 0);
 
     for (uint32_t i = 0; i < sigs.size(); ++i) {
         const Layout lay = mod_.pool.layout(sigs[i].type);
@@ -490,14 +495,18 @@ void Backend::build_state_types() {
         // z word to elide. A 4-state signal keeps it unless the analysis proves it
         // never z -- and always for an actual a callee reaches through a pointer
         // (a `ref` actual, or the out / inout temp of a call; a user signal is
-        // ptr_arg only by being a ref actual, see make_arg_temp), and for a member
+        // ptr_arg only by being a ref actual, see make_arg_temp), for a member
         // reachable through a virtual interface (the access is emitted once per
         // definition against a base chosen at run time, so it cannot depend on what
-        // the analysis proved about one instance's writers, LRM 25.9). Those take
-        // the CANONICAL type-derived shape, the same rule an aggregate leaf follows,
-        // so that both sides of an alias agree without either knowing the other.
+        // the analysis proved about one instance's writers, LRM 25.9), and for the
+        // storage of a bound port (uniform_: a child's code reaches it in every
+        // instance, whichever parent signal it is). Those take the CANONICAL
+        // type-derived shape, the same rule an aggregate leaf follows, so that both
+        // sides of an alias agree without either knowing the other.
+        uniform_[i] = i < mod_.port_bound.size() && mod_.port_bound[i] != 0 && !vif_sig_[i] && !sigs[i].is_event &&
+                      ty.kind != Type::Kind::UnpackedArray;
         slot.has_z  = slot.four_state && (may_z[i] || slot.init_z || !slot.undriven_mask.empty() ||
-                                          ptr_arg[i] || vif_sig_[i]);
+                                          ptr_arg[i] || vif_sig_[i] || uniform_[i] != 0);
         slot.slot_ty = slot_type(slot.width, slot.four_state, slot.has_z);
         if (ty.kind == Type::Kind::UnpackedArray) {
             slot.is_array   = true;
@@ -612,11 +621,17 @@ void Backend::build_state_types() {
     }
 
     {
-        bool any_handle = false;
+        bool     any_handle = false;
+        uint32_t nflags     = 0;
         for (uint32_t i = 0; i < sigs.size(); ++i) {
-            any_handle = any_handle || (!claimed[i] && reaches_class_handle(slots_[i].ir_type));
+            if (claimed[i]) {
+                continue;
+            }
+            any_handle = any_handle || reaches_class_handle(slots_[i].ir_type);
+            nflags += assign_gc_flags(slots_[i], nflags);
         }
         root_cards_field_ = add_gc_cards(root_fields, any_handle);
+        root_flags_field_ = add_gc_flags(root_fields, nflags);
     }
     state_ty_ = llvm::StructType::create(ctx_, root_fields, "clotho.state");
 }
@@ -644,6 +659,63 @@ uint32_t Backend::gc_cards_field(const SignalSlot& s) const {
     const uint32_t field = s.anchor == SignalSlot::no_anchor ? root_cards_field_ : anchors_[s.anchor].cards_field;
     assert(field != Anchor::no_cards && "a signal that holds a handle is in a region with card bytes");
     return field;
+}
+
+uint32_t Backend::gc_flags_field(const SignalSlot& s) const {
+    const uint32_t field = s.anchor == SignalSlot::no_anchor ? root_flags_field_ : anchors_[s.anchor].flags_field;
+    assert(field != Anchor::no_flags && s.cflag_base != SignalSlot::no_flags &&
+           "a signal that holds a container of handles is in a region with flag bytes");
+    return field;
+}
+
+// The container flag bytes follow the card bytes, so the two arrays are one run: the table
+// says where the flags start by the cards' end (gc_roots_global asserts it).
+uint32_t Backend::add_gc_flags(std::vector<llvm::Type*>& fields, uint32_t nflags) {
+    if (nflags == 0) {
+        return Anchor::no_flags;
+    }
+    assert(!fields.empty() && fields.back()->isArrayTy() && "the flag bytes follow the card bytes");
+    fields.push_back(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx_), nflags));
+    return static_cast<uint32_t>(fields.size() - 1);
+}
+
+uint32_t Backend::assign_gc_flags(SignalSlot& s, uint32_t first) {
+    if (!holds_gc_container(s.ir_type)) {
+        return 0;
+    }
+    const uint64_t bytes = root_env_->llmod.getDataLayout().getTypeAllocSize(s.storage_ty);
+    s.cflag_base         = first;
+    return static_cast<uint32_t>((bytes + RT_GC_CFLAG_BYTES - 1) >> RT_GC_CFLAG_SHIFT);
+}
+
+// The shapes collect_gc_containers finds entries for: a container that reaches a class handle is
+// a boundary, and unpacked arrays and structs are looked through.
+bool Backend::holds_gc_container(Ref type) {
+    assert(type != Ref::Invalid && "a container search needs a real type");
+    [[maybe_unused]] static constexpr uint32_t kWalkStepsMax = 1u << 20;
+    std::vector<Ref>                           work{ type };
+    [[maybe_unused]] uint32_t                  steps = 0;
+    while (!work.empty()) {
+        ++steps;
+        assert(steps < kWalkStepsMax && "container search did not converge");
+        const Ref r = work.back();
+        work.pop_back();
+        if (types::is_container(mod_.pool, r)) {
+            if (reaches_class_handle(r)) {
+                return true;
+            }
+            continue;
+        }
+        const Type& t = std::get<Type>(mod_.pool.get(r));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            work.push_back(t.element);
+        } else if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                work.push_back(fld.type);
+            }
+        }
+    }
+    return false;
 }
 
 const SignalSlot& Backend::slot_of(Signal s) const {
@@ -734,6 +806,11 @@ const PortLayout* Backend::port_of(const SignalSlot& s) const {
         return nullptr;
     }
     return &port_layouts_[port_idx_[si]];
+}
+
+bool Backend::uniform(Signal sig) const {
+    const auto si = static_cast<uint32_t>(sig);
+    return si < uniform_.size() && uniform_[si] != 0 && slots_[si].anchor != SignalSlot::no_anchor;
 }
 
 bool Backend::port_reachable(const SignalSlot& s) {
@@ -1443,6 +1520,18 @@ void Backend::build_ports() {
             }
             f.vcd      = f.vcd || (design_uses_vcd_ && vcd_index_[si] >= 0);
             f.n_shadow = std::max(f.n_shadow, slots_[si].sh_count);
+            if (uniform(sigs[pos])) {
+                // The canonical port of bound storage: every bucket, every id, the
+                // dump-var index whenever the design dumps, and a shadow address
+                // for each field the slot can stage (mm, z, dirty mask), so a
+                // child's code finds one layout whichever signal it is bound to.
+                // What this instance lacks the record leaves null or no_id.
+                f.sta.fill(true);
+                f.dyn.fill(true);
+                f.id.fill(true);
+                f.vcd      = f.vcd || design_uses_vcd_;
+                f.n_shadow = std::max(f.n_shadow, slots_[si].four_state ? 3u : 2u);
+            }
         }
     }
 

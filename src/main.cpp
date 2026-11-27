@@ -389,6 +389,7 @@ struct Options {
     std::optional<bool>        allow_port_coercion;
     std::optional<bool>        loose_timescale;
     std::optional<bool>        loose_stale_ref;
+    std::optional<bool>        as_written;
     std::optional<std::string> stop_time;
     std::vector<std::string>   dpi_libs;
     std::vector<std::string>   path_prefix_maps;
@@ -541,6 +542,13 @@ void register_options(Registry& r, Options& o) {
                     "was bound to, which stops the run by default: growing or reordering an array or queue "
                     "while a ref refers to an element of it leaves that ref on something else entirely, so "
                     "nothing after the first one means anything. For naming every such ref in one run");
+    r.add_developer(kBuildRun,
+                    "--as-written",
+                    o.as_written,
+                    "Simulate the design as written: keep the logic whose results nothing reads, and give every "
+                    "input and output port storage of its own, where otherwise the first is left out and the "
+                    "second shares its connection's, so a debugger can show every signal. The debug adapter "
+                    "passes it to the design it runs");
     r.add(kBuildRun,
           "--dpi-lib",
           o.dpi_libs,
@@ -1452,6 +1460,9 @@ int main(int argc, char** argv) {
         path_prefix_map.emplace_back(std::move(dir), entry.substr(eq + 1));
     }
 
+    // Only what is simulated drops the logic nothing reads and merges ports: `lint`
+    // and `synth` report on and translate the design as written.
+    const bool as_written = options.as_written == true || (command != Command::Build && command != Command::Run);
     // `--diag-json -` puts the diagnostics on stdout as JSON, and then they are not also text.
     const bool json_to_stdout = driver->options.diagJson.has_value() && *driver->options.diagJson == "-";
     const clotho::LowerResult result = clotho::lower_driver(std::move(driver),
@@ -1459,7 +1470,8 @@ int main(int argc, char** argv) {
                                                             config.allow_system,
                                                             std::move(path_prefix_map),
                                                             options.allow_port_coercion == true,
-                                                            config.stats);
+                                                            config.stats,
+                                                            as_written);
     if (!result.diagnostics.empty() && !json_to_stdout) {
         std::print(stderr, "{}", result.diagnostic_text());
     }

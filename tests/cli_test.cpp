@@ -432,6 +432,7 @@ TEST_CASE("cli: --help-all lists every option, tagged with the commands that tak
                                                  "--gc-heap-max",
                                                  "--gc-full-every",
                                                  "--loose-stale-ref",
+                                                 "--as-written",
                                                  "--perf-jitdump" });
     // Whatever a command's own help lists, `--help-all` lists too, and
     // `--help-all` after a command is the same list.
@@ -609,7 +610,10 @@ TEST_CASE("cli: --stat=unit-code counts the functions emitted for the groups of 
             initial #1 bus.clk = 1;
         endmodule
     )");
-    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    // Nothing reads `n`, so the design is simulated as written for there to be
+    // groups to count.
+    const Result r =
+      s.run(std::format("build --emit=llvm --stat=unit-code --as-written -o /dev/null \"{}\"", design.string()));
     CHECK(r.code == 0);
     CHECK(contains(r.err, "2 groups of multi-instance units over 6 instances' groups, 2 functions emitted (3 of the groups are coroutines"));
     CHECK(contains(r.err, "1 schedule groups run several groups (3 rows)"));
@@ -1123,15 +1127,15 @@ TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup")
     }
 }
 
-// A legal construct Clotho refuses (a wait on a fork-captured automatic event),
+// A legal construct Clotho refuses (a nonblocking assignment to a class property),
 // reported at 5:5 as an `unsupported-construct` error and by nothing else.
 constexpr std::string_view kRefusedDesign = R"(module top;
-  task automatic t;
-    event e;
-    fork begin #1 -> e; end join_none
-    wait (e.triggered);
-  endtask
-  initial t();
+  class C; int v; endclass
+  C c = new;
+  initial begin
+    c.v <= 1;
+    #1 $display(c.v);
+  end
 endmodule
 )";
 
@@ -1142,20 +1146,20 @@ TEST_CASE("cli: a refusal shows its source line and a caret, like a slang error"
     const fs::path design = s.write("refused.sv", kRefusedDesign);
     const Result   r      = s.run(std::format("run \"{}\"", design.string()));
     CHECK(r.code == 1);
-    CHECK(contains(r.err, "refused.sv:5:5: error: wait on the fork-captured automatic 'e'"));
-    CHECK(contains(r.err, "[unsupported-construct]\n    wait (e.triggered);\n    ^"));
+    CHECK(contains(r.err, "refused.sv:5:5: error: nonblocking assignment to a class property"));
+    CHECK(contains(r.err, "[unsupported-construct]\n    c.v <= 1;\n    ^"));
 
     SUBCASE("--diag-source=false leaves the headline alone") {
         const Result q = s.run(std::format("run --diag-source=false \"{}\"", design.string()));
         CHECK(q.code == 1);
         CHECK(contains(q.err, "refused.sv:5:5: error: "));
-        CHECK_FALSE(contains(q.err, "wait (e.triggered);"));
+        CHECK_FALSE(contains(q.err, "c.v <= 1;"));
     }
     SUBCASE("--diag-column=false drops the column from the location") {
         const Result q = s.run(std::format("run --diag-column=false \"{}\"", design.string()));
         CHECK(q.code == 1);
         CHECK(contains(q.err, "refused.sv:5: error: "));
-        CHECK(contains(q.err, "wait (e.triggered);"));
+        CHECK(contains(q.err, "c.v <= 1;"));
     }
 }
 
@@ -1184,8 +1188,8 @@ TEST_CASE("cli: design diagnostics are coloured only when asked for, on a pipe")
         CHECK(colour.code == 1);
         CHECK(contains(colour.err, kEsc));
         // The text under the colour is the plain text, nothing added or lost.
-        CHECK(contains(colour.err, "wait on the fork-captured"));
-        CHECK(contains(colour.err, "wait (e.triggered);"));
+        CHECK(contains(colour.err, "nonblocking assignment to a class property"));
+        CHECK(contains(colour.err, "c.v <= 1;"));
     }
     SUBCASE("--color-diagnostics=false is not colour either") {
         const Result off = s.run(std::format("lint --color-diagnostics=false \"{}\"", unused.string()));
@@ -1287,10 +1291,10 @@ TEST_CASE("cli: --diag-json carries a design's diagnostics") {
         const fs::path json = s.path("diag.json");
         const Result   r    = s.run(std::format("lint --diag-json \"{}\" \"{}\"", json.string(), refused.string()));
         CHECK(r.code == 1);
-        CHECK(contains(r.err, "wait on the fork-captured"));
+        CHECK(contains(r.err, "nonblocking assignment to a class property"));
         const std::string text = clotho::test::detail::read_file(json);
         CHECK(contains(text, "\"severity\": \"error\""));
-        CHECK(contains(text, "wait on the fork-captured"));
+        CHECK(contains(text, "nonblocking assignment to a class property"));
     }
     SUBCASE("to stdout with -, instead of the text") {
         const Result r = s.run(std::format("lint --diag-json - \"{}\"", unused.string()));

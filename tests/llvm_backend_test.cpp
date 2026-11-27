@@ -52,9 +52,10 @@ std::vector<std::string> define_params(const std::string& ir, std::string_view n
     return out;
 }
 
-// Lower SystemVerilog text to a Module and emit LLVM IR as a string.
+// Lower SystemVerilog text to a Module and emit LLVM IR as a string. The emit
+// helpers lower the design as written: they inspect how a construct lowers.
 std::string emit(std::string_view source) {
-    const LowerResult result = lower_text(source);
+    const LowerResult result = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
@@ -67,7 +68,7 @@ std::string emit(std::string_view source) {
 // Emit with an explicit config (e.g. {.thunk = false} to force the coroutine
 // form for structural assertions on both lowerings).
 std::string emit(std::string_view source, ir::SimulationConfig config) {
-    const LowerResult result = lower_text(source);
+    const LowerResult result = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
@@ -81,7 +82,7 @@ std::string emit(std::string_view source, ir::SimulationConfig config) {
 // emission structure (block labels, typed GEPs), which the pipeline is free to
 // rewrite.
 std::string emit_raw(std::string_view source, ir::SimulationConfig config = { .lower_coro = false }) {
-    const LowerResult result = lower_text(source);
+    const LowerResult result = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
@@ -341,7 +342,7 @@ TEST_CASE("instance state structs replicate per instantiation as per-scope globa
         module leaf(input logic a, output logic [7:0] q);
             logic [7:0] cnt;
             always @(posedge a) cnt <= cnt + 8'd1;
-            assign q = cnt;
+            assign q = ~cnt;
         endmodule
         module top;
             logic clk;
@@ -2564,6 +2565,56 @@ TEST_CASE("the unseeded $random stream restarts at power-on for every design") {
     // Anchored to the seed-0 head of the reference stream, so this pins "restarts
     // at power-on" rather than the weaker "restarts somewhere consistent".
     CHECK(first == "303379748\n");
+}
+
+// A design that ends in `$finish` with processes parked on waits and reports still queued
+// leaves nothing for the next design in the process: no stale wake, strobe or deferred
+// report reaches it. Wait queues are state of the design's own JIT module, and the
+// runtime's observed, deferred and strobe queues and its string storage are returned to
+// power-on when a run ends (sim_teardown) and at the start of the next (rt_run_init).
+// Oracle: none needed, the second design's output is its own and nothing else.
+TEST_CASE("a design left mid-wait by $finish leaves no wake or report for the next design") {
+    const std::string left = R"(
+        module top;
+            event e;
+            int   x;
+            string s = "a";
+            function automatic bit is_b(); return s == "b"; endfunction
+            always @(e) $display("stale event");
+            initial begin
+                fork
+                    begin wait (x == 99); $display("stale wait"); end
+                    begin wait (is_b()); $display("stale method wait"); end
+                join_none
+                $strobe("stale strobe");
+                assert #0 (x == 1) else $error("stale deferred report");
+                $finish;
+            end
+        endmodule
+    )";
+    const std::string next = R"(
+        module top;
+            event e;
+            int   x;
+            string s = "a";
+            function automatic bit is_b(); return s == "b"; endfunction
+            always @(e) $display("event %0t", $time);
+            initial begin
+                fork
+                    begin wait (x == 1); $display("wait %0t", $time); end
+                    begin wait (is_b()); $display("method wait %0t", $time); end
+                join_none
+                #1 -> e;
+                #1 x = 1;
+                #1 s = "b";
+                #1 $display("done %0t", $time);
+            end
+        endmodule
+    )";
+    run_capture(left);
+    CHECK(run_capture(next) == "event 1\nwait 2\nmethod wait 3\ndone 4\n");
+    run_capture(left);
+    CHECK(run_capture_stderr(next).empty());
 }
 
 TEST_CASE("$random lowers to an rt_random call") {

@@ -431,7 +431,8 @@ uint32_t signal_width(const ir::Module& m, std::string_view name) {
 }
 
 // Two-level hierarchy: an inverter child wired into a top via one input and one
-// output port.
+// output port. The top inverts again rather than copying, so `w` is no copy
+// alias (docs/design/modular-compilation.md) and stays a signal of its own.
 constexpr std::string_view kHier = R"(
     module inv(input a, output y);
         assign y = ~a;
@@ -439,21 +440,21 @@ constexpr std::string_view kHier = R"(
     module top(input g, output o);
         wire w;
         inv u_inv(.a(g), .y(w));
-        assign o = w;
+        assign o = ~w;
     endmodule
 )";
 
 } // namespace
 
 TEST_CASE("instantiation flattens the child under a hierarchical prefix") {
-    const LowerResult r = lower_text(kHier);
+    const LowerResult r = lower_text(kHier, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Module& m = *r.module;
     CHECK(m.name == "top");
     // Top signals are unprefixed; the child's are under "u_inv.".
     CHECK(signal_names(m) == std::set<std::string>{ "g", "o", "w", "u_inv.a", "u_inv.y" });
-    // top assign (o=w) + child assign (y=~a) + 2 port-copy processes (.a in, .y out).
+    // top assign (o=~w) + child assign (y=~a) + 2 port-copy processes (.a in, .y out).
     CHECK(m.processes().size() == 4);
 }
 
@@ -483,7 +484,7 @@ TEST_CASE("lower_files compiles a design split across two files into one design"
         module top(input g, output o);
             wire w;
             inv u_inv(.a(g), .y(w));
-            assign o = w;
+            assign o = ~w;
         endmodule
     )");
 
@@ -494,7 +495,8 @@ TEST_CASE("lower_files compiles a design split across two files into one design"
     const LowerResult                     r = lower_files(paths);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(r.module->name == "top");
-    CHECK(signal_names(*r.module) == std::set<std::string>{ "g", "o", "w", "u_inv.a", "u_inv.y" });
+    // u_inv's ports are g's and w's storage (bound value ports).
+    CHECK(signal_names(*r.module) == std::set<std::string>{ "g", "o", "w" });
 }
 
 TEST_CASE("lower_files reports a missing file loudly") {
@@ -533,7 +535,7 @@ TEST_CASE("the same module instantiated twice gets distinct signal storage") {
             inv u0(.a(g), .y(o[0]));
             inv u1(.a(g), .y(o[1]));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
@@ -854,7 +856,7 @@ TEST_CASE("nested instances chain their hierarchical prefixes") {
         module top(input g, output o);
             mid u_mid(.mi(g), .mo(o));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
@@ -930,7 +932,7 @@ TEST_CASE("a #() override specializes each instance's width independently") {
             m #(.W(3)) u0(.o(a));
             m #(.W(8)) u1(.o(b));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "u0.o") == 3);
     CHECK(signal_width(*r.module, "u1.o") == 8);
@@ -991,7 +993,7 @@ TEST_CASE("a #() type override specializes each instance's width independently")
             m #(.T(logic [2:0])) u0(.o(a));
             m #(.T(logic [15:0])) u1(.o(b));
         endmodule
-    )");
+    )", nullptr, ir::SystemAccess::Off, false, /*as_written=*/true);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "u0.o") == 3);
     CHECK(signal_width(*r.module, "u1.o") == 16);

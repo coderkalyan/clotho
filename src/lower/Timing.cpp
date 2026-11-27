@@ -175,12 +175,6 @@ void Lowerer::collect_inferred_sensitivity(const Statement&            body,
         if (mode == SensitivityMode::Comb && c.written.contains(static_cast<uint32_t>(s))) {
             continue;
         }
-        if (is_string_ref(module_.signal(s).type)) {
-            // TODO: string signals in inferred (@*) sensitivity — string
-            // stores skip wait-queue servicing, so the process would
-            // never re-trigger.
-            fail("string in inferred combinational sensitivity is not supported");
-        }
         out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
     }
 }
@@ -273,6 +267,31 @@ void Lowerer::refuse_container_event_control(const SignalEventControl& ev) {
     fail("an event control on a container class property (queue / dynamic array / "
          "associative array) is not supported in a list with other events, nor as the "
          "control of a nonblocking assignment or trigger; alone in a procedural `@` it is");
+}
+
+// Whether the event expression `e` reads heap state: a property, a weak reference,
+// a fork-captured automatic, a method called on an object, or anything a subroutine
+// it calls reads from one. A lone property or weak reference counts, unlike in
+// event_expr_reads_heap, whose question is what a sampling wait has to sample: this
+// one is asked where nothing can sample at all (event_signal).
+bool Lowerer::event_expr_on_heap(const Expression& e) {
+    ClassPropReadScan props;
+    e.visit(props);
+    if (props.any_prop || !props.weak_gets.empty()) {
+        return true;
+    }
+    if (waited_props_ != nullptr && e.kind != ExpressionKind::NamedValue &&
+        e.kind != ExpressionKind::HierarchicalValue) {
+        const CalleeReads called = callee_reads(e, waited_props_->overrides);
+        if (called.method_call || !called.props.empty() || !called.builtins.empty()) {
+            return true;
+        }
+    }
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
+    WaitLocalScan                                                scan;
+    scan.out = &named;
+    e.visit(scan);
+    return std::ranges::any_of(named, [&](const ValueSymbol* vs) { return is_boxed_symbol(*vs); });
 }
 
 // An event control that cannot host a wait of its own: the intra-assignment `lhs <= @(...) rhs`
@@ -456,11 +475,12 @@ ir::Signal Lowerer::event_signal(const Expression& e) {
         // handle.
         fail("an event control on an expression through a virtual interface is not supported");
     }
-    if (is_string_expr(e)) {
-        // TODO: waiting on a string change (needs string-aware wait-queue
-        // servicing; string stores skip edge detection).
-        fail("string in an event control is not supported");
-    }
+    // A string variable is a signal whose stores wake its any-change bucket when
+    // the characters change (Backend::str_chg_after), so it takes the path of any
+    // named signal below. Any other string expression has no net to be put on (the
+    // one synthesized at the end of this function carries a vector) and is sampled
+    // by the process that waits, like one over heap state.
+    const bool named = e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue;
     if (e.kind == ExpressionKind::ArbitrarySymbol) {
         // `@(cb)`: waiting on a clocking block (LRM 14.15) waits on the event
         // the block triggers at its clocking event, NOT on the clock itself --
@@ -478,7 +498,25 @@ ir::Signal Lowerer::event_signal(const Expression& e) {
         // event of the block that declares it -- the same wait as `@(cb)` on it.
         return clocking_state(*gc).event;
     }
-    if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
+    // An event expression over heap state, or a string expression, has to be
+    // sampled by the process that waits on it (lower_sampled_event_wait), and what
+    // reaches here is one no process samples. The temp net at the end of this
+    // function would be driven by a continuous process that evaluates the handles
+    // when it is built, before anything has assigned them, and never runs again
+    // when the object changes: a wait that never wakes.
+    //
+    // TODO: such an expression in a list with a signal or a named event (the woken
+    // process cannot tell which member woke it, so it cannot tell that member's
+    // event from a wake that left its own sample unchanged), and as the control of
+    // `<= @(...)` or `->> @(...)` or as a clocking event of a clocking block or a
+    // covergroup, none of which is a process that could sample.
+    if ((!e.type->isEvent() && event_expr_on_heap(e)) || (is_string_expr(e) && !named)) {
+        fail("an event control on a method call, on an expression of class properties or on a "
+             "string expression is supported only as a procedural `@`, alone or beside others "
+             "of its kind: not in a list with a signal or a named event, and not as the control "
+             "of a nonblocking assignment, a nonblocking trigger or a clocking event");
+    }
+    if (named) {
         // Waiting on a hierarchical signal (`@(posedge top.dut.clk)`, LRM 23.6)
         // subscribes to the target instance's signal directly. A clockvar
         // (`@(posedge cb.sig)`, LRM 14.15) resolves the same way and lands on
@@ -1734,8 +1772,7 @@ const Lowerer::ClockingBlockState& Lowerer::clocking_state(const ClockingBlockSy
 
 // Everything a process waiting on `e` has to be woken by (LRM 9.4.2, 9.4.3).
 //
-// The signals `e` reads, each as an any-change (level) event; collect_expr_reads
-// fails loudly on a string one, which the wait queues do not serve.
+// The signals `e` reads, each as an any-change (level) event.
 //
 // A member read through a virtual interface is not one of those signals: the
 // collector sees the handle variable, not the member. They are gathered apart and
@@ -1770,7 +1807,9 @@ Lowerer::ExprWaitDeps Lowerer::expr_wait_deps(const Expression& e) {
         scan.out = &named;
         e.visit(scan);
         for (const ValueSymbol* vs : named) {
-            if (is_boxed_symbol(*vs)) {
+            // A captured `event` is waited on as an event property is, below: on the
+            // object it holds, which is what a trigger fires.
+            if (is_boxed_symbol(*vs) && !vs->getType().isEvent()) {
                 deps.boxed.push_back(vs);
             }
         }
@@ -1788,6 +1827,20 @@ Lowerer::ExprWaitDeps Lowerer::expr_wait_deps(const Expression& e) {
                 break;
             }
         }
+        struct BoxedEvents : slang::ast::ASTVisitor<BoxedEvents, slang::ast::VisitFlags::AllGood> {
+            const Lowerer*                                               self;
+            ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> seen;
+            std::vector<const Expression*>*                              out;
+            void handle(const slang::ast::NamedValueExpression& nv) {
+                if (nv.type->isEvent() && self->is_boxed_symbol(nv.symbol) && seen.insert(&nv.symbol).second) {
+                    out->push_back(&nv);
+                }
+            }
+        };
+        BoxedEvents events;
+        events.self = this;
+        events.out  = &deps.props.event_props;
+        e.visit(events);
     }
     add_callee_wait_events(e, deps.reads);
     deps.unwakeable = deps.reads.empty() && deps.vif_reads.empty() && deps.props.notifiable.empty() &&
@@ -1822,9 +1875,13 @@ void Lowerer::add_callee_wait_events(const Expression& e, std::vector<ir::WaitEv
         add(entry->signal);
     };
     for (const slang::ast::ClassPropertySymbol* prop : called.props) {
-        // As the pre-pass: a property of a type that has no notifier has no
-        // design-wide one (WaitPropScan::note_callees).
-        if (prop_can_notify(prop->getType())) {
+        // As the pre-pass (WaitPropScan::note_callees): an `event` property has its
+        // own notifier and the one every trigger fires, and a property of a type
+        // that has no notifier has no design-wide one.
+        if (prop->getType().getCanonicalType().isEvent()) {
+            shared(*prop);
+            shared(prop->getParentScope()->getCompilation().getRoot());
+        } else if (prop_can_notify(prop->getType())) {
             shared(*prop);
         }
     }
@@ -1837,11 +1894,7 @@ void Lowerer::add_callee_wait_events(const Expression& e, std::vector<ir::WaitEv
         signals.record_read(*vs);
     }
     for (const ir::Signal sig : signals.reads) {
-        // A string signal has no wait queue to park on (collect_expr_reads
-        // refuses one the expression itself reads).
-        if (!is_string_ref(module_.signal(sig).type)) {
-            add(sig);
-        }
+        add(sig);
     }
 }
 
@@ -1884,7 +1937,7 @@ void Lowerer::push_wait_edges(const ExprWaitDeps&        deps,
     for (const ValueSymbol* vs : deps.boxed) {
         // Park on the box's notifier event, dereferencing the box handle AT
         // THIS POINT in the body: a fresh iteration of an enclosing loop can
-        // re-box (install_fork_decl_box allocates per entry), so the handle
+        // re-box (emit_decl_box allocates per entry), so the handle
         // is re-read on every pass, like a vif handle above.
         edges.push_back(
           ir::WaitEdge{ ir::Signal{ 0 }, static_cast<uint32_t>(ir::Edge::Any), boxed_notifier_handle(*vs, b, l) });
@@ -1936,6 +1989,12 @@ void Lowerer::declare_shared_notifiers(const RootSymbol& root) {
         info.shared_notify   = next;
         const ir::Signal sig = register_signal(std::move(info));
         shared_notifiers_->of.emplace(sym, SharedNotifiers::Entry{ .index = next, .signal = sig });
+        if (sym->kind == SymbolKind::Root) {
+            // The notifier every event trigger fires (WaitPropScan::note_callees),
+            // hung on the event type for the backend to find: no store has a field
+            // of that type to select, so nothing else can resolve it.
+            module_.set_change_notify_shared(module_.pool.event_type, 0, next, /*container=*/false);
+        }
         ++next;
     }
 }
@@ -1951,20 +2010,28 @@ void Lowerer::declare_shared_notifiers(const RootSymbol& root) {
 // is reached through: it has a source of its own that fires on exactly the change the
 // control names (push_prop_wait_events, weak_get_call, collect_wait_events), and
 // classify_event_control brings it into a list that is.
+//
+// A string that is not a variable of its own (`{s, "/"}`, `names[i]`, `f()`) is
+// sampled as well: a net carries a vector, and a string variable's own any-change
+// bucket serves only the variable.
 bool Lowerer::event_expr_sampled(const Expression& e) {
     if (e.type->isEvent() || lone_member_term(e)) {
         return false;
     }
     static const MethodOverrides no_overrides;
-    bool heap = event_expr_reads_heap(e, waited_props_ != nullptr ? waited_props_->overrides : no_overrides);
-    if (!heap) {
-        ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
-        WaitLocalScan                                                scan;
-        scan.out = &named;
-        e.visit(scan);
-        heap = std::ranges::any_of(named, [&](const ValueSymbol* vs) { return is_boxed_symbol(*vs); });
+    const bool named  = e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue;
+    bool       sample = is_string_expr(e) && !named;
+    if (!sample) {
+        sample = event_expr_reads_heap(e, waited_props_ != nullptr ? waited_props_->overrides : no_overrides);
     }
-    if (!heap) {
+    if (!sample) {
+        ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named_syms;
+        WaitLocalScan                                                scan;
+        scan.out = &named_syms;
+        e.visit(scan);
+        sample = std::ranges::any_of(named_syms, [&](const ValueSymbol* vs) { return is_boxed_symbol(*vs); });
+    }
+    if (!sample) {
         return false;
     }
     const ExprWaitDeps deps = expr_wait_deps(e);
@@ -2231,22 +2298,20 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
     const ir::SourceLoc l = loc(w);
     const ExprWaitDeps  deps = expr_wait_deps(w.cond);
     if (deps.unnotified_box != nullptr) {
-        // TODO: an unpacked struct, union or fixed unpacked array, which a class
-        // property can now carry a notifier for and a capture box cannot, plus
-        // `event`, whose `.triggered` a capture box cannot notify on yet.
+        // TODO: a covergroup handle, the one type a capture box holds that has no
+        // change notifier. A captured event is waited on through its own object.
         fail("wait on the fork-captured automatic '" + std::string(deps.unnotified_box->name) + "' of type " +
              deps.unnotified_box->getType().toString() +
              " is not supported: a capture box of this type has no change notifier");
     }
     if (deps.unwakeable) {
-        // The condition reads a class property that can carry no notifier -- a covergroup
-        // handle -- and nothing else that can wake this process. Lowering it anyway is what used to
-        // happen, and it produced a suspend with an EMPTY event list: a permanent park
-        // with no diagnostic, in a design whose author had every reason to expect
-        // a working wait. `wait(0)` still parks silently, because that one reads
-        // nothing at all and is the documented LRM 9.4.3 behaviour.
-        fail("wait on a class property of a type with no change notifier is not "
-             "supported (a covergroup handle property cannot be waited on)");
+        // The condition reads a class property of a type with no notifier and nothing else
+        // that can wake this process: a suspend with an EMPTY event list, a permanent park
+        // with no diagnostic. Every property type carries a notifier (prop_can_notify), so
+        // this is a disagreement between the pre-pass and the lowering, not a user error.
+        // `wait(0)` still parks silently, because that one reads nothing at all and is
+        // the documented LRM 9.4.3 behaviour.
+        fail("internal: wait on a class property of a type with no change notifier");
     }
 
     const auto park = [&] {

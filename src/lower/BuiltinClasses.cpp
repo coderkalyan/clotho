@@ -35,6 +35,11 @@ ir::Ref Lowerer::lower_process_class(const slang::ast::ClassType& clt) {
     std::vector<ir::FieldRow> fields;
     fields.push_back({ kProcessCtlField, make_int_type(64, false), 0 });
     module_.pool.set_struct_fields(fid, std::move(fields));
+    // The design-wide notifier of `status()`, when some `@` or `wait` reads one. It
+    // hangs on the control-block field so the backend can find it; nothing stores
+    // to that field, and the backend fires it where a thread's state changes
+    // (Backend::emit_proc_status_notify).
+    register_shared_notifier(clt, ref, 0, /*container=*/false);
     class_rand_.emplace(&clt, ClassRand{});
     compute_vtable(clt, ref);
     if (class_depth_ == 1) {

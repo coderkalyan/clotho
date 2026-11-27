@@ -1262,6 +1262,16 @@ ir::Index Lowerer::lower_cast(const CallExpression& call, ir::Builder& b, bool t
     }
     const ir::Index conv = coerce(lower_expr(src_expr, b), *src_expr.type, dest_ty, b, l);
     const ir::Ref   bit1 = make_int_type(1, false);
+    // Assign the value on success; keep the current dest on failure. The task form
+    // reports a failure; the function form answers 0.
+    const auto assign_if_valid = [&](ir::Index valid) {
+        const ir::Index cur = b.unary(ir::Inst::Tag::Load, dst, l);
+        b.binary(ir::Inst::Tag::Store, dst, b.select(valid, conv, cur, l), l);
+        if (task_form) {
+            emit_cast_fatal_unless(valid, call, b, l);
+        }
+        return b.select(valid, int1, int0, l);
+    };
     if (const auto* et = dt.as_if<slang::ast::EnumType>()) {
         // Enum destination (LRM 6.19.3): succeed only if the value is a legal
         // member. valid = OR over members of (conv === member).
@@ -1272,17 +1282,107 @@ ir::Index Lowerer::lower_cast(const CallExpression& call, ir::Builder& b, bool t
             const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, conv, mc, l);
             valid              = b.select(eq, one, valid, l);
         }
-        // Assign the value on success; keep the current dest on failure.
-        const ir::Index cur = b.unary(ir::Inst::Tag::Load, dst, l);
-        b.binary(ir::Inst::Tag::Store, dst, b.select(valid, conv, cur, l), l);
-        if (task_form) {
-            emit_cast_fatal_unless(valid, call, b, l);
-        }
-        return b.select(valid, int1, int0, l);
+        return assign_if_valid(valid);
+    }
+    if (packed_has_tagged_union(dt)) {
+        // NOTE: a bit pattern is a packed tagged union only if its tag names a member
+        // (docs/LRM_NOTES.md, note 76), so a source that does not is not assignment
+        // compatible with the destination (LRM 6.24.2) and the cast fails.
+        return assign_if_valid(packed_tags_valid(conv, dt, b, l));
     }
     // Numeric destination: a value cast always succeeds (LRM 6.24.2).
     b.binary(ir::Inst::Tag::Store, dst, conv, l);
     return int1;
+}
+
+// Whether the packed type `ct` is or contains a packed tagged union (through packed
+// struct fields, packed union members and packed array elements).
+bool Lowerer::packed_has_tagged_union(const slang::ast::Type& ct) {
+    const slang::ast::Type& t = ct.getCanonicalType();
+    if (t.isTaggedUnion()) {
+        return t.isPackedUnion();
+    }
+    if (const auto* ps = t.as_if<slang::ast::PackedStructType>()) {
+        return std::ranges::any_of(ps->membersOfType<FieldSymbol>(),
+                                   [&](const FieldSymbol& f) { return packed_has_tagged_union(f.getType()); });
+    }
+    if (const auto* pu = t.as_if<slang::ast::PackedUnionType>()) {
+        return std::ranges::any_of(pu->membersOfType<FieldSymbol>(),
+                                   [&](const FieldSymbol& f) { return packed_has_tagged_union(f.getType()); });
+    }
+    if (const auto* pa = t.as_if<slang::ast::PackedArrayType>()) {
+        return packed_has_tagged_union(pa->elementType);
+    }
+    return false;
+}
+
+// 1-bit predicate: every packed tagged union inside the flat value `v` of type `ct` has a tag
+// that names a member, and so does each union nested in the member that tag selects. A
+// member the tag does not select holds no value, so what its bits say is not checked. An x
+// or z tag bit names no member.
+ir::Index Lowerer::packed_tags_valid(ir::Index v, const slang::ast::Type& ct, ir::Builder& b, ir::SourceLoc l) {
+    using T                    = ir::Inst::Tag;
+    const slang::ast::Type& t  = ct.getCanonicalType();
+    const ir::Index         yes = true_const(b, l);
+    if (!packed_has_tagged_union(t)) {
+        return yes;
+    }
+    const ir::Ref   vty = lower_type(t);
+    const auto      lay = module_.pool.layout(vty);
+    const bool      four = lay.domain == ir::Domain::Four;
+    // The bits of a sub-value at `lsb`, as a flat value of type `st`.
+    const auto sub = [&](uint32_t lsb, const slang::ast::Type& st) {
+        const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), lsb), l);
+        return b.convert(b.binary(T::Srl, v, sh, l), lower_type(st), st.isSigned(), l);
+    };
+    if (t.isTaggedUnion()) {
+        const uint32_t tag_bits = union_tag_bits(t);
+        const auto&    pu       = t.as<slang::ast::PackedUnionType>();
+        ir::Index      tagv{};
+        const ir::Ref  tt       = make_int_type(tag_bits == 0 ? 1 : tag_bits, four);
+        if (tag_bits != 0) {
+            const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false), lay.width - tag_bits), l);
+            tagv               = b.convert(b.binary(T::Srl, v, sh, l), tt, false, l);
+        }
+        ir::Index in_range = b.constant(module_.pool.put_int(make_int_type(1, false), 0), l);
+        ir::Index nested   = yes;
+        for (const FieldSymbol& f : pu.membersOfType<FieldSymbol>()) {
+            ir::Index is_member = yes;
+            if (tag_bits != 0) {
+                const ir::Index idx = b.constant(module_.pool.put_int(tt, f.fieldIndex), l);
+                is_member           = b.binary(T::CaseEq, tagv, idx, l);
+            }
+            in_range = b.binary(T::Lor, in_range, is_member, l);
+            if (packed_has_tagged_union(f.getType())) {
+                const ir::Index inner = packed_tags_valid(sub(0, f.getType()), f.getType(), b, l);
+                nested = b.binary(T::Land, nested, b.binary(T::Lor, b.unary(T::Lnot, is_member, l), inner, l), l);
+            }
+        }
+
+        return b.binary(T::Land, in_range, nested, l);
+    }
+    ir::Index acc = yes;
+    if (const auto* ps = t.as_if<slang::ast::PackedStructType>()) {
+        for (const FieldSymbol& f : ps->membersOfType<FieldSymbol>()) {
+            if (packed_has_tagged_union(f.getType())) {
+                acc = b.binary(T::Land, acc, packed_tags_valid(sub(static_cast<uint32_t>(f.bitOffset), f.getType()), f.getType(), b, l), l);
+            }
+        }
+    } else if (const auto* pu = t.as_if<slang::ast::PackedUnionType>()) {
+        for (const FieldSymbol& f : pu->membersOfType<FieldSymbol>()) {
+            if (packed_has_tagged_union(f.getType())) {
+                acc = b.binary(T::Land, acc, packed_tags_valid(sub(0, f.getType()), f.getType(), b, l), l);
+            }
+        }
+    } else {
+        const auto&    pa = t.as<slang::ast::PackedArrayType>();
+        const uint32_t ew = static_cast<uint32_t>(pa.elementType.getBitWidth());
+        const uint32_t n  = static_cast<uint32_t>(pa.range.width());
+        for (uint32_t k = 0; k < n; ++k) {
+            acc = b.binary(T::Land, acc, packed_tags_valid(sub(k * ew, pa.elementType), pa.elementType, b, l), l);
+        }
+    }
+    return acc;
 }
 
 // Lower a system function call used as an rvalue (e.g. `$time`). User function

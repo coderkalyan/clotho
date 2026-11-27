@@ -435,7 +435,8 @@ RUNNING/WAITING for the whole run, which is correct: only `kill`, `disable`, or
 | WAITING → RUNNING | the resume block of the same suspend |
 | → FINISHED / KILLED | the completion sequence (§5.3) |
 | → SUSPENDED | `suspend()` |
-| SUSPENDED → RUNNING | `resume()` |
+| SUSPENDED → WAITING | `resume()` of a thread still blocked on its source |
+| SUSPENDED → RUNNING | `resume()` of a thread whose wake arrived while it was suspended, or that suspended itself |
 
 Two stores per park, in a gated design only. `status()` is `load ctl` masked to
 three bits; `.name()` on the result goes through the existing enum-name path
@@ -447,6 +448,32 @@ The LRM has no READY state, so a thread that is queued on a ring but not yet
 resumed reads **RUNNING** ("not in a blocking statement"). Recorded as an
 LRM-ambiguity decision; it is also unobservable before the thread's first run,
 since nothing else can hold its handle yet.
+
+### 6.1a Waiting on a status
+
+`wait (p.status() == process::FINISHED)` and `@(p.status())`, and either through a
+method that reads a status, depend on state no store of the design changes: a
+thread's own parks and its end change it. They are served by one design-wide
+notifier (`docs/design/classes.md`, "Waiting through a method"), hung on the
+control-block field of the process class by `lower_process_class` when some `@` or
+`wait` reads a status, and fired by generated code where a state changes
+(`emit_proc_status_notify`): at completion, in `suspend()` and `resume()`, and at
+a park. A killed thread is KILLED from the moment `kill` marks it, and unwinds to
+its completion in the same time step, before any waiter runs, so the completion
+announces that too. A waiter re-evaluates its own expression, so the change of a
+thread it did not ask about costs it one re-test. A thread with no `process`
+object has no status anybody can read and fires nothing.
+A design with no such wait emits none of it.
+
+**Which parks.** Not every one. Two threads that each wait on the other's status
+each block, and if every block woke the other they would wake each other for ever.
+A park is a change only if another thread could have read RUNNING off this thread
+since it last blocked, and between two parks nothing else runs: a thread that was
+blocked, ran and blocks again was WAITING every time anyone looked. That leaves the
+first park after creation and the first after a `resume()` that scheduled the
+thread. One flag in the status word records it (`RT_PROC_SEEN_WAIT`): set by the
+park that fires and by a `resume()` that leaves the thread blocked, cleared by a
+`resume()` that schedules it.
 
 ### 6.2 The poll
 
@@ -1056,8 +1083,12 @@ keeps naming the same object while a handle exists.
 
 - A thread queued on a ring but not yet resumed reads **RUNNING**; the LRM has no
   READY state (§6.1).
-- `resume()` on a process that is not SUSPENDED is a **no-op**; the LRM does not
-  say.
+- `resume()` on a process that is not SUSPENDED is a **no-op** (9.7: "shall have no
+  effect").
+- **A thread resumed while it is still blocked reads WAITING**, not RUNNING. 9.7:
+  resume "shall resensitize the process to the event expression or to wait for the
+  wait condition to become true or for the delay to expire", and WAITING is "waiting
+  in a blocking statement". It read RUNNING until its source fired.
 - `set_randstate` with a string not produced by `get_randstate` is a **located
   fatal**; the LRM makes it undefined and clotho never silently accepts.
 - A killed thread's already-armed nonblocking assignments and intra-assignment

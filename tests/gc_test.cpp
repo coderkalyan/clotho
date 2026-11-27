@@ -3163,9 +3163,10 @@ TEST_CASE("gc: a handle stored through a ref into a property of a promoted objec
     CHECK(yg.remembered > 0u);
 }
 
-// An OUTPUT formal of struct type is copied out by the callee through the pointer to the
-// actual, which is a property of a promoted object. The callee is a task, so a collection
-// runs between the call and the copy-out.
+// An OUTPUT formal of struct type bound to a property of a promoted object. The callee
+// copies its formal out to a temporary of the caller, and the caller assigns the temporary
+// to the property when the task returns, after the collections that ran while the task was
+// suspended: the store that puts the fresh object in the old one is the caller's.
 TEST_CASE("gc: a struct copied out through an output formal into a promoted object after a suspend survives") {
     constexpr std::string_view src      = R"(
         module m;
@@ -3215,6 +3216,62 @@ TEST_CASE("gc: a struct copied out through an output formal into a promoted obje
     CHECK(yg.young_collections > 0u);
     CHECK(yg.promoted > 0u);
     CHECK(yg.remembered > 0u);
+}
+
+// The same, with the actual an element of a queue the promoted object owns: a place with no
+// address a callee could be handed, since the queue is resized while the task is suspended.
+TEST_CASE("gc: a struct copied out through an output formal into a promoted object's queue element survives") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            typedef struct { Cell c; int n; } pair_t;
+            class Box; string name; pair_t q[$]; endclass
+            Box  box;
+            Junk sink;
+            function automatic void install();
+                pair_t none;
+                box      = new;
+                box.name = "long-lived-box";
+                box.q.push_back(none);
+            endfunction
+            task automatic make(output pair_t r, input int v);
+                Cell f;
+                #20;
+                f        = new;
+                f.v      = v;
+                f.tag    = "copied-out";
+                r.c      = f;
+                r.n      = v;
+                f        = null;
+            endtask
+            initial begin
+                pair_t none;
+                for (int i = 0; i < 80; i++) begin
+                    #1;
+                    if (i >= 20 && i < 40) box.q.push_back(none);
+                    for (int k = 0; k < 128; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            end
+            initial begin
+                install();
+                #20;
+                make(box.q[0], 777);
+                #20;
+                $display("%0d %0d %0d %s", box.q.size(), box.q[0].n, box.q[0].c.v, box.q[0].c.tag);
+            end
+        endmodule
+    )";
+    const std::string          expected = "21 777 777 copied-out\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
 }
 
 // `Holder` is allocated, and its property initializer allocates a `Leaf` before the store
@@ -5919,6 +5976,198 @@ TEST_CASE("gc: a young collection reads no state slot nothing stored to") {
     CHECK(yg.state_slots_read <= 4u * (RT_GC_CARD_BYTES / 8u));
     const rt_gc_stats full = run_stats(src, "12000\n", cadence_ordinary, nursery_bytes_small, 1);
     CHECK(full.state_slots_read >= 20000u);
+}
+
+// A queue of handles copied out through an output formal into an element of a queue
+// that a promoted object owns, after the task was suspended across young
+// collections. The copy-out is an assignment the caller makes when the task
+// returns, with the barrier of any store into the object's container; the callee
+// used to write through the element's address, which names no owner to log.
+TEST_CASE("gc: a queue copied out through an output formal into a promoted object's container survives") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Cell; int v; string tag; endclass
+            class Junk; int v; string tag; endclass
+            class Box;  string name; Cell qq[$][$]; endclass
+            Box  box;
+            Junk sink;
+            function automatic void install();
+                Cell none[$];
+                box      = new;
+                box.name = "long-lived-box";
+                box.qq.push_back(none);
+            endfunction
+            task automatic make(output Cell r[$], input int v);
+                Cell f;
+                #20;
+                f     = new;
+                f.v   = v;
+                f.tag = "copied-out";
+                r.push_back(f);
+                f     = null;
+            endtask
+            initial begin
+                for (int i = 0; i < 80; i++) begin
+                    #1;
+                    for (int k = 0; k < 128; k++) begin
+                        sink = new;
+                        sink.v   = 32'h5A5A5A5A;
+                        sink.tag = "junk";
+                    end
+                end
+            end
+            initial begin
+                install();
+                #20;
+                make(box.qq[0], 777);
+                #20;
+                $display("%0d %0d %s", box.qq[0].size(), box.qq[0][0].v, box.qq[0][0].tag);
+            end
+        endmodule
+    )";
+    const std::string          expected = "1 777 copied-out\n";
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.promoted > 0u);
+}
+
+// -- 10. Containers of design state are walked by the ones mutated (docs/design/garbage-collection.md §7) --
+//
+// A young collection walks the containers of design state that a mutation logged since the last collection
+// and no others. Each case puts one young object into a container by the writer under test, after the first
+// (full) collection and with young collections only, and holds it by that container alone while junk is
+// allocated over whatever is freed. Where an operation must log by itself, a pause before it lets a
+// collection clear whatever an earlier operation logged; where it copies from another container, nothing
+// pauses between, so the copy is not of an object a collection has already made old.
+
+namespace {
+
+void check_container_store(const std::string& src, const std::string& expected) {
+    check_cadences(src, expected);
+    const rt_gc_stats yg = run_stats(src, expected, cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 0u);
+    CHECK(yg.state_containers_logged > 0u);
+}
+
+constexpr std::string_view make_cell = "Cell c; c = new; c.v = 4242; c.tag = \"stored\"; ";
+
+} // namespace
+
+TEST_CASE("gc: a young object pushed onto a state queue survives young collections") {
+    check_container_store(
+      state_store_design("Cell q[$];",
+                         std::string("begin ") + std::string(make_cell) + "q.push_back(c); c = null; end",
+                         "$display(\"%0d %s\", q[0].v, q[0].tag);"),
+      "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object stored into an element of a state queue survives") {
+    check_container_store(state_store_design("Cell q[$];",
+                                             std::string("q.push_back(null); q.push_back(null); #10; begin ") +
+                                               std::string(make_cell) + "q[1] = c; c = null; end",
+                                             "$display(\"%0d %s %0d\", q[1].v, q[1].tag, q[0] == null);"),
+                          "4242 stored 1\n");
+}
+
+TEST_CASE("gc: a state queue assigned a queue of young objects survives") {
+    check_container_store(state_store_design("Cell q[$]; Cell src[$];",
+                                             std::string("begin ") + std::string(make_cell) +
+                                               "src.push_back(c); c = null; q = src; src.delete(); end",
+                                             "$display(\"%0d %s\", q[0].v, q[0].tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a state dynamic array made by new[n](old) from young objects survives") {
+    check_container_store(state_store_design("Cell d[]; Cell s[];",
+                                             std::string("begin ") + std::string(make_cell) +
+                                               "s = new[1]; s[0] = c; c = null; d = new[1](s); s.delete(); end",
+                                             "$display(\"%0d %s\", d[0].v, d[0].tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object inserted into a state associative array as a value survives") {
+    check_container_store(state_store_design("Cell a[int];",
+                                             std::string("begin ") + std::string(make_cell) + "a[7] = c; c = null; end",
+                                             "$display(\"%0d %s\", a[7].v, a[7].tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object inserted into a state associative array as a key survives") {
+    check_container_store(state_store_design("int k[Cell];",
+                                             std::string("begin ") + std::string(make_cell) + "k[c] = 1; c = null; end",
+                                             "foreach (k[x]) $display(\"%0d %s\", x.v, x.tag);"),
+                          "4242 stored\n");
+}
+
+TEST_CASE("gc: a young object pushed onto a queue nested in a state queue survives") {
+    check_container_store(state_store_design("Cell qq[$][$]; Cell row[$];",
+                                             std::string("qq.push_back(row); #10; begin ") + std::string(make_cell) +
+                                               "qq[0].push_back(c); c = null; end",
+                                             "$display(\"%0d %s\", qq[0][0].v, qq[0][0].tag);"),
+                          "4242 stored\n");
+}
+
+// What the flags are for: a young collection walks the containers mutated and not the others. A queue of
+// twenty thousand objects that nothing mutates again sits beside the slot a churn stores to, in the same
+// card, and no collection after the first walks it.
+TEST_CASE("gc: a young collection walks no state container nothing mutated") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Cell; int v; endclass
+            Cell q[$];
+            Cell keep;
+            int  n;
+            initial begin
+                repeat (20000) begin keep = new; q.push_back(keep); end
+                repeat (60) begin
+                    repeat (200) begin keep = new; keep.v = n; n++; end
+                    #1;
+                end
+                $display("%0d %0d", q.size(), n);
+            end
+        endmodule
+    )";
+    const rt_gc_stats yg = run_stats(src, "20000 12000\n", cadence_ordinary, nursery_bytes_small, full_every_never);
+    CHECK(yg.full_collections == 1u);
+    CHECK(yg.young_collections > 1u);
+    CHECK(yg.state_containers_read == 0u);
+    const rt_gc_stats full = run_stats(src, "20000 12000\n", cadence_ordinary, nursery_bytes_small, 1);
+    CHECK(full.state_containers_read == 1u);
+}
+
+// An event made by the initializer of a class body is stored into the body after it was made. The
+// allocation can collect with the body held only by the code making it, which promotes the body, and
+// the store then lands in an old object nothing logged: the event must be logged by the initializer.
+// Collecting at every allocation is what reaches it; the event is waited on and triggered after a churn.
+TEST_CASE("gc: an event made by a class body's initializer survives in a body a collection promoted") {
+    constexpr std::string_view src      = R"(
+        module m;
+            class Holder; event ev; int v; endclass
+            class Junk; int v; string tag; endclass
+            Holder h;
+            Junk   sink;
+            int    hits;
+            initial begin
+                h   = new;
+                h.v = 7;
+                for (int i = 0; i < 400; i++) begin
+                    sink     = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+                fork begin @(h.ev); hits++; end join_none
+                #1;
+                -> h.ev;
+                #1;
+                $display("%0d %0d", hits, h.v);
+            end
+        endmodule
+    )";
+    const std::string          expected = "1 7\n";
+    check_cadences(src, expected);
+    CHECK(run_capture(src, gc_cfg(cadence_stress, nursery_bytes_small, full_every_never)) == expected);
 }
 
 // -- Frames that ran ----------------------------------------------------------------------

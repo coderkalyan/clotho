@@ -380,14 +380,16 @@ void Backend::taint(const char* why) {
 // (declarations that name one signal in one instance are one binding), and the
 // owner definition and def-local position of the signal it names, whose layout
 // the code addresses the owner's record and wake buckets by. Bindings that name
-// the same member of the same owner (a child's port) agree in every instance; a
-// port the parent binds to a net of its own choosing (an inout, a driver slot)
-// does not. An event port is keyed by its declaration alone: the code reads the
-// event's object from the handle in its storage and addresses nothing of the
-// owner's record or buckets, so instances bound to different events of their
-// parents still share. A function binding is keyed by which declaration stands
-// for it alone: the code passes the record the binding holds and names the
-// function it calls, which the callers' keys carry (group_key, subroutine_key).
+// the same member of the same owner (a child's port) agree in every instance. A
+// port's storage (uniform: a bound value port, an inout) has one shape and one
+// port layout whatever signal it is, so it is keyed by its declaration alone and
+// every instance of a unit shares the code whichever signals its parent binds. An
+// event port is keyed by its declaration alone too: the code reads the event's
+// object from the handle in its storage and addresses nothing of the owner's
+// record or buckets, so instances bound to different events of their parents
+// still share. A function binding is keyed by which declaration stands for it
+// alone: the code passes the record the binding holds and names the function it
+// calls, which the callers' keys carry (group_key, subroutine_key).
 std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
     const Anchor&         a = anchors_[anchor];
     std::vector<uint64_t> key;
@@ -396,6 +398,10 @@ std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
         const SignalSlot& s = slot_of(a.externs[k]);
         key.push_back(a.bind_of.at(static_cast<uint32_t>(a.externs[k])));
         if (mod_.signal(a.externs[k]).is_event) {
+            continue;
+        }
+        if (uniform(a.externs[k])) {
+            key.push_back(~uint64_t{ 1 });
             continue;
         }
         key.push_back(s.anchor == SignalSlot::no_anchor

@@ -134,12 +134,15 @@ void rt_gc_note_ref_store(void* slot, const struct rt_ref_witness* chain, uint64
 // The write barrier of design state (docs/design/garbage-collection.md §7). A store of a
 // class handle into a state region -- or a mutation of a state-resident container, which
 // stores one into its payload -- has to be logged, because a young collection reads only
-// the cards logged since the last collection: a card is RT_GC_CARD_BYTES of a region, one
-// byte of dirty flag in the region itself. `addr` is the first byte stored to and `bytes`
-// how many; every card they touch is logged. Generated code tests the card byte inline
-// and calls this only when it is clear, so a hot slot costs the call once per collection
-// cycle. An address in no registered region is ignored: the runtime's callers need not
-// know whether a place is state.
+// what was logged since the last collection. `addr` is the first byte stored to and `bytes`
+// how many. Every card they touch is logged (a card is RT_GC_CARD_BYTES of a region, one
+// byte of dirty flag in the region itself), and so is every state-resident container whose
+// handle they touch (rt_gc_container): `addr` is a word of the container's handle, or of an
+// aggregate that holds one. Generated code tests the card byte, or for a container the flag
+// byte of the word, inline and calls this only when it is clear, so a hot slot or container
+// costs the call once per collection cycle; a store of more than a word is one call. An
+// address in no registered region is ignored: the runtime's callers need not know whether a
+// place is state.
 void rt_gc_note_state_store(void* addr, uint64_t bytes);
 
 // -- Per-class trace map ------------------------------------------------------
@@ -202,9 +205,9 @@ typedef struct rt_gc_map {
 //
 // One constant per storage region (the design state buffer, each per-instance
 // state buffer; a static class property is a slot of one of them): the class-handle
-// slots inside it, by ascending byte offset. Emitted by the backend and registered once
-// at startup, so the table's lifetime is the JIT'd module's and the runtime only
-// borrows it.
+// slots inside it, by ascending byte offset, and the handle-bearing containers inside it
+// (rt_gc_container). Emitted by the backend and registered once at startup, so the table's
+// lifetime is the JIT'd module's and the runtime only borrows it.
 //
 // A region ends in its CARD BYTES: one byte for each RT_GC_CARD_BYTES of the region before
 // them, `cards` bytes in from `base`, clear until a store to that stretch is logged
@@ -212,18 +215,32 @@ typedef struct rt_gc_map {
 // code finds the byte of a place from the place alone -- region offset >> RT_GC_CARD_SHIFT
 // -- so nothing instance-specific is in code shared by the instances of one unit.
 //
-// A young collection reads the slots of the logged cards and no others. A full
-// collection reads every slot of every table.
+// A region that holds a container ends in its FLAG BYTES too, `flags` bytes in from `base`
+// and after the card bytes: one for each RT_GC_CFLAG_BYTES of every signal that holds a
+// container, found by the same arithmetic from the signal's storage. A container's flag
+// bytes are clear until a mutation of it is logged, all set together, and clear again after
+// the collection that walked it. A flag and not the card, because one card holds many
+// containers and the slots beside them, and what a logged container costs is its whole
+// payload: a queue of a million handles must not be walked because a handle slot a few bytes
+// away was stored to.
+//
+// A young collection reads the slots of the logged cards and walks the logged containers,
+// and no others. A full collection reads every slot and walks every container of every table.
 #define RT_GC_CARD_SHIFT 9u
 #define RT_GC_CARD_BYTES (1u << RT_GC_CARD_SHIFT)
+#define RT_GC_CFLAG_SHIFT 3u
+#define RT_GC_CFLAG_BYTES (1u << RT_GC_CFLAG_SHIFT)
 
 typedef struct rt_gc_roots {
     void*           base;
     uint32_t        nhandles;
-    uint32_t        bytes; // the region's size, card bytes included
+    uint32_t                      bytes; // the region's size, card and flag bytes included
     const uint32_t* offsets;
     uint32_t        cards; // offset of the card bytes in the region
+    uint32_t                      flags; // offset of the container flag bytes in the region
+    uint32_t                      ncontainers;
     uint32_t        reserved;
+    const struct rt_gc_container* containers; // ascending by offset
 } rt_gc_roots;
 
 // -- Coroutine frame registry -------------------------------------------------
@@ -456,24 +473,16 @@ void rt_gc_nba_container_add(uint32_t idx, uint32_t stride, uint32_t offset, uin
 //                                rt_gc_map leaves, so a container inside a dead
 //                                object keeps nothing alive.
 
-// One state-resident container: byte offset within the table's base region, its
-// element kind (rt_elem_dynarr / rt_elem_queue / rt_elem_assoc) and its element
-// descriptor.
+// One state-resident container: byte offset of its handle within its table's region, its
+// element kind (rt_elem_dynarr / rt_elem_queue / rt_elem_assoc), the index of the flag byte
+// of the handle's first word (one byte for each word follows it) and its element
+// descriptor. Entries do not overlap.
 typedef struct rt_gc_container {
     uint64_t           offset;
     uint32_t           kind;
-    uint32_t           reserved;
+    uint32_t                  flag;
     const struct rt_elem_ops* ops;
 } rt_gc_container;
-
-typedef struct rt_gc_container_table {
-    void*                    base;
-    uint32_t                 count;
-    uint32_t                 reserved;
-    const rt_gc_container* entries;
-} rt_gc_container_table;
-
-void rt_gc_containers_add(const rt_gc_container_table* table);
 
 // A dynamically-scoped handle-bearing container: a frame local, or an element of
 // one. `handle` is the rt_dynarr / rt_queue / rt_assoc itself.
@@ -602,11 +611,16 @@ typedef struct rt_gc_stats {
     // Cards the barrier has logged over the run, which is what tells a test the barrier fired at
     // all rather than a young collection having found the slot some other way.
     uint64_t state_cards_logged;
+    // The same pair for the containers of design state: the ones the last collection walked as
+    // roots, which a test asserts does not grow with the containers nothing mutated, and the
+    // ones the barrier has logged over the run.
+    uint64_t state_containers_read;
+    uint64_t state_containers_logged;
 } rt_gc_stats;
 
-// How many logged cards a collection cycle holds before the next collection reads every slot of
-// design state instead (restored by rt_gc_init). For the tests of that fallback, which could not
-// reach the real bound with a design of a reasonable size.
+// How many logged cards, and how many logged containers, a collection cycle holds before the
+// next collection reads all of design state instead (restored by rt_gc_init). For the tests of
+// that fallback, which could not reach the real bound with a design of a reasonable size.
 void rt_gc_set_logged_cards_max(uint64_t max);
 
 void rt_gc_get_stats(rt_gc_stats* out);

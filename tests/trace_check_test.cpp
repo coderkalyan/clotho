@@ -99,7 +99,9 @@ TEST_CASE("a build without CLOTHO_EXTRA_ASSERTS has no trace checker symbol") {
                               "rt_trace_resume", "rt_trace_end", "rt_trace_slot", "rt_trace_halted", "rt_trace_region",
                               "rt_trace_nba_create", "rt_trace_nba_stage", "rt_trace_nba_release", "rt_trace_nba_pass",
                               "rt_trace_pend", "rt_trace_trigger", "rt_trace_slot_end", "rt_trace_finish",
-                              "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once" }) {
+                              "rt_trace_change", "rt_trace_block", "rt_trace_disable", "rt_trace_abort", "rt_trace_once",
+                              "rt_trace_fork", "rt_trace_child_done", "rt_trace_join", "rt_trace_members", "rt_trace_member", "rt_trace_inertial_arm", "rt_trace_inertial_decide",
+                              "rt_trace_inertial_fire", "rt_trace_inertial_applied", "rt_trace_nba_event" }) {
 #ifdef CLOTHO_EXTRA_ASSERTS
         CHECK_MESSAGE(dlsym(RTLD_DEFAULT, name) != nullptr, name);
 #else
@@ -480,10 +482,15 @@ void nba_put(const rt_trace_nba_site& s, uint32_t* dst, uint32_t value, uint32_t
     rt_trace_nba_create(&s, dst, nullptr, &v, mask == 0xffffffffu ? nullptr : &m, nullptr, nullptr);
 }
 
-// A statement arms a record, which a timer or an event releases later.
-void nba_arm(const void* rec, const rt_trace_nba_site& s, uint32_t* dst, uint32_t value) {
+// A statement arms a record, which a timer (`ticks` from now) or an event releases later.
+void nba_arm(const void* rec, const rt_trace_nba_site& s, uint32_t* dst, uint32_t value, uint64_t ticks = 1) {
     const uint64_t v = value;
-    rt_trace_nba_stage(rec, &s, dst, nullptr, &v, nullptr, nullptr, nullptr);
+    rt_trace_nba_stage(rec, ticks, &s, dst, nullptr, &v, nullptr, nullptr, nullptr);
+}
+
+// The event of a `<= @e` record's control that it counts `count` occurrences of.
+void nba_waits(const void* rec, uint32_t count, const void* x, uint32_t edge) {
+    rt_trace_nba_event(rec, count, x, edge);
 }
 
 // The NBA region of a slot, once the Active region has drained.
@@ -2260,5 +2267,782 @@ TEST_CASE("trace check: only an activation a walk marked is force-woken (R23.5)"
     rt_trace_wake(unmarked, RT_TRACE_FORCE, nullptr, 0);
     CHECK(rule() == "R23.5");
     CHECK(has(rt_trace_report(), "no disable or kill had marked"));
+}
+
+// R22: the children of a fork and the join that waits for them. The parent is proc_a, the children
+// proc_b, proc_d and proc_e (the tag bits of a parked handle are stripped, so proc_c would name proc_a),
+// and the fork's record is rec_a.
+namespace {
+
+alignas(8) char proc_e, proc_f;
+
+void* const kParent     = &proc_a;
+void* const kChildren[] = { &proc_b, &proc_d, &proc_e };
+
+// The parent runs and forks `width` children, which the spawns that follow announce.
+void fork_of(uint32_t kind, uint32_t width) {
+    rt_trace_begin();
+    rt_trace_spawn(kParent, &kProcess, nullptr);
+    rt_trace_dispatch(kParent, RT_TRACE_INLINE);
+    rt_trace_fork(kParent, &rec_a, kind, width);
+    for (uint32_t i = 0; i < width; ++i) {
+        rt_trace_spawn(kChildren[i], &kForkChild, kParent);
+    }
+}
+
+// A child resumed at the fork, which runs to its end.
+void completes_inline(void* kid) {
+    CHECK_MESSAGE(rt_trace_dispatch(kid, RT_TRACE_INLINE) == 1, std::string(rt_trace_report()));
+    rt_trace_child_done(kid, &rec_a);
+    rt_trace_end(kid);
+}
+
+// A child resumed at the fork, which parks at a `#ticks`.
+void parks_inline(void* kid, uint64_t ticks) {
+    CHECK_MESSAGE(rt_trace_dispatch(kid, RT_TRACE_INLINE) == 1, std::string(rt_trace_report()));
+    rt_trace_park(kid, &kDelay, ticks);
+}
+
+// The timer of a child's delay expires at `tick` and the child runs to its completion, which the
+// caller then follows (or not) with the wake of the parent.
+void timer_completes(void* kid, uint64_t tick) {
+    rt_trace_slot(tick);
+    rt_trace_wake(kid, RT_TRACE_TIMER, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK_MESSAGE(rt_trace_dispatch(kid, RT_TRACE_RING) == 1, std::string(rt_trace_report()));
+    rt_trace_resume(kid, &kDelay);
+    rt_trace_child_done(kid, &rec_a);
+}
+
+void parent_joins() {
+    rt_trace_park(kParent, &kJoin, id_of(&rec_a));
+}
+
+} // namespace
+
+TEST_CASE("trace check: a join is woken by the last of its children and passed only then (R22)") {
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    parks_inline(kChildren[1], 1);
+    parks_inline(kChildren[2], 2);
+    parent_joins();
+    timer_completes(kChildren[1], 1);
+    rt_trace_end(kChildren[1]);
+    timer_completes(kChildren[2], 2);
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    rt_trace_end(kChildren[2]);
+    CHECK(rt_trace_dispatch(kParent, RT_TRACE_RING) == 1);
+    rt_trace_resume(kParent, &kJoin);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.forks == before.forks + 1);
+    CHECK(after.joins == before.joins + 1);
+
+    // Children that all completed at the fork leave nothing to park for: the parent passes the join.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    completes_inline(kChildren[0]);
+    completes_inline(kChildren[1]);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rt_trace_halted() == 0);
+
+    // Woken by the second of three: the join would go on with a child running.
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    parks_inline(kChildren[1], 1);
+    parks_inline(kChildren[2], 2);
+    parent_joins();
+    timer_completes(kChildren[1], 1);
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "2 of the 3 children had completed"));
+    CHECK(has(rt_trace_report(), "woken by a completion its join is not due at"));
+
+    // The last child completes and wakes nobody: the parent stays at its join for good.
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    parks_inline(kChildren[1], 1);
+    parks_inline(kChildren[2], 2);
+    parent_joins();
+    timer_completes(kChildren[1], 1);
+    rt_trace_end(kChildren[1]);
+    timer_completes(kChildren[2], 2);
+    rt_trace_end(kChildren[2]);
+    rt_trace_slot_end();
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "was not woken by the completion its join is due at"));
+    CHECK(has(rt_trace_report(), "still parked at the join"));
+
+    // The parent goes on past a join with a child still to complete.
+    fork_of(RT_TRACE_JOIN_ALL, 3);
+    completes_inline(kChildren[0]);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "1 of the 3 children had completed"));
+}
+
+TEST_CASE("trace check: a join_any is woken by its first child, which the parent passes it on, and the siblings start later (R22)") {
+    // The first child completes at the fork: the parent does not park, and the siblings are queued.
+    fork_of(RT_TRACE_JOIN_ANY, 3);
+    completes_inline(kChildren[0]);
+    rt_trace_wake(kChildren[1], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_wake(kChildren[2], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_park(kParent, &kDelay, 1);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[1], &rec_a);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_dispatch(kChildren[2], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[2], &rec_a);
+    rt_trace_end(kChildren[2]);
+    CHECK(rt_trace_halted() == 0);
+
+    // Every child parks: the first to complete wakes the parent, and the second wakes nobody.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    parent_joins();
+    timer_completes(kChildren[0], 1);
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    rt_trace_end(kChildren[0]);
+    CHECK(rt_trace_dispatch(kParent, RT_TRACE_RING) == 1);
+    rt_trace_resume(kParent, &kJoin);
+    rt_trace_join(kParent, &rec_a);
+    rt_trace_park(kParent, &kDelay, 5);
+    timer_completes(kChildren[1], 2);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_halted() == 0);
+
+    // The first completion wakes nobody: the next event shows the parent still at its join.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    parent_joins();
+    timer_completes(kChildren[0], 1);
+    rt_trace_end(kChildren[0]);
+    rt_trace_slot(2);
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "join_any"));
+    // Woken before any child completed: the parent would go on with all of them still running.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    parent_joins();
+    rt_trace_wake(kParent, RT_TRACE_CHILD, &rec_a, 0);
+    CHECK(rule() == "R22.3");
+    CHECK(has(rt_trace_report(), "0 of the 2 children had completed"));
+
+    // With no child completed, a join_any does not pass.
+    fork_of(RT_TRACE_JOIN_ANY, 2);
+    parks_inline(kChildren[0], 1);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "0 of the 2 children had completed"));
+}
+
+// R22: a join_none child starts when its parent blocks or ends, and a join_any sibling not at all
+// before that once the parent is due to go on (fork_test.cpp, "fork: join_none does not run its
+// children at the fork" and "fork: join_any does not run the siblings it is not waiting for").
+TEST_CASE("trace check: a child that the parent does not wait for starts from a ring, not at the fork (R22)") {
+    // join_none: queued, and run once the parent has blocked.
+    fork_of(RT_TRACE_JOIN_NONE, 2);
+    rt_trace_wake(kChildren[0], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_wake(kChildren[1], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_park(kParent, &kDelay, 1);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[0], &rec_a);
+    rt_trace_end(kChildren[0]);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[1], &rec_a);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_halted() == 0);
+
+    // join_none: resumed at the fork, while the parent runs.
+    fork_of(RT_TRACE_JOIN_NONE, 2);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_INLINE) == 0);
+    CHECK(rule() == "R22.1");
+    CHECK(has(rt_trace_report(), "a join_none child ran at the fork"));
+    CHECK(has(rt_trace_report(), "design.sv:27:3"));
+
+    // join_any: the first child completed, and a sibling is resumed all the same.
+    fork_of(RT_TRACE_JOIN_ANY, 3);
+    completes_inline(kChildren[0]);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_INLINE) == 0);
+    CHECK(rule() == "R22.1");
+    CHECK(has(rt_trace_report(), "a join_any sibling ran after the first child had completed"));
+
+    // join_any: while none has completed, the parent still waits for each of them and runs them inline.
+    fork_of(RT_TRACE_JOIN_ANY, 3);
+    parks_inline(kChildren[0], 1);
+    parks_inline(kChildren[1], 2);
+    completes_inline(kChildren[2]);
+    CHECK(rt_trace_halted() == 0);
+
+    // A fork in a function has no activation and no join: its children are not tied to a parent, and
+    // run from the ring.
+    rt_trace_begin();
+    rt_trace_fork(nullptr, &rec_a, RT_TRACE_JOIN_NONE, 2);
+    rt_trace_spawn(kChildren[0], &kForkChild, nullptr);
+    rt_trace_spawn(kChildren[1], &kForkChild, nullptr);
+    rt_trace_wake(kChildren[0], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_wake(kChildren[1], RT_TRACE_SPAWN, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[0], &rec_a);
+    rt_trace_end(kChildren[0]);
+    CHECK(rt_trace_dispatch(kChildren[1], RT_TRACE_RING) == 1);
+    rt_trace_child_done(kChildren[1], &rec_a);
+    rt_trace_end(kChildren[1]);
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a child completes once into the record of the fork that made it, and a join is of a fork whole (R22)") {
+    // Into the record of another fork: the count of the wrong parent would fall, and its wake would come
+    // from the wrong fork.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    rt_trace_fork(nullptr, &rec_b, RT_TRACE_JOIN_NONE, 1);
+    CHECK(rt_trace_dispatch(kChildren[0], RT_TRACE_INLINE) == 1);
+    rt_trace_child_done(kChildren[0], &rec_b);
+    CHECK(rule() == "R22.2");
+    CHECK(has(rt_trace_report(), "the record of another fork"));
+
+    // Twice.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    completes_inline(kChildren[0]);
+    rt_trace_child_done(kChildren[0], &rec_a);
+    CHECK(rule() == "R22.2");
+    CHECK(has(rt_trace_report(), "completes twice"));
+
+    // Into a record that no fork announced.
+    fork_of(RT_TRACE_JOIN_ALL, 2);
+    rt_trace_spawn(&proc_f, &kProcess, nullptr);
+    CHECK(rt_trace_dispatch(&proc_f, RT_TRACE_INLINE) == 1);
+    rt_trace_child_done(&proc_f, &rec_b);
+    CHECK(rule() == "R22.2");
+    CHECK(has(rt_trace_report(), "no fork announced"));
+
+    // A join before the fork created every child it announced: its count could never be reached.
+    rt_trace_begin();
+    rt_trace_spawn(kParent, &kProcess, nullptr);
+    rt_trace_dispatch(kParent, RT_TRACE_INLINE);
+    rt_trace_fork(kParent, &rec_a, RT_TRACE_JOIN_ALL, 3);
+    rt_trace_spawn(kChildren[0], &kForkChild, kParent);
+    rt_trace_spawn(kChildren[1], &kForkChild, kParent);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "announced 3 children and had created 2"));
+
+    // The join of a fork that another activation made.
+    fork_of(RT_TRACE_JOIN_ALL, 1);
+    completes_inline(kChildren[0]);
+    rt_trace_spawn(kChildren[1], &kProcess, nullptr);
+    rt_trace_dispatch(kChildren[1], RT_TRACE_INLINE);
+    rt_trace_join(kChildren[1], &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "another made"));
+
+    // A new fork on the address a finished one used starts a new record: the old count is gone.
+    fork_of(RT_TRACE_JOIN_ALL, 1);
+    completes_inline(kChildren[0]);
+    rt_trace_join(kParent, &rec_a);
+    rt_trace_fork(kParent, &rec_a, RT_TRACE_JOIN_ALL, 1);
+    rt_trace_spawn(kChildren[1], &kForkChild, kParent);
+    rt_trace_join(kParent, &rec_a);
+    CHECK(rule() == "R22.4");
+    CHECK(has(rt_trace_report(), "0 of the 1 children had completed"));
+}
+
+// S9: the members of a fused group, each guarded on its own sensitivity (B15). The group is proc_a and lists `in_sig`
+// and `mid_sig` for any change; member 0 reads `in_sig` and writes `mid_sig`, and member 1 lists `mid_sig`.
+namespace {
+
+int in_sig, mid_sig;
+
+// A bracket that names no signal, so the names the lists gave are the ones a report uses.
+const rt_trace_change_site kPlain{ "design.sv:8:3", nullptr, RT_TRACE_CHG_STORE };
+
+const rt_trace_member_entry kMembers[] = { { &in_sig, RT_TRACE_ANY, 0 }, { &mid_sig, RT_TRACE_ANY, 1 } };
+
+// The seed's reports of the group: its static list, its members, its park at the static control.
+// A group that the seed does not queue waits at its static control; one it queues does not.
+void seeded_group(void* a, uint32_t exact, bool parked = true) {
+    const rt_trace_entry list[] = { { &in_sig, "in", RT_TRACE_ANY, nullptr }, { &mid_sig, "mid", RT_TRACE_ANY, nullptr } };
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_subscribe(a, list, 2);
+    rt_trace_members(a, kMembers, 2, 2, exact);
+    if (parked) {
+        rt_trace_park(a, &kStatic, 0);
+    }
+}
+
+// `x` changes, the group is woken by it and dispatched.
+void woken_by(void* a, int* x) {
+    rt_trace_change(&kPlain, x, RT_TRACE_SEEN_LEVEL);
+    rt_trace_wake(a, RT_TRACE_STATIC, x, RT_TRACE_ANY);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+}
+
+} // namespace
+
+TEST_CASE("trace check: a member of a fused group runs when a change satisfies its own list, and that includes a change a member before it made (S9, B15)") {
+    void* a = &proc_a;
+    rt_trace_counts before{};
+    rt_trace_totals(&before);
+    // `in` wakes the group; member 0 runs and writes `mid`, which hands member 1 its trigger bit although the group is
+    // already running; both run, and the group goes back to sleep.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_counts after{};
+    rt_trace_totals(&after);
+    CHECK(after.member_runs == before.member_runs + 2);
+
+    // The next activation is the group's own again: woken by `mid` alone, only member 1 is owed.
+    woken_by(a, &mid_sig);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+
+    // B15: the guard tested the word as it was when the group began, so member 1 never saw the bit that member 0's
+    // write gave it, and the group went back to sleep without running it.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rule() == "R6.4");
+    CHECK(has(rt_trace_report(), "member 1 of the 2"));
+    CHECK(has(rt_trace_report(), "did not run before the group went back to sleep"));
+    CHECK(has(rt_trace_report(), "mid"));
+
+    // A change that arrives while the group is parked or queued is owed to its member too.
+    seeded_group(a, 1);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_wake(a, RT_TRACE_STATIC, &mid_sig, RT_TRACE_ANY);
+    rt_trace_change(&kPlain, &in_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rule() == "R6.4");
+    CHECK(has(rt_trace_report(), "member 0 of the 2"));
+
+    // A member that has run is not owed a second run by a change that comes after it: the producer is before its
+    // consumers in a fused group, and a later write finds the member already past.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_member(a, 1);
+    rt_trace_change(&kPlain, &mid_sig, RT_TRACE_SEEN_LEVEL);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a member of a fused group does not run unless one of its own events fired, a wake that names none excepted (S9)") {
+    void* a = &proc_a;
+    // Member 1 runs, and only `in` changed.
+    seeded_group(a, 1);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_member(a, 1);
+    CHECK(rule() == "R5.5");
+    CHECK(has(rt_trace_report(), "none of its own events fired"));
+    CHECK(has(rt_trace_report(), "any change of mid"));
+
+    // Trigger bits shared by two events of the group let a sibling's event run a member: no member run is then
+    // unjustified.
+    seeded_group(a, 0);
+    woken_by(a, &in_sig);
+    rt_trace_member(a, 0);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+
+    // A wake that cannot name its trigger sets every bit and runs every member: the seed's time-zero run.
+    seeded_group(a, 1, false);
+    rt_trace_wake(a, RT_TRACE_SEED, nullptr, 0);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rt_trace_dispatch(a, RT_TRACE_RING) == 1);
+    rt_trace_member(a, 0);
+    rt_trace_member(a, 1);
+    rt_trace_park(a, &kStatic, 0);
+    CHECK(rt_trace_halted() == 0);
+
+    // A member run of a group whose members the seed did not report.
+    rt_trace_begin();
+    rt_trace_spawn(a, &kProcess, nullptr);
+    rt_trace_member(a, 0);
+    CHECK(rule() == "R5.3");
+    CHECK(has(rt_trace_report(), "did not report its members"));
+}
+
+// R16: the update of an inertial store, `assign #d x = y` (S26). The target's site is 3 and its records are
+// irec_a and irec_b. The store evaluates a value and decides (rt_inertial_decide); the generated code arms the
+// record the decision asks for; the wheel fires it, at the top of the slot of its deadline, and the commit
+// applies it before the Active region.
+namespace {
+
+constexpr uint32_t kSite = 3;
+char               irec_a, irec_b;
+
+// The runtime reports nothing before generated code has (a run with the check off reports no event), so a run starts with one.
+void inert_begin() {
+    rt_trace_begin();
+    rt_trace_fork(nullptr, &irec_b, RT_TRACE_JOIN_NONE, 0);
+}
+
+void evaluates(uint32_t same_pending, uint32_t same_cur, uint64_t epoch) {
+    rt_trace_inertial_decide(kSite, same_pending, same_cur, epoch);
+}
+
+void arms(const void* rec, uint64_t ticks, uint64_t epoch) {
+    rt_trace_inertial_arm(kSite, rec, ticks, epoch);
+}
+
+// The top of the slot of `tick`: the wheel fires the record, and the commit applies it if it is current.
+void top_of_slot(uint64_t tick, const void* rec, uint32_t current) {
+    rt_trace_slot(tick);
+    rt_trace_inertial_fire(rec, current);
+    rt_trace_region(RT_TRACE_REG_PREPONED);
+    if (current != 0) {
+        rt_trace_inertial_applied(rec);
+    }
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+}
+
+} // namespace
+
+TEST_CASE("trace check: an inertial update is armed for its delay, fired by the wheel at its deadline and applied at the top of the slot (R16)") {
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    top_of_slot(5, &irec_a, 1);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A new value before the deadline supersedes the pending update: the first record is dropped when it fires, and
+    // the second is the one applied, at its own deadline.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 0, 2);
+    arms(&irec_b, 5, 2);
+    top_of_slot(5, &irec_a, 0);
+    rt_trace_slot_end();
+    top_of_slot(7, &irec_b, 1);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A pulse shorter than the delay: the value goes back to the current one before the deadline, which cancels the
+    // pending update and arms nothing.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 1, 0);
+    top_of_slot(5, &irec_a, 0);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // The same value again keeps the timer running: no new record, and the pending one is applied at its deadline.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(1, 0, 0);
+    top_of_slot(5, &irec_a, 1);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // A zero delay cannot arm the wheel: its record fires at once and is applied in the NBA region of the slot.
+    inert_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    evaluates(0, 0, 1);
+    arms(&irec_a, 0, 1);
+    rt_trace_inertial_fire(&irec_a, 1);
+    nba_begin();
+    rt_trace_inertial_applied(&irec_a);
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a newer store cancels a pending inertial update, and the same value does not restart it (R16)") {
+    // The pulse gets through: the record that the cancel superseded is applied.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 1, 0);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.4");
+    CHECK(has(rt_trace_report(), "superseded"));
+
+    // The update is lost: a record nothing superseded is dropped.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 0);
+    CHECK(rule() == "R16.4");
+    CHECK(has(rt_trace_report(), "no later store had superseded"));
+
+    // A new value supersedes the record, and it is applied all the same.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(0, 0, 2);
+    arms(&irec_b, 5, 2);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.4");
+
+    // The same value restarts the timer: a record was armed for a value the pending update already holds.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(2);
+    evaluates(1, 0, 2);
+    CHECK(rule() == "R16.1");
+    CHECK(has(rt_trace_report(), "the timer restarted"));
+
+    // The value went back to the current one and a record was armed anyway; a new value armed none.
+    inert_begin();
+    evaluates(0, 1, 1);
+    CHECK(rule() == "R16.1");
+    inert_begin();
+    evaluates(0, 0, 0);
+    CHECK(rule() == "R16.1");
+    CHECK(has(rt_trace_report(), "armed no update"));
+
+    // A record armed that no decision asked for, and one armed for another epoch than the decision's.
+    inert_begin();
+    arms(&irec_a, 5, 1);
+    CHECK(rule() == "R16.2");
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 2);
+    CHECK(rule() == "R16.2");
+}
+
+TEST_CASE("trace check: an inertial record fires at its deadline and its update is applied before the Active region (R16)") {
+    // Fired a tick late, and a tick early.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(6);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.3");
+    CHECK(has(rt_trace_report(), "armed for tick 5"));
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(4);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.3");
+
+    // A record that the wheel never fired: found when the slot of its deadline is over.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(5);
+    rt_trace_slot_end();
+    CHECK(rule() == "R16.3");
+    CHECK(has(rt_trace_report(), "never fired"));
+
+    // A record that nothing armed.
+    inert_begin();
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    CHECK(rule() == "R16.3");
+
+    // Fired by the wheel and not applied by the commit at the top of the slot: the Active region would read the old value.
+    inert_begin();
+    evaluates(0, 0, 1);
+    arms(&irec_a, 5, 1);
+    rt_trace_slot(5);
+    rt_trace_inertial_fire(&irec_a, 1);
+    rt_trace_region(RT_TRACE_REG_PREPONED);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    CHECK(rule() == "R16.5");
+    CHECK(has(rt_trace_report(), "before the Active region began"));
+
+    // A zero-delay record applied outside an NBA pass, and one never applied.
+    inert_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    evaluates(0, 0, 1);
+    arms(&irec_a, 0, 1);
+    rt_trace_inertial_fire(&irec_a, 1);
+    rt_trace_inertial_applied(&irec_a);
+    CHECK(rule() == "R16.5");
+    CHECK(has(rt_trace_report(), "outside an NBA pass"));
+    inert_begin();
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    evaluates(0, 0, 1);
+    arms(&irec_a, 0, 1);
+    rt_trace_inertial_fire(&irec_a, 1);
+    rt_trace_slot_end();
+    CHECK(rule() == "R16.5");
+    CHECK(has(rt_trace_report(), "still unapplied"));
+}
+
+// R11: a timed nonblocking update is created when its delay elapses (`<= #d`) or when its event occurs the number of
+// times it counts (`<= @e`, `<= repeat(n) @e`), and not before (B23: a `<= @e` on a declared event was never counted
+// down, so it was never created).
+
+TEST_CASE("trace check: a `<= #d` update is created when its delay elapses and not before (R11)") {
+    // Armed for 5 ticks at tick 0: the timer releases it at tick 5, and the NBA region applies it.
+    rt_trace_begin();
+    q = 0;
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(5);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_TIMER, 0);
+    nba_begin();
+    q = 1;
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // Released a tick early.
+    rt_trace_begin();
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(4);
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_TIMER, 0);
+    CHECK(rule() == "R11.1");
+    CHECK(has(rt_trace_report(), "created at tick 4"));
+    CHECK(has(rt_trace_report(), "ends at tick 5"));
+
+    // Never released: found when the slot of its deadline is over.
+    rt_trace_begin();
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(5);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.1");
+    CHECK(has(rt_trace_report(), "no update was created"));
+
+    // A record armed for a later tick is not owed at the end of an earlier slot.
+    rt_trace_begin();
+    nba_arm(&rec1, kTimer, &q, 1, 5);
+    rt_trace_slot(2);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a `<= @e` update is created at the n-th occurrence of its control, and only then (R11, B23)") {
+    // `q <= repeat(2) @(posedge clk) v`: the first posedge counts one, a negedge none, the second creates it.
+    rt_trace_begin();
+    q = 0;
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &clk, RT_TRACE_POS);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_change(&kStore, &clk, seen_for(1, 0, false));
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 3);
+    nba_begin();
+    q = 1;
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // Created at the first occurrence of two.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &clk, RT_TRACE_POS);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 1);
+    CHECK(rule() == "R11.2");
+    CHECK(has(rt_trace_report(), "1 of the 2 occurrences"));
+
+    // The second occurrence comes and nothing creates the update: the next event shows it.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &clk, RT_TRACE_POS);
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    rt_trace_change(&kStore, &clk, seen_for(0, 1, false));
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
+    CHECK(has(rt_trace_report(), "was not created"));
+
+    // B23: the record waits on a declared event, and `-> e` fires the object's own waiters, never the record.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &ev1, RT_TRACE_OBJ);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
+    // ... and with the release the trigger owes, it is clean.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &ev1, RT_TRACE_OBJ);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 1);
+    rt_trace_region(RT_TRACE_REG_ACTIVE);
+    nba_begin();
+    q = 1;
+    nba_end();
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+}
+
+TEST_CASE("trace check: a `<= @(a or b)` update counts an occurrence of either, and an event listed twice counts one (R11, R21)") {
+    // Either entry matures a count of one; an event that is not listed does not.
+    for (const void* occurs : { static_cast<const void*>(&clk), static_cast<const void*>(&done) }) {
+        rt_trace_begin();
+        nba_arm(&rec1, kEvent, &q, 1, 0);
+        nba_waits(&rec1, 1, &clk, RT_TRACE_POS);
+        nba_waits(&rec1, 1, &done, RT_TRACE_POS);
+        rt_trace_change(&kStore, occurs, seen_for(0, 1, false));
+        rt_trace_nba_release(&rec1, RT_TRACE_NBA_EVENT, 1);
+        CHECK(rt_trace_halted() == 0);
+    }
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &clk, RT_TRACE_POS);
+    rt_trace_change(&kStore, &done, seen_for(0, 1, false));
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+
+    // One occurrence of an event listed under two names counts once: a count of two is not reached.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 2, &ev1, RT_TRACE_OBJ);
+    nba_waits(&rec1, 2, &ev1, RT_TRACE_OBJ);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_trigger(&ev1, RT_TRACE_TRIGGER_NOW);
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
+
+    // A change entry counts any write that changed the value; a record armed on a slot the trace was not told the wait
+    // of (an old hand-built sequence) is not asked.
+    rt_trace_begin();
+    nba_arm(&rec1, kEvent, &q, 1, 0);
+    nba_waits(&rec1, 1, &clk, RT_TRACE_ANY);
+    rt_trace_change(&kStore, &clk, seen_for(1, 1, false));
+    rt_trace_slot_end();
+    CHECK(rt_trace_halted() == 0);
+    rt_trace_change(&kStore, &clk, seen_for(1, 0, false));
+    rt_trace_slot_end();
+    CHECK(rule() == "R11.2");
 }
 #endif // CLOTHO_EXTRA_ASSERTS

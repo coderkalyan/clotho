@@ -1080,10 +1080,10 @@ collection is the cost to avoid.
   needs no instrumenting either, for a better reason than a range mark: the owner is
   remembered, and tracing the owner walks the container wherever its elements have
   moved to.
-- **Design state is logged by cards.** Every state region ends in one byte of dirty flag for each
-  `RT_GC_CARD_BYTES` (512) of the region. A store of a class or event handle into state -- a scalar,
-  an array element, a struct member, the staging of a nonblocking assignment, an aggregate copy, a
-  container mutation -- tests the card byte of the place inline (a load, a compare and a not-taken
+- **Design state is logged by cards, and its containers by flags.** Every state region ends in one byte
+  of dirty flag for each `RT_GC_CARD_BYTES` (512) of the region. A store of a class or event handle
+  into state -- a scalar, an array element, a struct member, the staging of a nonblocking assignment,
+  an aggregate copy -- tests the card byte of the place inline (a load, a compare and a not-taken
   branch; the byte is at a constant offset from the signal's storage, so shared code names nothing of
   an instance) and calls `rt_gc_note_state_store` when it is clear. That sets the byte and appends the
   card to a bounded log. A young collection reads the handle slots of the logged cards (the table's
@@ -1095,9 +1095,26 @@ collection is the cost to avoid.
   entry from the callee (`rt_gc_note_ref_store` finds the region by address). A frame local needs no
   barrier: a young collection reads every frame that ran since the last one and every frame a callee can
   store into (§5.5).
-  The extra-assertion build checks it twice: `verify_cards` that a card byte is set exactly when the
-  log holds it, and, before a young collection marks anything, that no slot outside the logged cards
-  names an unmarked (young) object.
+
+  A container of design state (a queue, dynamic array or associative array whose elements or keys can
+  hold a handle) is an entry of its region's root table and has flag bytes of its own after the cards,
+  one for each word of every signal that holds one. A card would not do: what a container costs a
+  collection is its whole payload, so a queue of a million handles must not be walked because a slot a
+  few bytes from its handle was stored to. A mutation that adds a handle to the container -- a push or
+  insert, an element store, a whole assignment or move, `new[n](old)`, `new[n]` of events, an
+  associative entry (its key or its constructed value), at any depth inside it -- tests the flag byte
+  of the word of the outermost container's handle it has the address of (the handle itself, or its
+  epoch word for a place inside the payload) and calls `rt_gc_note_state_store`, which logs the cards
+  and every container whose handle the range touches. A young collection walks the logged containers
+  and no others, a full collection every one, with the same bounded log and fallback as the cards.
+  Moving handles within a container (a sort, a ring growth) and removing them add none, so they log
+  nothing. A `ref` bound into a container reaches the same entry through its witness chain, and a
+  container formal is never bound to a place inside another container (the frontend passes a temp).
+
+  The extra-assertion build checks both: `verify_cards` that a card byte, and a container's flag bytes
+  together, are set exactly when the log holds them, and, before a young collection marks anything,
+  that no slot outside the logged cards and no element or key of an unlogged container names an
+  unmarked (young) object.
 - **The mark is the generation.** A young collection never frees a marked object
   and sweeps only blocks allocated from since the last collection, which is what
   lets it skip the stable population without freeing it. Old garbage accumulates

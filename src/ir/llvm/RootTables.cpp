@@ -179,13 +179,21 @@ void Backend::fill_instance_records(const std::vector<llvm::Function*>& procs) {
             // densely from 0, so its own scan needs no padding) and vif waiter heads.
             const uint32_t rank = port_field_[si];
             const auto     put  = [&](uint32_t elem, llvm::Constant* v) { set_port(ai, rank, elem, v); };
+            // A canonical port (uniform) holds every id and the dump-var index
+            // whether or not this instance has them, and its readers test for
+            // no_id and -1 at run time.
+            const bool canon = uniform(sj);
             for (uint32_t f = 0; f < kIdFamilies; ++f) {
                 if (pl->id[f] != no_port_elem && id_val_[si][f] != no_id) {
                     put(pl->id[f], b_.getInt32(id_val_[si][f]));
+                } else if (pl->id[f] != no_port_elem && canon) {
+                    put(pl->id[f], b_.getInt32(no_id));
                 }
             }
             if (pl->vcd != no_port_elem && vcd_index_[si] >= 0) {
                 put(pl->vcd, b_.getInt32(static_cast<uint32_t>(vcd_index_[si])));
+            } else if (pl->vcd != no_port_elem && canon) {
+                put(pl->vcd, b_.getInt32(~0u));
             }
             for (uint32_t k = 0; k < s.sh_count && k < pl->n_shadow; ++k) {
                 put(pl->shadow + k, gep(a.shadow_ty, sym(a.shadow_gv), { 0, s.sh_first + k }));
@@ -428,10 +436,17 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         llvm::Constant* ctl    = nullptr;
         llvm::Constant* list   = nullptr;
         uint32_t        n      = 0;
+        // A guarded group's members (S9): each one's own list, how many there are, and whether no two events
+        // of the group share a trigger bit.
+        llvm::Constant* mlist   = nullptr;
+        uint32_t        mn      = 0;
+        uint32_t        members = 0;
+        uint32_t        exact   = 0;
     };
     std::vector<TraceRow>                     trace_rows;
     std::vector<std::vector<llvm::Constant*>> trace_entries(procs.size());
     auto* const                               trace_entry_ty = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, i64, ptr_ty });
+    auto* const                               trace_member_ty = llvm::StructType::get(ctx_, { ptr_ty, i32, i32 });
 
     // Schedule groups with an always_comb / always_latch member start after every other
     // body. A fused group is ONE body, so a continuous assignment fused with such a
@@ -576,9 +591,41 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
                 org |= RT_TRACE_ORG_REACTIVE_CONT;
             }
             llvm::Module& root = root_env_->llmod;
-            trace_rows.push_back(TraceRow{ trace_control(root, org, at.where),
-                                           subscribed_statically(k) ? trace_control(root, RT_TRACE_CTL_STATIC, at.where)
-                                                                    : null_ptr });
+            TraceRow      trow{ trace_control(root, org, at.where),
+                                subscribed_statically(k) ? trace_control(root, RT_TRACE_CTL_STATIC, at.where) : null_ptr };
+            // S9: the members of a guarded group, each with the list its guard tests, and whether the group's
+            // events keep trigger bits of their own. Only a group of one row is ever guarded
+            // (emit_sched_entries); an event object is not listed.
+            if (sched_[g].rows.size() == 1 && group_guarded_[sched_[g].rows.front()]) {
+                const uint32_t               g0 = sched_[g].rows.front();
+                std::vector<llvm::Constant*> entries;
+                for (uint32_t i = 0; i < groups_[g0].size(); ++i) {
+                    for (const WaitEvent& w : all[groups_[g0][i]].wait_events) {
+                        if (!mod_.signal(w.signal).is_event) {
+                            entries.push_back(llvm::ConstantStruct::get(
+                              trace_member_ty, { storage_address(slot_of(w.signal)), b_.getInt32(static_cast<uint32_t>(w.edge)),
+                                                 b_.getInt32(i) }));
+                        }
+                    }
+                }
+                if (!entries.empty()) {
+                    auto* const arr = llvm::ArrayType::get(trace_member_ty, entries.size());
+                    trow.mlist      = new llvm::GlobalVariable(root, arr, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage,
+                                                               llvm::ConstantArray::get(arr, entries), "clotho.trace.members");
+                    trow.mn         = static_cast<uint32_t>(entries.size());
+                }
+                trow.members = static_cast<uint32_t>(groups_[g0].size());
+                uint64_t used = 0;
+                trow.exact    = 1;
+                for (const WaitEvent& w : group_events_[g0]) {
+                    const uint8_t c = colour_of(w);
+                    if (c == 0 || (used >> c & 1) != 0) {
+                        trow.exact = 0;
+                    }
+                    used |= 1ull << c;
+                }
+            }
+            trace_rows.push_back(trow);
         }
     }
     if (rows.empty()) {
@@ -635,7 +682,7 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
 
     // The trace's tables: one row per seed row, the list of each row's static subscription, and
     // the name of the variable of each persistent event waiter.
-    auto* const           trace_row_ty   = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, ptr_ty, i32 });
+    auto* const           trace_row_ty   = llvm::StructType::get(ctx_, { ptr_ty, ptr_ty, ptr_ty, i32, ptr_ty, i32, i32, i32 });
     llvm::GlobalVariable* trace_rows_gv  = nullptr;
     llvm::GlobalVariable* trace_names_gv = nullptr;
     if (trace_on()) {
@@ -652,7 +699,9 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
         std::vector<llvm::Constant*> v;
         for (const TraceRow& r : trace_rows) {
             v.push_back(llvm::ConstantStruct::get(
-              trace_row_ty, { r.origin, r.ctl, r.list != nullptr ? r.list : null_ptr, b_.getInt32(r.n) }));
+              trace_row_ty, { r.origin, r.ctl, r.list != nullptr ? r.list : null_ptr, b_.getInt32(r.n),
+                              r.mlist != nullptr ? r.mlist : null_ptr, b_.getInt32(r.mn), b_.getInt32(r.members),
+                              b_.getInt32(r.exact) }));
         }
         auto* const arr = llvm::ArrayType::get(trace_row_ty, v.size());
         trace_rows_gv   = new llvm::GlobalVariable(root_env_->llmod, arr, /*isConstant=*/true,
@@ -816,7 +865,8 @@ void Backend::emit_seed(llvm::Value* wheel, const std::vector<llvm::Function*>& 
                 return b_.CreateLoad(ty, b_.CreateStructGEP(trace_row_ty, trow, f));
             };
             emit_trace_seed_row(h, tfield(0, ptr_ty), tfield(1, ptr_ty), tfield(2, ptr_ty), tfield(3, i32),
-                                b_.CreateICmpEQ(ring_of(kind), b_.getInt32(RingNone)));
+                                b_.CreateICmpEQ(ring_of(kind), b_.getInt32(RingNone)),
+                                TraceMembers{ tfield(4, ptr_ty), tfield(5, i32), tfield(6, i32), tfield(7, i32) });
         }
         // The time-zero settle run must evaluate every member.
         auto* const flag = block("seed.flag");

@@ -334,6 +334,11 @@ const Lowerer::RandSeqCtx& Lowerer::randseq_block(const RandSequenceStatement& r
             ctx.captures.push_back({ sym, fn_ctx_->boxed.contains(sym) });
         }
     }
+    // What the fork children in the block's code reference: an automatic a code
+    // block declares among them is boxed at its declaration, as in any body.
+    BoxCandidateScan forks;
+    visit_randseq(rs, forks);
+    ctx.fork_refs = std::move(forks.candidates);
 
     for (const RsProd* p : rs.productions) {
         ctx.ids[p] = module_.reserve_function(module_.pool.void_type);
@@ -430,6 +435,7 @@ void Lowerer::build_production(const RsProd& p, const RandSeqCtx& rs, ir::Functi
     ctx.invoking_scope = hier_name();
     ctx.is_task     = rs.is_task;
     ctx.in_randseq  = true;
+    ctx.fork_refs      = rs.fork_refs;
     // As build_function / build_task: an enclosing construction's or default
     // argument's `this` is another builder's Index and stops at this boundary.
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
@@ -604,6 +610,7 @@ void Lowerer::build_production_step(const RsProd& p, const RandSeqCtx& rs, ir::F
     ctx.invoking_scope = hier_name();
     ctx.is_task     = rs.is_task;
     ctx.in_randseq  = true;
+    ctx.fork_refs      = rs.fork_refs;
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
     const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
     const FnScope                          fn_scope(*this, &ctx);

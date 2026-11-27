@@ -745,8 +745,14 @@ int32_t Backend::trigger_id(Signal sig, uint32_t edge) const {
     return trigger_id_.empty() ? -1 : trigger_id_[static_cast<uint32_t>(sig)][edge];
 }
 
+// Bound storage (uniform) answers every wake fact yes: what waits on it is other
+// units' business, so its writers classify and scan every bucket and find the
+// empty ones empty at run time.
 bool Backend::signal_has_waiters(Signal sig) const {
     const auto i = static_cast<uint32_t>(sig);
+    if (uniform(sig)) {
+        return true;
+    }
     for (uint32_t e = 0; e < 3; ++e) {
         // A `<= @e` trigger has no coroutine waiter but its edge must still be
         // watched so a store/commit fires its deferred records.
@@ -764,13 +770,13 @@ bool Backend::signal_has_waiters(Signal sig) const {
 bool Backend::signal_has_level_waiters(Signal sig) const {
     const auto i = static_cast<uint32_t>(sig);
     const auto e = static_cast<uint32_t>(Edge::Any);
-    return wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr;
+    return uniform(sig) || wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr;
 }
 
 bool Backend::signal_has_bucket(Signal sig, Edge e) const {
     const auto i = static_cast<uint32_t>(sig);
     const auto k = static_cast<uint32_t>(e);
-    return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr || vif_wait_[i][k] ||
+    return uniform(sig) || wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr || vif_wait_[i][k] ||
            trigger_id(sig, k) >= 0;
 }
 
@@ -1178,9 +1184,10 @@ bool Backend::service_wait_queue(Signal       sig,
         emit_trace_change(path, sig, storage_ptr(slot), t);
     }
     // Saved, not asserted empty: a wake this one emits may service another
-    // signal's queues, which must not take this store's touch.
+    // signal's queues, which must not take this store's touch. Bound storage
+    // never folds it: whether it is dumped is a run-time test (vcd_touch_lvalue).
     const std::optional<VcdFold> outer = std::exchange(vcd_fold_, std::nullopt);
-    if (fold_vcd >= 0) {
+    if (fold_vcd >= 0 && !uniform(sig)) {
         vcd_fold_ = VcdFold{ .sig = sig, .base = fold_vcd };
     }
     service_wake_buckets(sig, f);
@@ -1190,12 +1197,15 @@ bool Backend::service_wait_queue(Signal       sig,
 }
 
 // Fire each of `sig`'s per-edge buckets that exists behind one branch on its fact.
+// Bound storage reached through its port has every bucket, `<= @` trigger id
+// included, and scans or fires each one the port does not mark empty.
 void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
-    const auto i = static_cast<uint32_t>(sig);
+    const auto i     = static_cast<uint32_t>(sig);
+    const bool canon = uniform(sig) && port_reachable(slot_of(sig));
 
     // One change is one release moment for the `<= @` records it matures, however many
     // of the buckets below it satisfies.
-    emit_release_moment(sig, f);
+    emit_release_moment(sig, f, canon);
 
     // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
     // bucket also fires on an LSB transition.
@@ -1214,6 +1224,14 @@ void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
         b_.CreateCondBr(fact, body, cont);
 
         b_.SetInsertPoint(body);
+        if (canon) {
+            service_static_queue(sig, e);
+            service_dynamic_queue(sig, e);
+            fire_port_trigger(sig, e);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+            continue;
+        }
         if (wait_sta_gv_[i][e] != nullptr) {
             service_static_queue(sig, e);
         }
@@ -1230,6 +1248,30 @@ void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
     }
+}
+
+// The `<= @(edge sig)` trigger id of bound storage, from its port: no_id when
+// nothing lists that edge of this instance's signal.
+llvm::Value* Backend::port_trigger_id(Signal sig, uint32_t edge) {
+    const auto family = static_cast<IdFamily>(static_cast<uint32_t>(IdFamily::TrigPos) + edge);
+    return id_value(sig, family, no_id);
+}
+
+// fire_event_trigger for bound storage reached through its port, when the design
+// has `<= @` controls at all: fires the trigger the port names, if it names one.
+void Backend::fire_port_trigger(Signal sig, uint32_t edge) {
+    if (trigger_id_.empty()) {
+        return;
+    }
+    llvm::Value* const id   = port_trigger_id(sig, edge);
+    auto* const        fn   = b_.GetInsertBlock()->getParent();
+    auto* const        body = llvm::BasicBlock::Create(ctx_, "trig.body", fn);
+    auto* const        cont = llvm::BasicBlock::Create(ctx_, "trig.cont", fn);
+    b_.CreateCondBr(b_.CreateICmpNE(id, b_.getInt32(no_id)), body, cont);
+    b_.SetInsertPoint(body);
+    emit_trigger_fire(id);
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
 }
 
 // Service a waited-on class property's change notifiers after a blocking write to
@@ -1298,17 +1340,27 @@ void Backend::service_change_notify(const LValue& lv,
 // occurrence matured -- not in the order the Any, Positive and Negative buckets are
 // scanned, which counting once here, before the first of them, keeps out of it
 // (docs/design/intra-assignment-timing.md, "Order against plain NBAs"). A signal no
-// `<= @` control lists emits nothing.
-void Backend::emit_release_moment(Signal sig, const EdgeFacts& f) {
+// `<= @` control lists emits nothing. Bound storage reached through its port
+// (`canon`) tests at run time which edges its port names a trigger for; a trigger
+// only a detached `->> @(x)` subscribes to starts a moment no record waits on,
+// which only advances the counter.
+void Backend::emit_release_moment(Signal sig, const EdgeFacts& f, bool canon) {
     if (intra_trigger_edge_.empty()) {
         return;
     }
     const auto&  listed = intra_trigger_edge_[static_cast<uint32_t>(sig)];
     llvm::Value* hit    = nullptr;
     const auto   add    = [&](Edge e, llvm::Value* fact) {
-        if (fact != nullptr && listed[static_cast<uint32_t>(e)]) {
-            hit = hit != nullptr ? b_.CreateOr(hit, fact) : fact;
+        if (fact == nullptr) {
+            return;
         }
+        if (canon) {
+            fact = b_.CreateAnd(
+              fact, b_.CreateICmpNE(port_trigger_id(sig, static_cast<uint32_t>(e)), b_.getInt32(no_id)));
+        } else if (!listed[static_cast<uint32_t>(e)]) {
+            return;
+        }
+        hit = hit != nullptr ? b_.CreateOr(hit, fact) : fact;
     };
     add(Edge::Any, f.changed);
     add(Edge::Positive, f.pos);
@@ -1460,7 +1512,21 @@ void Backend::service_static_queue(Signal sig, uint32_t edge) {
         // The storage the writer reaches, as the waiter's list names it.
         args.push_back(storage_ptr(slot_of(sig)));
     }
+    if (!uniform(sig) || !port_reachable(s)) {
+        b_.CreateCall(scan, args);
+        return;
+    }
+    // Bound storage has every bucket in its port, most of them empty in a given
+    // instance: test the count before calling the scan.
+    llvm::Value* const cap  = b_.CreateLoad(b_.getInt32Ty(), port_elem_ptr(s, port_of(s)->sta[edge].cap));
+    auto* const        fn   = b_.GetInsertBlock()->getParent();
+    auto* const        body = llvm::BasicBlock::Create(ctx_, "nsta.call", fn);
+    auto* const        cont = llvm::BasicBlock::Create(ctx_, "nsta.skip", fn);
+    b_.CreateCondBr(b_.CreateICmpNE(cap, b_.getInt32(0)), body, cont);
+    b_.SetInsertPoint(body);
     b_.CreateCall(scan, args);
+    b_.CreateBr(cont);
+    b_.SetInsertPoint(cont);
 }
 
 // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -1621,6 +1687,15 @@ void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel, uint32_t tri
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
     emit_event_wake_list(obj, { .kind = RT_TRACE_EVENT, .obj = obj });
+    // Some `@` or `wait` calls a method that reads an event property (LRM 9.4.2).
+    // The method can reach any event of the design through any object, so each
+    // trigger wakes those waiters to re-evaluate. The frontend hangs their notifier
+    // on the event type (Lowerer::declare_shared_notifiers); no other design has one.
+    if (const ChangeNotify* cn = mod_.change_notify(mod_.pool.event_type, 0);
+        cn != nullptr && cn->shared != kNoNotify) {
+        llvm::Value* any = event_obj_live(b_.CreateLoad(b_.getInt64Ty(), chg_shared_slot(cn->shared)));
+        emit_event_wake_list(any, { .kind = RT_TRACE_EVENT, .obj = any });
+    }
     // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
     // object rather than on a signal edge. Every trigger form converges here, and
     // only an object some such statement registered on has an id to fire.

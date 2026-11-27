@@ -101,6 +101,14 @@ enum {
     RT_TRACE_ABORT_KILL = 1,
 };
 
+// The join of a fork (rt_trace_fork): `join` waits for every child, `join_any` for the first and
+// `join_none` for none.
+enum {
+    RT_TRACE_JOIN_ALL = 0,
+    RT_TRACE_JOIN_ANY = 1,
+    RT_TRACE_JOIN_NONE = 2,
+};
+
 // The ring a wake pushes onto, in bits 8 and up of rt_trace_wake's cause: the Active ring, the
 // Reactive ring, or the reactive continuous ring a program's port copies and assigns drain from
 // before program code.
@@ -338,6 +346,14 @@ typedef struct rt_trace_nba_site {
     uint32_t bits1;
 } rt_trace_nba_site;
 
+// One entry of a guarded group's member lists (S9): member `member` of the group lists the storage at `x`
+// for `edge` (RT_TRACE_POS ...), which is the sensitivity its guard tests.
+typedef struct rt_trace_member_entry {
+    const void* x;
+    uint32_t    edge;
+    uint32_t    member;
+} rt_trace_member_entry;
+
 // What a run reported, for the suite's summary line.
 typedef struct rt_trace_counts {
     uint64_t runs;
@@ -357,6 +373,13 @@ typedef struct rt_trace_counts {
     // Block entries and exits, and activations a `disable` or `kill` marked.
     uint64_t blocks;
     uint64_t aborts;
+    // Forks, and the joins their parents passed.
+    uint64_t forks;
+    uint64_t joins;
+    // Members of guarded groups that ran (S9).
+    uint64_t member_runs;
+    // Inertial records armed (S26).
+    uint64_t inertial_arms;
 } rt_trace_counts;
 
 #ifdef CLOTHO_EXTRA_ASSERTS
@@ -380,6 +403,15 @@ void rt_trace_subscribe(void* a, const rt_trace_entry* list, uint32_t n);
 
 // The same for one event object, found when the seed links the persistent node.
 void rt_trace_subscribe_event(void* a, const void* obj, const char* name);
+
+// The members of the guarded group `a` (S9): `list` is each member's own sensitivity as the IR gives it (an
+// event object is not listed), `members` the number of members. `exact` says that no two events of the group
+// share a trigger bit, so a member runs only when one of its own events fired or the wake named none;
+// otherwise a sibling's event that shares its bit runs it too.
+void rt_trace_members(void* a, const rt_trace_member_entry* list, uint32_t n, uint32_t members, uint32_t exact);
+
+// Member `i` of the guarded group `a` starts its body in this activation.
+void rt_trace_member(void* a, uint32_t i);
 
 // Add one entry to the list of the park that follows, at a RT_TRACE_CTL_EVENT control: the
 // activation `a` waits for `x` (`shape`: as rt_trace_entry's).
@@ -426,6 +458,20 @@ void rt_trace_disable(void* a, const void* target);
 // callee completes.
 void rt_trace_abort(void* a, const void* target, uint32_t kind);
 
+// `a` forks `width` children onto the join record `rec`, which the children's epilogues, the join's
+// park and the parent's wake name alike (RT_TRACE_JOIN_*); `a` is null in a function, which has no
+// activation and no join. The children are announced by the spawns that follow, each of them
+// created by `a`. A fork on an address a record had starts a new record.
+void rt_trace_fork(void* a, const void* rec, uint32_t kind, uint32_t width);
+
+// Fork child `a` completes into the join record `rec`: before the decrement of the record's own
+// count, and so before the wake of the parent that this completion is due to make.
+void rt_trace_child_done(void* a, const void* rec);
+
+// `a` is past the join of the fork on `rec`, which it either did not park for (the children it waits
+// for had completed already) or was woken from.
+void rt_trace_join(void* a, const void* rec);
+
 // The scheduler runs the bodies of one region through `clotho.run_once` (`kind`:
 // RT_TRACE_ORG_PREINIT ...), or has done (0).
 void rt_trace_once(uint32_t kind);
@@ -445,9 +491,17 @@ void rt_trace_nba_create(const rt_trace_nba_site* site, void* dst0, void* dst1, 
 
 // A timed update is armed: `rec` is the record that will release it, `<= #d` for a timer and
 // `<= @e` for an event, and the planes are those of rt_trace_nba_create. The update is
-// created when the record is released (rt_trace_nba_release).
-void rt_trace_nba_stage(const void* rec, const rt_trace_nba_site* site, void* dst0, void* dst1,
+// created when the record is released (rt_trace_nba_release): `ticks` from now by the timer of a
+// `<= #d` (zero for an event), and by the occurrence of its control that completes its count for a
+// `<= @e` (rt_trace_nba_event).
+void rt_trace_nba_stage(const void* rec, uint64_t ticks, const rt_trace_nba_site* site, void* dst0, void* dst1,
                         const void* val0, const void* mask0, const void* val1, const void* mask1);
+
+// An event the `<= @e` record `rec`, just armed, waits for: `x` is a signal's storage (`edge`
+// RT_TRACE_POS, _NEG or _ANY) or an event object (RT_TRACE_OBJ), one call for each event the control
+// lists, and `count` the repeat count: how many occurrences release the record. A record the trace is
+// told no event of is not asked.
+void rt_trace_nba_event(const void* rec, uint32_t count, const void* x, uint32_t edge);
 
 // A timer or an occurrence of an event releases `rec`: `path` is RT_TRACE_NBA_TIMER or
 // RT_TRACE_NBA_EVENT, and `moment` the scheduler's number for the occurrences that released
@@ -463,6 +517,24 @@ void rt_trace_pend(const void* obj);
 
 // Event object `obj` triggers: RT_TRACE_TRIGGER_NOW or RT_TRACE_TRIGGER_NB.
 void rt_trace_trigger(const void* obj, uint32_t kind);
+
+// An inertial store (S26: `assign #d`, a net delay, a gate delay) at site `idx`, the dense id of its target,
+// armed `rec` for the decision it was given: `epoch` is that decision's stamp, which the record carries, and
+// `ticks` the delay from now (zero: the record fires at once, and its update lands in the NBA region).
+void rt_trace_inertial_arm(uint32_t idx, const void* rec, uint64_t ticks, uint64_t epoch);
+
+// The store at site `idx` evaluated a value and the runtime decided (rt_inertial_decide): `same_pending` says the
+// value equals the one a record already armed holds, `same_cur` that it equals the target's current value, and
+// `epoch` is the stamp of a new record the store must arm, or zero when it arms none.
+void rt_trace_inertial_decide(uint32_t idx, uint32_t same_pending, uint32_t same_cur, uint64_t epoch);
+
+// The wheel (or a zero delay) fires inertial record `rec`. `current` says the runtime takes it for the latest
+// of its site, so that its update will be applied; otherwise it is dropped.
+void rt_trace_inertial_fire(const void* rec, uint32_t current);
+
+// The commit of the record's site applies `rec`, a record the site's ready list held (any record of any
+// intra-assignment site comes through here; the ones that are not inertial are none of this event's).
+void rt_trace_inertial_applied(const void* rec);
 
 // -- Events of the scheduler (runtime/Scheduler.cpp) --
 

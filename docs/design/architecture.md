@@ -108,17 +108,17 @@ them in step.
   have explicit stack maps; object fields and design state are scanned precisely.
 - A young collection costs what happened since the last collection (allocation,
   logged writes, frames that ran), never the size of the design. Design-state
-  handle slots are read by dirty card, and a frame is read only if it ran or a
-  callee can store into it. **Not yet:** each one walks every state-resident
-  container and every container local to a frame.
+  handle slots are read by dirty card, each state-resident container is walked
+  only if a mutation of it was logged, and a frame is read only if it ran or a
+  callee can store into it. **Not yet:** each one walks every container local
+  to a frame.
 - An object is finalized only if it owns a buffer outside the heap when it dies.
   **Not yet:** every dead object with a string or container property runs a
   finalizer.
 - A handle stored through a `ref` argument is recorded by a barrier in the
   callee, which finds the owning object from the address, or from the witness
-  chain when the place is an element of a container. **Not yet:** an output
-  formal bound to an element inside a container's payload is still recorded at
-  the call site.
+  chain when the place is an element of a container. An output argument is
+  never such an element: the caller assigns a temporary to it after the call.
 - Any process may run on any worker thread, but two run at the same time only
   when what they may access does not overlap with a write, and a run is
   reproducible. So values and containers need no protection against concurrent

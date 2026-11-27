@@ -35,8 +35,10 @@ struct Analyzed {
     }
 };
 
+// The facts of every process of the design as written (Lower.h, lower_text).
 Analyzed run(std::string_view source) {
-    Analyzed a{ .lowered = lower_text(source), .facts = {} };
+    Analyzed a{ .lowered = lower_text(source, nullptr, ir::SystemAccess::Off, false, /*as_written=*/true),
+                .facts   = {} };
     REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostic_text());
     REQUIRE(a.lowered.module != nullptr);
     a.facts = ir::analyze(*a.lowered.module);

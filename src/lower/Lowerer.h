@@ -192,6 +192,9 @@ const slang::ast::ClassType* weak_reference_base(const slang::ast::ClassType& cl
 // Whether `clt` is `std::semaphore` or a `std::mailbox #(T)` (LRM 15.3, 15.4).
 bool is_sync_builtin_class(const slang::ast::ClassType& clt);
 
+// Whether `clt` is `std::process` (LRM 9.7).
+bool is_process_class(const slang::ast::ClassType& clt);
+
 // Whether `sub` is one of weak_reference's four built-in methods.
 bool is_weak_reference_method(const slang::ast::SubroutineSymbol& sub);
 
@@ -349,7 +352,7 @@ struct WaitedProps {
     };
     ankerl::unordered_dense::map<const slang::ast::ClassPropertySymbol*, Waited> props;
     // Every value symbol some `wait` condition in the design names. Consulted when a
-    // capture box is minted (box_one_capture / install_fork_decl_box): a box whose
+    // capture box is minted (box_one_capture / emit_decl_box): a box whose
     // symbol is here carries a change notifier so the wait can be woken. A superset
     // of the symbols that end up boxed -- signals and class properties land here too
     // and are simply never asked about.
@@ -751,15 +754,16 @@ inline void for_each_fork_stmt(const BlockStatement& blk, F&& fn) {
     }
 }
 
-// Symbols a fork's children reference anywhere in a subroutine body, which is the set
-// whose frame locals have to be boxed (docs/design/fork-join.md V4). Run before the
-// frame is laid out, because a boxed local is boxed for every access in the activation
-// -- including accesses lowered before the `fork` is reached.
+// Every symbol a fork child references anywhere in a body: the candidates for a
+// capture box (docs/design/fork-join.md V4). Run over a body before it is lowered,
+// because a boxed variable is boxed for every access, the ones before the `fork`
+// included, and so has to be known when its declaration is reached.
 //
-// Deliberately an over-approximation: it collects every reference, not just the ones
-// that turn out to be this frame's locals, so it needs no notion of storage class at a
-// point where storage does not exist yet. A module signal or a static in the set is
-// never a frame local, so it never boxes.
+// Deliberately an over-approximation: it collects every reference, a module signal,
+// a static and a variable the child itself declares among them. What boxes is decided
+// where the body's own formals are known (install_capture_boxes) and where one of its
+// automatics is declared (box_if_captured), and neither is reached for a symbol that
+// is not the body's own.
 //
 // EVERY fork kind, `join` included. The storage a capture needs is not a property of
 // the join kind -- it is a property of the capture, and the fat `ArgDir::Ref` ABI could
@@ -768,8 +772,7 @@ inline void for_each_fork_stmt(const BlockStatement& blk, F&& fn) {
 // outlives every child" also has one real counterexample: `kill` on a joining parent
 // (docs/design/process-class.md §11), which left a child holding a pointer into a freed
 // coroutine frame. One storage rule for all three kinds retires both problems, and
-// costs nothing in a design whose forks capture nothing -- which includes every fork in
-// a PROCESS body, where the parent's variables are module signals.
+// costs nothing in a body whose forks capture nothing.
 struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
     ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> candidates;
     // A child reads a class property of the enclosing method through the implicit
@@ -777,11 +780,6 @@ struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
     // ValueSymbol this scan can name (it hangs off the SubroutineSymbol), so it travels
     // as a flag and install_capture_boxes resolves it against `sub.thisVar`.
     bool implicit_this = false;
-
-    // The declared variables of every fork body walked here -- the fork's OWN
-    // block_item_declarations, which are not per-activation captures. Subtracted by
-    // install_capture_boxes.
-    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> fork_scope_decls;
 
     void handle(const BlockStatement& blk);
 };
@@ -1348,6 +1346,12 @@ public:
     // Whether `--allow-port-coercion` is given (LRM 23.3.3.1).
     void set_allow_port_coercion(bool allow) {
         allow_port_coercion_ = allow;
+    }
+
+    // Whether input and output ports may hold no storage of their own
+    // (bind_value_port): off for a design lowered as written.
+    void set_merge_ports(bool merge) {
+        merge_ports_ = merge;
     }
 
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
@@ -2028,6 +2032,16 @@ private:
 
     bool needs_port_coercion(const PortConnection& pc, const PortSymbol& p);
 
+    void bind_value_port(const InstanceSymbol& inst, const PortConnection& pc, const PortSymbol& p);
+
+    bool value_port_bindable(const InstanceSymbol& inst, const PortSymbol& p);
+
+    const ValueSymbol* direct_port_target(const PortConnection& pc, const PortSymbol& p);
+
+    ir::Signal port_temp(const PortSymbol& p);
+
+    bool forced_member(const ValueSymbol& sym);
+
     bool net_is_read(const ValueSymbol& sym);
 
     bool port_driven_inside(const PortSymbol& p);
@@ -2623,6 +2637,8 @@ private:
                                std::vector<ir::WaitEvent>&            out);
 
     void refuse_container_event_control(const SignalEventControl& ev);
+
+    bool event_expr_on_heap(const Expression& e);
 
     void refuse_detached_member_event(const TimingControl& tc);
 
@@ -3951,6 +3967,9 @@ private:
         ir::Ref            this_class = ir::Ref::Invalid;
         // Productions are coroutines exactly when the randsequence sits in one.
         bool is_task = false;
+        // What the fork children inside the block's code reference (BoxCandidateScan):
+        // every production body takes it as its FnCtx::fork_refs.
+        ankerl::unordered_dense::set<const ValueSymbol*> fork_refs;
         // A production named as a `rand join` operand (LRM 18.17.5) additionally
         // gets two entry points, because interleaving has to advance a sequence one
         // depth-1 unit at a time and a plain call runs it to completion: `plan`
@@ -4371,6 +4390,10 @@ private:
     // instance of its specialization; `text` is then what follows the path. Anywhere
     // else the whole name is static text: package and `$unit` code, which sits under
     // no instance, and a subroutine reached through a virtual interface, which serves
+    // A packed value holding a packed tagged union whose tag names no member is not a value
+    // of the type ($cast, docs/LRM_NOTES.md note 76).
+    bool      packed_has_tagged_union(const slang::ast::Type& ct);
+    ir::Index packed_tags_valid(ir::Index v, const slang::ast::Type& ct, ir::Builder& b, ir::SourceLoc l);
     // every instance.
     struct ScopeName {
         bool        in_instance = false;
@@ -5366,16 +5389,19 @@ private:
         // of its box rather than out of Local 0.
         const ValueSymbol* this_var = nullptr;
         // Captured automatics that live in a GC box rather than in the frame, so a
-        // detached fork child can share them after this activation is gone (LRM 9.3.2
-        // makes an enclosing automatic ONE variable; docs/design/fork-join.md V4).
-        // Consulted by value_lvalue BEFORE localmap: a boxed symbol keeps its localmap
-        // entry so ForkCaptureDetector still sees it as this frame's, but every access
-        // goes through the box.
+        // fork child can share them after this activation is gone (LRM 9.3.2,
+        // docs/design/fork-join.md V4). Consulted by value_lvalue BEFORE localmap: a
+        // boxed formal keeps its localmap entry, the ABI's copy-in slot, but every
+        // access goes through the box.
         struct Boxed {
             uint32_t local; // frame Local holding the box handle
             ir::Ref  cls;   // the box's one-field synthetic class
         };
         ankerl::unordered_dense::map<const ValueSymbol*, Boxed> boxed;
+        // Every symbol a fork child in this body references (BoxCandidateScan). An
+        // automatic of this body found here is boxed where it is declared
+        // (box_if_captured).
+        ankerl::unordered_dense::set<const ValueSymbol*> fork_refs;
         // Set while lowering a randsequence production body (LRM 18.17). The two
         // synthesized `output` formals: `$abort`, which a `break` with no enclosing
         // loop raises and every caller tests (18.17.6), and `$result`, which a
@@ -5405,11 +5431,10 @@ private:
     ankerl::unordered_dense::map<ir::Ref, ir::Ref>             box_class_notified_;
     ankerl::unordered_dense::set<uint32_t>                     notified_box_refs_;
 
-    // The per-entry box of a fork-scope declaration in a PROCESS body, where there is
-    // no frame to hold the handle (an initial/always block's own variables are design
-    // state, not frame locals -- docs/design/garbage-collection.md 5.4). Keyed by the
-    // declared symbol, which belongs to exactly one fork block, so entries never
-    // collide; in a subroutine the home is a frame slot and FnCtx::boxed carries it
+    // The box of a captured automatic of a PROCESS body, where there is no frame to
+    // hold the handle (an initial/always block's own variables are design state, not
+    // frame locals -- docs/design/garbage-collection.md 5.4). Keyed by the declared
+    // symbol; in a subroutine the home is a frame slot and FnCtx::boxed carries it
     // instead. Consulted by value_lvalue after the frame path, which is why a fork
     // CHILD -- which has a frame of its own and receives the handle as a formal --
     // resolves through its own `boxed` entry rather than through this map.
@@ -5418,6 +5443,8 @@ private:
         ir::Ref    cls; // the box's one-field synthetic class
     };
     ankerl::unordered_dense::map<const ValueSymbol*, ProcForkBox> proc_fork_boxes_;
+    // FnCtx::fork_refs for the procedural block being lowered, which has no FnCtx.
+    ankerl::unordered_dense::set<const ValueSymbol*> proc_fork_refs_;
 
     ir::Ref box_class_type(ir::Ref inner);
 
@@ -5441,13 +5468,13 @@ private:
 
     void install_capture_boxes(const SubroutineSymbol& sub, const Statement& body, ir::Builder& b);
 
-    void box_one_capture(const ValueSymbol& vs, bool copy_in, ir::Builder& b, ir::SourceLoc l);
+    void box_one_capture(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l);
 
-    void install_fork_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l);
+    void box_if_captured(const VariableSymbol& vs, bool force_frame, ir::Builder& b);
+
+    void emit_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l);
 
     ir::Index capture_handle(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l);
-
-    std::vector<const ValueSymbol*> body_automatics(const SubroutineSymbol& sub, const Statement& body);
 
     // The static-lifetime locals `sub` declares through declaration statements, in
     // source order: the variables lower_var_decl gives persistent storage (a `for`
@@ -5990,6 +6017,7 @@ private:
     struct CoverOpts {
         uint32_t                   weight         = 1;
         uint32_t                   type_weight    = 1;
+        uint32_t                   type_goal      = 100;
         uint32_t                   goal           = 100;
         uint32_t                   at_least       = 1;
         uint32_t                   auto_bin_max   = 64; // LRM Table 19-1's default
@@ -6135,10 +6163,10 @@ private:
         // actual), not a scalar plane store. `agg_ty` is the temp's aggregate type.
         bool    is_agg = false;
         ir::Ref agg_ty = ir::Ref::Invalid;
-        // A queue output / inout formal whose actual is a BOUNDED queue, passed via a
-        // temp so the copy-back is a whole-queue assignment that truncates to the actual's
-        // bound (the callee only knows its formal's own, usually unbounded, type).
-        bool is_bounded_queue = false;
+        // A container output / inout formal passed via a temp of the formal's type,
+        // so the copy-back is a whole-container assignment to the actual
+        // (container_actual_needs_temp).
+        bool is_container = false;
     };
 
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
@@ -6151,6 +6179,17 @@ private:
     ir::Index agg_input_actual(const Expression& src, ir::Ref pty, ir::Builder& b, ir::SourceLoc l);
 
     void emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l);
+
+    bool place_in_container_payload(const Expression& e);
+
+    bool container_actual_needs_temp(const Expression& actual, ir::Ref actual_ty, ir::Ref formal_ty);
+
+    void emit_container_place_copy(ir::Index     dst,
+                                   ir::Ref       dst_ty,
+                                   ir::Index     src,
+                                   ir::Ref       src_ty,
+                                   ir::Builder&  b,
+                                   ir::SourceLoc l);
 
     bool is_whole_ref_actual(const Expression& a);
 
@@ -6637,8 +6676,13 @@ private:
     const InferredClockMap* inferred_clocks_ = nullptr;
     // Port coercion (LRM 23.3.3.1); see set_allow_port_coercion.
     bool allow_port_coercion_ = false;
+    // See set_merge_ports.
+    bool merge_ports_ = true;
     // The ports build_inout_aliases coerced to inout: wire_ports copies nothing for them.
     ankerl::unordered_dense::set<const PortSymbol*> coerced_ports_;
+    // The input and output ports bind_value_port bound to the parent's own signal:
+    // wire_ports copies nothing for them. A port bound to a temporary keeps its copy.
+    ankerl::unordered_dense::set<const PortSymbol*> bound_value_ports_;
     // Every write target in this top's hierarchy, by the value symbol it roots at, and
     // the instance body each one is written in.
     ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, std::vector<const Expression*>> writes_;
@@ -6702,9 +6746,12 @@ private:
     // initializers with its children's. Whatever Collect / Classify and the code after
     // the walk append goes to the top's own processes. Lazily engaged.
     std::optional<ir::Builder> preinit_;
-    // Live signal -> its Preponed shadow. LRM 16.5: assertion expressions read
-    // sampled values, and what is sampled is the VARIABLE, not the expression.
-    ankerl::unordered_dense::map<uint32_t, ir::Signal> sva_shadows_;
+    // (Sampling scope id << 32 | live signal) -> its Preponed shadow. LRM 16.5:
+    // assertion expressions read sampled values, and what is sampled is the
+    // VARIABLE, not the expression.
+    ankerl::unordered_dense::map<uint64_t, ir::Signal> sva_shadows_;
+    // Per scope id, the shadows of other instances' signals it holds so far.
+    ankerl::unordered_dense::map<uint32_t, uint32_t> sva_foreign_shadows_;
     // In creation order, so the sampling process copies them deterministically.
     std::vector<std::pair<ir::Signal, ir::Signal>> sva_shadow_pairs_;
     // Each clocking block (LRM 14) of the design, by its symbol. Filled in

@@ -1486,3 +1486,188 @@ TEST_CASE("fork: a spawning function called from a non-procedural context is rej
     )",
                    "called from a DPI export");
 }
+
+// -- One instance of an automatic per entry to its scope (LRM 6.21) -------------
+//
+// "Variables declared in an automatic task, function, or block ... default to the
+// lifetime of the call or block, and are initialized on each entry to the call or
+// block", and "the lifetime of a scope enclosing any fork-join block includes the
+// lifetime of the fork-join block". So a block entered again while the children it
+// forked last time still run has two instances of its automatics alive, and each
+// child keeps the one of the entry that forked it.
+//
+// iverilog 13 cannot oracle it: it refuses `automatic` in a static block and its vvp
+// aborts on a detached child of an automatic task. Verilator 5.052 --timing agrees
+// with the block-automatic and child-automatic cases below; it copies a bare loop
+// variable at the fork, the deviation the loop-variable tests above already decline.
+
+// The idiom the rule exists for. One variable for the activation, or one signal for
+// the process, made every child print the last value: 2 2 2.
+TEST_CASE("fork: each entry to a block gives its join_none child its own automatic") {
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic go;
+            for (int i = 0; i < 3; i++) begin
+              automatic int id = i;
+              fork #(2 * id + 2) $write("t%0d ", id); join_none
+            end
+          endtask
+          function automatic void spawn;
+            for (int i = 0; i < 3; i++) begin
+              automatic int id = i;
+              fork #(id + 7) $write("f%0d ", id); join_none
+            end
+          endfunction
+          initial begin
+            for (int i = 0; i < 3; i++) begin
+              automatic int id = i;
+              fork #(2 * id + 1) $write("p%0d ", id); join_none
+            end
+            go();
+            spawn();
+            #10 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out == "p0 t0 p1 t1 p2 t2 f0 f1 f2 |\n");
+}
+
+// Within one entry the block and its child still share the one variable: what the
+// child writes the block reads, and the next entry starts from its own initializer.
+TEST_CASE("fork: a block and the child it forked share the automatic of that entry") {
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            for (int i = 0; i < 2; i++) begin
+              automatic int acc = 10 * i;
+              fork #1 acc += 1; join_none
+              #2 $write("%0d ", acc);
+            end
+            $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out == "1 11 |\n");
+}
+
+// A `for` loop's own variable is an automatic of the loop (LRM 12.7.1), one per
+// execution of the loop statement. The first loop's children print at 3 and 4,
+// while the second loop is running: they read the first loop's variable, which
+// ended at 2, where one shared variable would have shown them the second loop's 0
+// or 1.
+TEST_CASE("fork: a loop executed again has a new loop variable") {
+    const std::string body = R"(
+            repeat (2) begin
+              for (int i = 0; i < 2; i++) begin
+                fork #3 $write("%0d@%0t ", i, $time); join_none
+                #1;
+              end
+            end
+            #5 $display("|");
+    )";
+    SUBCASE("in a process") {
+        CHECK(run_capture("module t; initial begin " + body + " end endmodule") == "2@3 2@4 2@5 2@6 |\n");
+    }
+    SUBCASE("in a task") {
+        CHECK(run_capture("module t; task automatic go; " + body + " endtask initial go(); endmodule") ==
+              "2@3 2@4 2@5 2@6 |\n");
+    }
+}
+
+// A `foreach` loop variable is captured like any other automatic; in a task it was
+// refused. Each child reads it one time unit into its own iteration, which lasts two.
+TEST_CASE("fork: a join_none child reads the foreach loop variable") {
+    const std::string body = R"(
+            foreach (a[i]) begin
+              fork #1 $write("%0d ", i); join_none
+              #2;
+            end
+            $display("|");
+    )";
+    SUBCASE("in a process") {
+        CHECK(run_capture("module t; int a[3]; initial begin " + body + " end endmodule") == "0 1 2 |\n");
+    }
+    SUBCASE("in a task") {
+        CHECK(run_capture("module t; int a[3]; task automatic go; " + body + " endtask initial go(); endmodule") ==
+              "0 1 2 |\n");
+    }
+}
+
+// A variable a pattern binds (LRM 12.6) is an automatic of the statement that
+// matches, one per match.
+TEST_CASE("fork: a join_none child reads the pattern variable of its own match") {
+    const std::string out = run_capture(R"(
+        module t;
+          typedef union tagged { void Invalid; int Valid; } vi_t;
+          task automatic go(vi_t u);
+            if (u matches tagged Valid .x)
+              fork #x $write("t%0d ", x); join_none
+          endtask
+          initial begin
+            vi_t u;
+            go(tagged Valid 2);
+            go(tagged Valid 4);
+            for (int i = 0; i < 2; i++) begin
+              u = tagged Valid (2 * i + 1);
+              if (u matches tagged Valid .x)
+                fork #x $write("p%0d ", x); join_none
+            end
+            #6 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out == "p1 t2 p3 t4 |\n");
+}
+
+// A fork child is a body like any other: an automatic it declares belongs to it, one
+// per child, and its own fork children capture it. In a task the first was one
+// variable for every child of the activation (3 3 3), and the second was refused.
+TEST_CASE("fork: a child's own automatic is the child's, and its children capture it") {
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic go;
+            for (int j = 1; j <= 3; j++)
+              fork
+                automatic int k = j;
+                begin
+                  automatic int m = 0;
+                  m += k;
+                  #k $write("m%0d ", m);
+                end
+              join_none
+          endtask
+          initial begin
+            go();
+            fork
+              begin
+                #4;
+                for (int i = 0; i < 2; i++) begin
+                  automatic int v = i + 10;
+                  fork #(v - 9) $write("v%0d ", v); join_none
+                end
+              end
+            join_none
+            #8 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out == "m1 m2 m3 v10 v11 |\n");
+}
+
+// A randsequence production is a body too (LRM 18.17): an automatic one of its code
+// blocks declares is boxed where it is declared when a fork child there reads it.
+TEST_CASE("fork: a child forked in a randsequence code block reads the block's automatic") {
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            randsequence (main)
+              main : first second;
+              first : { automatic int v = 5; fork #1 $write("%0d ", v); join_none };
+              second : { automatic int v = 7; fork #2 $write("%0d ", v); join_none };
+            endsequence
+            #3 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out == "5 7 |\n");
+}

@@ -1287,7 +1287,7 @@ endmodule
 )", r);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     const ir::Process& p = monitor_process(m);
-    CHECK(touches(m, p, "dif.sva.shadow.v"));
+    CHECK(touches(m, p, "sva.shadow.$0"));
     CHECK_FALSE(touches(m, p, "dif.v"));
 }
 
@@ -1445,8 +1445,9 @@ endmodule
 )", r);
     REQUIRE(r.ok);
     REQUIRE(m.monitors.size() == 2);
-    CHECK(m.signal(m.monitors[0].clock).name == "u0.clk");
-    CHECK(m.signal(m.monitors[1].clock).name == "u1.clk");
+    // Each instance's clock port is bound to its parent's clock (bound value ports).
+    CHECK(m.signal(m.monitors[0].clock).name == "ck0");
+    CHECK(m.signal(m.monitors[1].clock).name == "ck1");
 }
 
 TEST_CASE("an inferred clock clotho cannot place in the procedure is refused") {
@@ -1776,16 +1777,29 @@ size_t shadow_count(const ir::Module& m) {
     return n;
 }
 
-// A shadow is named under the instance declaring the variable it samples:
-// `s.a` is shadowed by `s.sva.shadow.a`.
+// Whether a Preponed process copies the live signal named `live` into a shadow:
+// the shadow lives in the sampling instance, whichever instance declares `live`.
 bool has_shadow(const ir::Module& m, std::string_view live) {
-    const size_t      dot  = live.rfind('.');
-    const std::string want = dot == std::string_view::npos ? "sva.shadow." + std::string(live)
-                                                           : std::string(live.substr(0, dot + 1)) + "sva.shadow." +
-                                                               std::string(live.substr(dot + 1));
-    for (const ir::SignalInfo& s : m.signals()) {
-        if (s.name == want) {
-            return true;
+    for (const ir::Process& p : m.processes()) {
+        if (p.activation != ir::Activation::Preponed) {
+            continue;
+        }
+        const ir::Ir& ir = p.ir;
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const auto i = static_cast<ir::Index>(k);
+            if (ir.tag(i) != ir::Inst::Tag::Store) {
+                continue;
+            }
+            const ir::Index l = ir.payload(i).binary.l;
+            const ir::Index v = ir.payload(i).binary.r;
+            if (ir.tag(l) != ir::Inst::Tag::Signal || ir.tag(v) != ir::Inst::Tag::Load ||
+                ir.tag(ir.payload(v).unary) != ir::Inst::Tag::Signal) {
+                continue;
+            }
+            if (m.signal(ir.payload(l).signal).name.find("sva.shadow.") != std::string::npos &&
+                m.signal(ir.payload(ir.payload(v).unary).signal).name == live) {
+                return true;
+            }
         }
     }
     return false;
@@ -1920,11 +1934,10 @@ endmodule
 }
 
 TEST_CASE("sampling a variable of another instance now works") {
-    // Once refused: a shadow is no longer required to live in the asserting
-    // instance's own scope. sampled_shadow_of attaches it beside `s.a` in `s`'s
-    // OWN declaring scope instead, and `t`'s monitor reads it through the same
-    // per-instance addressing an ordinary hierarchical read of `s.a` already
-    // used (docs/design/concurrent-assertions.md 4).
+    // Once refused: a shadow is no longer required to sample a variable of the
+    // asserting instance's own. sampled_shadow_of gives `t` a shadow of `s.a`,
+    // which `t`'s Preponed process copies through the same addressing an
+    // ordinary hierarchical read of `s.a` uses (docs/design/concurrent-assertions.md 4).
     LowerResult        r;
     const ir::Module&  m = lower_for_monitor(R"(
 module sub;
@@ -1969,9 +1982,8 @@ endmodule
 }
 
 TEST_CASE("sampling through two hierarchy hops works") {
-    // Not narrowed by depth: the shadow is attached beside the live signal
-    // wherever it is actually declared, so a second hop costs nothing extra --
-    // find_scope_node walks the whole scope tree, not just one level.
+    // Not narrowed by depth: signal_scope_ names the instance of any signal, so a
+    // second hop costs nothing extra.
     LowerResult        r;
     const ir::Module&  m = lower_for_monitor(R"(
 module leaf;
@@ -2025,12 +2037,11 @@ endmodule
     CHECK(has_shadow(m, "unit_sig"));
 }
 
-TEST_CASE("two asserting instances sampling one interface signal share one shadow") {
-    // The sharing invariant concurrent-assertions.md 4 states for the
-    // same-scope case extends across scopes: c1 and c2 are two DIFFERENT
-    // asserting instances of one definition (so this also exercises the
-    // shadow surviving state-type dedup), both sampling dif's own sig --
-    // one shadow, one copy, not two.
+TEST_CASE("two asserting instances sampling one interface signal hold a shadow each") {
+    // A shadow is state of the instance that samples (concurrent-assertions.md
+    // 4): c1 and c2, two instances of one definition, each copy dif's sig into a
+    // shadow of their own in a Preponed process of their own, so neither unit's
+    // state depends on the other's assertions.
     LowerResult        r;
     const ir::Module&  m = lower_for_monitor(R"(
 interface dif_bus(input bit clk);
@@ -2048,25 +2059,19 @@ endmodule
 )", r);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(m.monitors.size() == 2);
-    CHECK(shadow_count(m) == 1);
+    CHECK(shadow_count(m) == 2);
     CHECK(has_shadow(m, "dif.sig"));
-
-    // The single Preponed process (one scope holds the shadow) still copies it
-    // exactly once per timestep --
-    // not once per asserting instance.
-    const ir::Process* preponed = nullptr;
+    CHECK(preponed_count(m) == 2);
     for (const ir::Process& proc : m.processes()) {
-        if (proc.activation == ir::Activation::Preponed) {
-            REQUIRE(preponed == nullptr); // one process for the one scope
-            preponed = &proc;
+        if (proc.activation != ir::Activation::Preponed) {
+            continue;
         }
+        size_t stores = 0;
+        for (size_t i = 0; i < proc.ir.inst_count(); i++) {
+            stores += proc.ir.tag(static_cast<ir::Index>(i)) == ir::Inst::Tag::Store ? 1 : 0;
+        }
+        CHECK(stores == 1);
     }
-    REQUIRE(preponed != nullptr);
-    size_t stores = 0;
-    for (size_t i = 0; i < preponed->ir.inst_count(); i++) {
-        stores += preponed->ir.tag(static_cast<ir::Index>(i)) == ir::Inst::Tag::Store ? 1 : 0;
-    }
-    CHECK(stores == 1);
 }
 
 TEST_CASE("sampling a variable with no packed value is refused") {

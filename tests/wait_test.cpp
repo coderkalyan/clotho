@@ -24,11 +24,6 @@ std::string run_capture_finish(std::string_view source) {
     return test::run_design_subprocess(source);
 }
 
-std::string lower_error(std::string_view source) {
-    const LowerResult r = lower_text(source);
-    return r.ok ? std::string{} : r.diagnostic_text();
-}
-
 } // namespace
 
 // IEEE 1800-2023 9.4.3: a `wait` whose condition is already true does not
@@ -152,20 +147,25 @@ TEST_CASE("wait on a constant-false condition parks the process forever") {
     CHECK(run_capture_finish(src) == "before\nwatchdog 100\n");
 }
 
-// A string condition would need a string-aware wait queue (string stores skip
-// wait-queue servicing), so it must fail loudly, not silently never re-trigger.
-TEST_CASE("wait on a string condition fails loudly") {
+// A string condition is true when the string is not empty, and a store that changes
+// its characters re-tests it (tests/string_test.cpp has the rest). It was refused:
+// a string store serviced no wait queue.
+TEST_CASE("wait on a string condition resumes when the string becomes non-empty") {
     constexpr std::string_view src = R"(
         module m;
             string s = "";
             initial begin
                 wait(s);
-                $display("x");
+                $display("woke %0t", $time);
+            end
+            initial begin
+                #2 s = "";
+                #1 s = "go";
+                #1 $finish;
             end
         endmodule
     )";
-    const std::string err = lower_error(src);
-    CHECK(err.find("string") != std::string::npos);
+    CHECK(run_capture_finish(src) == "woke 3\n");
 }
 
 // -- wait on a class property (LRM 9.4.3) ------------------------------------
@@ -1132,7 +1132,7 @@ TEST_CASE("a fork child's wait wakes on a sibling child's write") {
 }
 
 // A fork-scope declaration in a PROCESS body boxes per entry
-// (install_fork_decl_box, design-state home): same hole, same fix.
+// (emit_decl_box, design-state home): same hole, same fix.
 TEST_CASE("wait on a fork-scope declaration wakes across sibling children") {
     constexpr std::string_view src = R"(
         module m;
@@ -1241,10 +1241,9 @@ TEST_CASE("wait over two captured automatics re-tests until both are written") {
     CHECK(run_capture_finish(src) == "woke at 8\n");
 }
 
-// A captured automatic of a type with no change notifier (an unpacked struct)
-// is refused loudly, like the class-property arm: a silent permanent park is
-// the defect this whole section exists to prevent.
-TEST_CASE("wait on a captured unpacked struct fails loudly") {
+// A captured unpacked struct is boxed with the same one notifier an aggregate class
+// property has, since a capture box is a one-field object.
+TEST_CASE("wait on a captured unpacked struct resumes when a member is stored") {
     constexpr std::string_view src = R"(
         module m;
             typedef struct { int a; } st;
@@ -1252,28 +1251,29 @@ TEST_CASE("wait on a captured unpacked struct fails loudly") {
                 st x;
                 fork begin #2 x.a = 1; end join_none
                 wait (x.a != 0);
+                $display("woke %0t", $time);
             endtask
             initial begin t(); $finish; end
         endmodule
     )";
-    CHECK(lower_error(src).find("fork-captured automatic 'x' of type m.st is not supported") != std::string::npos);
+    CHECK(run_capture_finish(src) == "woke 2\n");
 }
 
-// A captured event has no notifier for `.triggered` either; the refusal names the
-// event rather than describing aggregate types it is not.
-TEST_CASE("wait on a captured event's triggered fails loudly") {
+// A captured event is waited on through the object it holds, the one a trigger
+// fires, as an event class property is.
+TEST_CASE("wait on a captured event's triggered resumes at the trigger") {
     constexpr std::string_view src = R"(
         module m;
             task automatic t;
                 event e;
                 fork begin #1 -> e; end join_none
                 wait (e.triggered);
+                $display("woke %0t", $time);
             endtask
             initial begin t(); $finish; end
         endmodule
     )";
-    CHECK(lower_error(src).find("fork-captured automatic 'e' of type event is not supported") !=
-          std::string::npos);
+    CHECK(run_capture_finish(src) == "woke 1\n");
 }
 
 // A write through a `ref` to a container ELEMENT wakes the waiters of the container's signal at the

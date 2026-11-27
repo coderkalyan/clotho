@@ -1794,21 +1794,30 @@ void Lowerer::join_pca_targets() {
                     fail("internal: an instance of a forced member's type lacks the member");
                 }
                 // The storage the member names, which a port can alias to its
-                // connection; the state goes with the storage.
+                // connection (an inout, or an input or output the parent binds,
+                // bind_value_port); the state goes with the storage, into the
+                // instance that owns it.
                 const ValueSymbol& c = canonical_value_symbol(*vs);
                 if (c.kind == SymbolKind::Net) {
                     continue;
                 }
-                const Scope* home = c.getParentScope();
-                while (home != nullptr && home->asSymbol().kind != SymbolKind::InstanceBody) {
-                    home = home->asSymbol().getParentScope();
+                const ir::Signal tsig  = signal_of(c);
+                const auto       owner = signal_scope_.find(static_cast<uint32_t>(tsig));
+                uint32_t         scope_id = 0;
+                if (owner != signal_scope_.end()) {
+                    scope_id = owner->second;
+                } else {
+                    const Scope* home = c.getParentScope();
+                    while (home != nullptr && home->asSymbol().kind != SymbolKind::InstanceBody) {
+                        home = home->asSymbol().getParentScope();
+                    }
+                    const auto scope = home != nullptr ? owners_->scopes.find(home) : owners_->scopes.end();
+                    if (scope == owners_->scopes.end()) {
+                        fail("internal: a forced member's instance was not collected");
+                    }
+                    scope_id = scope->second.index;
                 }
-                const auto scope = home != nullptr ? owners_->scopes.find(home) : owners_->scopes.end();
-                if (scope == owners_->scopes.end()) {
-                    fail("internal: a forced member's instance was not collected");
-                }
-                ir::InstanceScope* node = scope_node(scope->second.index);
-                const ir::Signal   tsig = signal_of(c);
+                ir::InstanceScope* node = scope_node(scope_id);
                 const auto [it, inserted] = pca_->vars.try_emplace(static_cast<uint32_t>(tsig));
                 ForceInfo&         fi     = it->second;
                 if (inserted) {
@@ -2074,9 +2083,10 @@ void Lowerer::lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder&
         bool               is_net = false;
         const ValueSymbol* sym    = force_target(a.left(), &is_net);
         if (sym == nullptr && !stmt_force_site_.contains(&s)) {
-            fail("force is only supported on a whole variable/net or a constant "
-                 "bit/part-select of a net (LRM 10.6.2); a select of a variable, "
-                 "a concatenation, and an aggregate are not yet supported");
+            fail("force of a bit-select or part-select of a variable is illegal (LRM 10.6.2; "
+                 "10.6.1 for assign); force is only supported on a whole variable/net or a "
+                 "constant bit/part-select of a net; a concatenation and an aggregate are not "
+                 "yet supported");
         }
         if (is_net || stmt_force_site_.contains(&s)) {
             // Net force (LRM 10.6.2), whole or a constant bit/part-select: set the

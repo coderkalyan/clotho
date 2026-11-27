@@ -1330,12 +1330,15 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         }
         const PortSymbol& p = pc->port.as<PortSymbol>();
         if (p.direction == slang::ast::ArgumentDirection::InOut || p.direction == slang::ast::ArgumentDirection::Ref ||
-            coerced_ports_.contains(&p)) {
+            coerced_ports_.contains(&p) || bound_value_ports_.contains(&p)) {
             // inout / ref ports share storage via build_inout_aliases (the child
             // internal net/var aliases the parent signal), so there is no
             // one-way copy to wire here — both sides already reference one
             // signal and any drivers fold through net resolution. A port coerced to
-            // inout (needs_port_coercion) is aliased the same way.
+            // inout (needs_port_coercion) is aliased the same way, and so is an
+            // input or output bound to the parent's own signal (bind_value_port).
+            // One bound to a temporary of the parent is copied below, to or from
+            // the temporary, which its internal symbol now names.
             continue;
         }
         if (p.internalSymbol == nullptr) {
@@ -1595,12 +1598,6 @@ void Lowerer::collect_expr_reads(const Expression& expr, std::vector<ir::WaitEve
     for (const ir::Signal s : c.reads) {
         if (c.written.contains(static_cast<uint32_t>(s))) {
             continue;
-        }
-        if (is_string_ref(module_.signal(s).type)) {
-            // TODO: string signals in inferred sensitivity — string stores
-            // skip wait-queue servicing, so the process would never
-            // re-trigger.
-            fail("string in inferred sensitivity is not supported");
         }
         out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
     }
