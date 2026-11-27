@@ -108,8 +108,9 @@ them in step.
   have explicit stack maps; object fields and design state are scanned precisely.
 - A young collection costs what happened since the last collection (allocation,
   logged writes, frames that ran), never the size of the design. Design-state
-  handle slots are read by dirty card. **Not yet:** each one walks every
-  state-resident container and scans every registered frame.
+  handle slots are read by dirty card, and a frame is read only if it ran or a
+  callee can store into it. **Not yet:** each one walks every state-resident
+  container and every container local to a frame.
 - An object is finalized only if it owns a buffer outside the heap when it dies.
   **Not yet:** every dead object with a string or container property runs a
   finalizer.

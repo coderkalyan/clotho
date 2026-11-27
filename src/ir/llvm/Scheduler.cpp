@@ -186,6 +186,10 @@ void Backend::emit_suspend(const char* label, const TracePark& park) {
     sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
     b_.SetInsertPoint(resume);
     emit_proc_state(kProcWaiting, kProcRunning);
+    // Before anything of this coroutine can store into its frame: put the frame back among
+    // those a young collection reads if a collection retired it while it was parked
+    // (rt_gc_frame, Gc.h).
+    emit_gc_frame_resumed();
     // Whoever ran while this thread was parked published its own generation.
     if (gen_gv_ != nullptr) {
         if (llvm::Value* gen = body_gen(); gen != nullptr) {
