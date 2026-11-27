@@ -3224,8 +3224,20 @@ private:
     }
 
     // The static wake scan, emitted once per LLVM module and shape and called from
-    // The shared static scans (static_scan_fn) per LLVM module and shape.
-    std::map<std::tuple<llvm::Module*, bool, uint32_t>, llvm::Function*> static_scan_fns_;
+    // every store that wakes a static waiter list (service_static_queue), so a store
+    // site holds one call rather than the loop. It takes the address of the list's
+    // header. With `vcd` it also takes the store's dump-var index and touches it
+    // after the scan. `edge` only shapes the function when the trace checker is on,
+    // whose report names the list's edge; the traced form also takes the storage
+    // the writer reaches.
+    llvm::Function* static_scan_fn(bool vcd, uint32_t edge);
+    void            emit_static_scan_rt(llvm::Value* list, const TraceCause& why);
+
+    // A port's storage woken through one shared function per LLVM module and port
+    // layout (the bound_notify_fns_ / bound_store_fns_ caches).
+    llvm::Function* bound_notify_fn(const PortLayout& pl);
+    llvm::Function* bound_store_fn(const PortLayout& pl, bool four);
+    void            emit_bound_wake(const PortLayout& pl, llvm::Value* port, llvm::Value* want);
 
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr, const TraceCause& why);
 
